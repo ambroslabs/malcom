@@ -1,0 +1,25 @@
+# Compiled binaries
+/cosmos-p2p
+/cosmos-crawl
+/cosmos-blockcache
+/bin/
+*.exe
+
+# Runtime data: node identity (private key!), block cache, addrbook snapshots,
+# crawl results, per-peer activity dumps. Keep these out of git.
+/data/
+
+# Local Claude/IDE state
+.claude/scheduled_tasks.lock
+.claude/local/
+.idea/
+.vscode/
+
+# Editor swap
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
