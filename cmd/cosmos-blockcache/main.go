@@ -137,6 +137,10 @@ func main() {
 	}
 
 	obsR := observer.NewReactor(logger.With("module", "observer"))
+	obsR.SetTipFn(func() int64 {
+		_, tip := cache.Range()
+		return tip
+	})
 
 	sw := p2p.NewSwitch(p2pConfig, transport)
 	sw.SetLogger(logger.With("module", "p2p"))
@@ -175,6 +179,12 @@ func main() {
 
 	// Drive the sync loop.
 	go reactor.SyncLoop(ctx)
+
+	// Heartbeat: refresh the consensus state-claim we send to peers as our
+	// cache advances, so they keep gossiping votes/proposals/blockparts.
+	stopHeartbeat := make(chan struct{})
+	defer close(stopHeartbeat)
+	go obsR.Heartbeat(stopHeartbeat)
 
 	// Periodic discoveries persist: merge live peer activity into the on-disk
 	// list, deduplicated by node ID, so subsequent runs can dial them.

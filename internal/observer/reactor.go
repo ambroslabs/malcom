@@ -18,6 +18,7 @@ import (
 	cmtcons "github.com/cometbft/cometbft/proto/tendermint/consensus"
 	protomem "github.com/cometbft/cometbft/proto/tendermint/mempool"
 	cmtproto "github.com/cometbft/cometbft/proto/tendermint/types"
+	gogoproto "github.com/cosmos/gogoproto/proto"
 )
 
 // Channel IDs (matching cometbft conventions).
@@ -76,18 +77,44 @@ type Reactor struct {
 	lastTxRing      [32]string
 	lastTxRingHead  int
 	lastTxRingCount int
+
+	// tipFn returns the height of the latest block in our cache. We claim
+	// that we're working on tipFn()+1 in NewRoundStep messages so peers
+	// gate-keeping mempool / vote / blockpart / proposal gossip on
+	// peerState.GetHeight() will treat us as caught up. We never sign or
+	// vote — purely an announcement.
+	tipFn func() int64
+	// HeartbeatInterval is how often we re-broadcast our NewRoundStep so
+	// peers' tracking advances as our cache does.
+	HeartbeatInterval time.Duration
+
+	// Counters of relay activity.
+	votesRelayed      int64
+	blockPartsRelayed int64
+	proposalsRelayed  int64
+	stepSent          int64
 }
 
 func NewReactor(logger log.Logger) *Reactor {
 	r := &Reactor{
-		logger:      logger,
-		seenTx:      make(map[[32]byte]struct{}, 4096),
-		SampleEvery: 0,
-		counters:    Counters{unknownTypes: make(map[string]int64, 16)},
+		logger:            logger,
+		seenTx:            make(map[[32]byte]struct{}, 4096),
+		SampleEvery:       0,
+		counters:          Counters{unknownTypes: make(map[string]int64, 16)},
+		HeartbeatInterval: 3 * time.Second,
 	}
 	r.BaseReactor = *p2p.NewBaseReactor("observer", r)
 	r.BaseReactor.SetLogger(logger)
 	return r
+}
+
+// SetTipFn provides a callback returning the height of the latest block we
+// have. We claim height = tip+1 in NewRoundStep so peers gate-keeping mempool
+// and consensus gossip on peerState.GetHeight() let traffic through.
+func (r *Reactor) SetTipFn(fn func() int64) {
+	r.mu.Lock()
+	r.tipFn = fn
+	r.mu.Unlock()
 }
 
 func (r *Reactor) GetChannels() []*conn.ChannelDescriptor {
@@ -106,14 +133,87 @@ func (r *Reactor) GetChannels() []*conn.ChannelDescriptor {
 	}
 }
 
-func (r *Reactor) AddPeer(p2p.Peer)           {}
-func (r *Reactor) RemovePeer(p2p.Peer, any)   {}
+func (r *Reactor) AddPeer(peer p2p.Peer) {
+	r.sendStateClaim(peer)
+}
+
+func (r *Reactor) RemovePeer(p2p.Peer, any) {}
+
+// sendStateClaim broadcasts our claimed (height, round, step) to one peer.
+// Peers gate Vote/Proposal/BlockPart and (importantly) mempool Tx gossip on
+// our claimed height matching their consensus height.
+func (r *Reactor) sendStateClaim(peer p2p.Peer) {
+	r.mu.Lock()
+	tipFn := r.tipFn
+	r.mu.Unlock()
+	if tipFn == nil {
+		return
+	}
+	tip := tipFn()
+	if tip <= 0 {
+		return
+	}
+	msg := &cmtcons.NewRoundStep{
+		Height:                tip + 1, // we're "voting on" the next block
+		Round:                 0,
+		Step:                  1, // RoundStepNewHeight
+		SecondsSinceStartTime: 0,
+		LastCommitRound:       0,
+	}
+	if peer.TrySend(p2p.Envelope{ChannelID: StateChannel, Message: msg}) {
+		r.mu.Lock()
+		r.stepSent++
+		r.mu.Unlock()
+	}
+}
+
+// Heartbeat re-sends our state claim to all connected peers on every tick
+// so peers' tracking advances as the chain advances.
+func (r *Reactor) Heartbeat(stop <-chan struct{}) {
+	t := time.NewTicker(r.HeartbeatInterval)
+	defer t.Stop()
+	for {
+		select {
+		case <-stop:
+			return
+		case <-t.C:
+			if r.Switch == nil {
+				continue
+			}
+			for _, p := range r.Switch.Peers().List() {
+				r.sendStateClaim(p)
+			}
+		}
+	}
+}
+
+// relayConsensus broadcasts a consensus message to every connected peer
+// except the sender. These messages are signature-verifiable end-to-end, so
+// relaying without "running" them is safe — recipients verify themselves.
+func (r *Reactor) relayConsensus(env p2p.Envelope, ch byte, msg gogoproto.Message) {
+	if r.Switch == nil {
+		return
+	}
+	senderID := env.Src.ID()
+	for _, p := range r.Switch.Peers().List() {
+		if p.ID() == senderID {
+			continue
+		}
+		// TrySend so a slow peer doesn't block our hot path.
+		p.TrySend(p2p.Envelope{ChannelID: ch, Message: msg})
+	}
+}
 
 func (r *Reactor) Receive(env p2p.Envelope) {
 	// Cometbft auto-unwraps oneof Messages before handing them to Receive,
 	// so env.Message is the *inner* type (e.g. *Vote, *Proposal, *Txs).
+	//
+	// We only hold mu while updating counters; relays (which can block in
+	// peer.TrySend → MConn) happen after we drop the lock.
+	var relayCh byte
+	var relayMsg gogoproto.Message
+
 	r.mu.Lock()
-	defer r.mu.Unlock()
 	switch m := env.Message.(type) {
 
 	// Consensus messages.
@@ -123,12 +223,18 @@ func (r *Reactor) Receive(env p2p.Envelope) {
 		r.counters.NewValidBlocks++
 	case *cmtcons.Proposal:
 		r.counters.Proposals++
+		r.proposalsRelayed++
+		relayCh, relayMsg = DataChannel, m
 	case *cmtcons.ProposalPOL:
 		r.counters.ProposalPols++
 	case *cmtcons.BlockPart:
 		r.counters.BlockParts++
+		r.blockPartsRelayed++
+		relayCh, relayMsg = DataChannel, m
 	case *cmtcons.Vote:
 		r.counters.Votes++
+		r.votesRelayed++
+		relayCh, relayMsg = VoteChannel, m
 	case *cmtcons.HasVote:
 		r.counters.HasVotes++
 	case *cmtcons.VoteSetMaj23:
@@ -169,6 +275,11 @@ func (r *Reactor) Receive(env p2p.Envelope) {
 	default:
 		// Helpful when a message type isn't matched.
 		r.counters.unknownTypes[goTypeName(m)]++
+	}
+	r.mu.Unlock()
+
+	if relayMsg != nil {
+		r.relayConsensus(env, relayCh, relayMsg)
 	}
 }
 
