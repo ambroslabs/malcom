@@ -50,6 +50,12 @@ type Counters struct {
 	UniqueTxs int64 // unique tx hashes seen this run
 	TxBytes   int64 // total tx bytes seen
 
+	// Relay
+	VotesRelayed      int64
+	BlockPartsRelayed int64
+	ProposalsRelayed  int64
+	TxsRelayed        int64
+
 	// Evidence
 	EvidenceItems int64
 
@@ -92,7 +98,16 @@ type Reactor struct {
 	votesRelayed      int64
 	blockPartsRelayed int64
 	proposalsRelayed  int64
+	txsRelayed        int64
 	stepSent          int64
+
+	// RelayTxs, when true, forwards each unique mempool tx (deduped via
+	// seenTx) to all connected peers except the sender. We do NOT run
+	// CheckTx — chain-agnostic. Receivers run CheckTx themselves and drop
+	// invalid txs, so the worst-case cost of relay is N CheckTx invocations
+	// per bad tx (no further amplification because the receivers don't
+	// re-gossip what they reject).
+	RelayTxs bool
 }
 
 func NewReactor(logger log.Logger) *Reactor {
@@ -102,6 +117,7 @@ func NewReactor(logger log.Logger) *Reactor {
 		SampleEvery:       0,
 		counters:          Counters{unknownTypes: make(map[string]int64, 16)},
 		HeartbeatInterval: 3 * time.Second,
+		RelayTxs:          true,
 	}
 	r.BaseReactor = *p2p.NewBaseReactor("observer", r)
 	r.BaseReactor.SetLogger(logger)
@@ -204,6 +220,26 @@ func (r *Reactor) relayConsensus(env p2p.Envelope, ch byte, msg gogoproto.Messag
 	}
 }
 
+// relayTxs forwards a batch of mempool txs to every connected peer except
+// the sender. We do NOT run CheckTx — recipients verify themselves and
+// reject invalid txs (cometbft's mempool reactor does this). Each tx is
+// relayed only once (dedup happens in Receive via seenTx). Bandwidth cost
+// to us: tx_size × (peers−1) per unique tx. Recipients' worst-case cost
+// for a bad tx: one CheckTx invocation, then they drop it (no further
+// amplification, because they don't re-gossip what they reject).
+func (r *Reactor) relayTxs(sender p2p.ID, txs [][]byte) {
+	if r.Switch == nil || len(txs) == 0 {
+		return
+	}
+	msg := &protomem.Txs{Txs: txs}
+	for _, p := range r.Switch.Peers().List() {
+		if p.ID() == sender {
+			continue
+		}
+		p.TrySend(p2p.Envelope{ChannelID: MempoolChannel, Message: msg})
+	}
+}
+
 func (r *Reactor) Receive(env p2p.Envelope) {
 	// Cometbft auto-unwraps oneof Messages before handing them to Receive,
 	// so env.Message is the *inner* type (e.g. *Vote, *Proposal, *Txs).
@@ -248,10 +284,13 @@ func (r *Reactor) Receive(env p2p.Envelope) {
 			return
 		}
 		r.counters.TxBatches++
+		// Collect first-sight txs to relay (after dropping the lock).
+		var freshTxs [][]byte
 		for _, tx := range m.Txs {
 			r.counters.Txs++
 			r.counters.TxBytes += int64(len(tx))
 			h := sha256.Sum256(tx)
+			fresh := false
 			if len(r.seenTx) < MaxSeenTx {
 				if _, seen := r.seenTx[h]; !seen {
 					r.seenTx[h] = struct{}{}
@@ -262,10 +301,20 @@ func (r *Reactor) Receive(env p2p.Envelope) {
 					if r.lastTxRingCount < len(r.lastTxRing) {
 						r.lastTxRingCount++
 					}
+					fresh = true
 				}
 			} else if _, seen := r.seenTx[h]; !seen {
 				r.counters.UniqueTxs++
+				fresh = true
 			}
+			if fresh && r.RelayTxs {
+				freshTxs = append(freshTxs, tx)
+			}
+		}
+		if len(freshTxs) > 0 {
+			r.txsRelayed += int64(len(freshTxs))
+			// Defer the relay until after the lock is released.
+			defer r.relayTxs(env.Src.ID(), freshTxs)
 		}
 
 	// Evidence (sent as a list, not via Message wrapper).
@@ -294,7 +343,12 @@ func goTypeName(v interface{}) string {
 func (r *Reactor) Snapshot() Counters {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	return r.counters
+	c := r.counters
+	c.VotesRelayed = r.votesRelayed
+	c.BlockPartsRelayed = r.blockPartsRelayed
+	c.ProposalsRelayed = r.proposalsRelayed
+	c.TxsRelayed = r.txsRelayed
+	return c
 }
 
 // UnknownTypes returns a copy of the unknown-message-type histogram.

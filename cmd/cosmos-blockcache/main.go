@@ -236,6 +236,11 @@ func main() {
 				obs.BlockParts, obs.BlockParts-prevObs.BlockParts,
 				obs.Proposals, obs.Proposals-prevObs.Proposals,
 				obs.HasVotes, obs.NewRoundSteps, obs.EvidenceItems)
+			fmt.Printf("[relay]  txs_out=%d (Δ%d) votes_out=%d (Δ%d) block_parts_out=%d (Δ%d) proposals_out=%d (Δ%d)\n",
+				obs.TxsRelayed, obs.TxsRelayed-prevObs.TxsRelayed,
+				obs.VotesRelayed, obs.VotesRelayed-prevObs.VotesRelayed,
+				obs.BlockPartsRelayed, obs.BlockPartsRelayed-prevObs.BlockPartsRelayed,
+				obs.ProposalsRelayed, obs.ProposalsRelayed-prevObs.ProposalsRelayed)
 			prevC, prevObs, prevAt = c, obs, now
 		}
 	}
