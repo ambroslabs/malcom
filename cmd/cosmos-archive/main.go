@@ -52,6 +52,7 @@ Subcommands:
   status     one-screen dashboard (latest [archive] line + ranges + disk)
   verify     read every (or sampled) block on disk and check CRC + proto + height
   verify-chain  sequential per-range walk: Block.ValidateBasic + prev↔current chain linkage
+  fsck       deep on-disk integrity check (.blocks self-walk, idx cross-check, CRC, orphan detection)
   download   fetch missing blocks from archive peers (long-running)
 
 Run any subcommand with -h for its flags.
@@ -76,6 +77,8 @@ func main() {
 		runVerify(os.Args[2:])
 	case "verify-chain":
 		runVerifyChain(os.Args[2:])
+	case "fsck":
+		runFSCK(os.Args[2:])
 	case "download":
 		runDownload(os.Args[2:])
 	case "-h", "--help", "help":
@@ -426,6 +429,153 @@ func fmtDur(s float64) string {
 		return fmt.Sprintf("%.1fs", s)
 	}
 	return d.Truncate(time.Second).String()
+}
+
+// runFSCK runs a deep on-disk integrity check across every shard:
+//
+//   - Walks each .blocks file from offset 0 using length prefixes alone.
+//   - For each record found, cross-checks against the .idx entry that
+//     should point at that offset.
+//   - Counts orphan bytes (in .blocks but unreachable from .idx),
+//     orphan records, idx entries pointing past EOF, idx vs walk length
+//     mismatches.
+//   - Optionally CRC-checks up to -max-crc-per-shard records per shard.
+//
+// Output gives per-shard findings + a single roll-up so you can find
+// exactly which shard, which offset, and which height is corrupt.
+func runFSCK(args []string) {
+	fs := flag.NewFlagSet("fsck", flag.ExitOnError)
+	dir := fs.String("archive", "/mnt/data/cosmos-archive/cosmoshub-4", "archive root directory")
+	maxCRC := fs.Int("max-crc-per-shard", -1, "limit CRC checks per shard (-1 = all)")
+	verbose := fs.Bool("v", false, "print per-shard summary even when clean")
+	_ = fs.Parse(args)
+
+	st, err := archive.New(*dir)
+	if err != nil {
+		log.Fatalf("open archive: %v", err)
+	}
+	defer st.Close()
+
+	startT := time.Now()
+	reports, err := st.FSCKAll(*maxCRC)
+	if err != nil {
+		log.Fatalf("fsck: %v", err)
+	}
+	dur := time.Since(startT)
+
+	bases := make([]uint64, 0, len(reports))
+	for b := range reports {
+		bases = append(bases, b)
+	}
+	sort.Slice(bases, func(i, j int) bool { return bases[i] < bases[j] })
+
+	totals := struct {
+		shards         int
+		shardsClean    int
+		shardsWithIssue int
+		entries        int
+		records        int
+		bytes          int64
+		idxBad         int
+		idxNotInBlocks int
+		idxLenMismatch int
+		orphanRecs     int
+		orphanBytes    int64
+		walkErrors     int
+		crcChecked     int
+		crcBad         int
+		errors         int
+	}{}
+
+	for _, base := range bases {
+		r := reports[base]
+		clean := r.IdxBadEntries == 0 && r.IdxNotInBlocks == 0 && r.IdxLengthMismatch == 0 &&
+			r.OrphanRecords == 0 && r.CRCBad == 0 && len(r.WalkErrors) == 0
+
+		totals.shards++
+		if clean {
+			totals.shardsClean++
+		} else {
+			totals.shardsWithIssue++
+		}
+		totals.entries += r.IdxEntries
+		totals.records += r.WalkRecords
+		totals.bytes += r.BlocksFileSize
+		totals.idxBad += r.IdxBadEntries
+		totals.idxNotInBlocks += r.IdxNotInBlocks
+		totals.idxLenMismatch += r.IdxLengthMismatch
+		totals.orphanRecs += r.OrphanRecords
+		totals.orphanBytes += r.OrphanBytesAfterWalk
+		totals.walkErrors += len(r.WalkErrors)
+		totals.crcChecked += r.CRCChecked
+		totals.crcBad += r.CRCBad
+		totals.errors += len(r.Errors)
+
+		if !clean || *verbose {
+			fmt.Printf("shard base=%s\n", commafmt(base))
+			fmt.Printf("  idx entries:       %s   (%d bad-length)\n",
+				commafmt(uint64(r.IdxEntries)), r.IdxBadEntries)
+			fmt.Printf("  blocks records:    %s   (file=%s)\n",
+				commafmt(uint64(r.WalkRecords)), humanBytes(r.BlocksFileSize))
+			fmt.Printf("  CRC checked:       %s   (%d bad)\n",
+				commafmt(uint64(r.CRCChecked)), r.CRCBad)
+			if r.IdxNotInBlocks > 0 {
+				fmt.Printf("  idx points past EOF:    %d\n", r.IdxNotInBlocks)
+			}
+			if r.IdxLengthMismatch > 0 {
+				fmt.Printf("  idx vs walk len mismatch: %d\n", r.IdxLengthMismatch)
+			}
+			if r.OrphanRecords > 0 {
+				fmt.Printf("  orphan records:    %d   (in .blocks but no idx entry)\n", r.OrphanRecords)
+			}
+			if r.OrphanBytesAfterWalk > 0 {
+				fmt.Printf("  trailing orphan bytes: %s   (after offset %d)\n",
+					humanBytes(r.OrphanBytesAfterWalk), r.WalkLastEnd)
+			}
+			if len(r.WalkErrors) > 0 {
+				fmt.Printf("  walk errors:\n")
+				for _, e := range r.WalkErrors {
+					fmt.Printf("    %s\n", e)
+				}
+			}
+			if !clean && len(r.Errors) > 0 {
+				show := len(r.Errors)
+				if show > 10 {
+					show = 10
+				}
+				fmt.Printf("  first %d errors:\n", show)
+				for _, e := range r.Errors[:show] {
+					fmt.Printf("    %s\n", e)
+				}
+				if len(r.Errors) > 10 {
+					fmt.Printf("    ... (%d more)\n", len(r.Errors)-10)
+				}
+			}
+			fmt.Println()
+		}
+	}
+
+	fmt.Println("─────────────────────────────────────────────────────────")
+	fmt.Printf("fsck totals\n")
+	fmt.Printf("  shards:            %d   (%d clean, %d with issues)\n",
+		totals.shards, totals.shardsClean, totals.shardsWithIssue)
+	fmt.Printf("  idx entries:       %s\n", commafmt(uint64(totals.entries)))
+	fmt.Printf("  blocks records:    %s   (%s on disk)\n",
+		commafmt(uint64(totals.records)), humanBytes(totals.bytes))
+	fmt.Printf("  CRC checked:       %s   (%d bad)\n",
+		commafmt(uint64(totals.crcChecked)), totals.crcBad)
+	fmt.Printf("  idx-bad-length:    %d\n", totals.idxBad)
+	fmt.Printf("  idx-past-EOF:      %d\n", totals.idxNotInBlocks)
+	fmt.Printf("  idx-len-mismatch:  %d\n", totals.idxLenMismatch)
+	fmt.Printf("  orphan records:    %d\n", totals.orphanRecs)
+	fmt.Printf("  orphan bytes:      %s\n", humanBytes(totals.orphanBytes))
+	fmt.Printf("  walk errors:       %d\n", totals.walkErrors)
+	fmt.Printf("  ran in %s\n", dur.Truncate(time.Millisecond))
+
+	if totals.crcBad > 0 || totals.idxBad > 0 || totals.idxNotInBlocks > 0 ||
+		totals.idxLenMismatch > 0 || totals.orphanRecs > 0 || totals.walkErrors > 0 {
+		os.Exit(1)
+	}
 }
 
 // runVerifyChain walks every contiguous range sequentially, checking:

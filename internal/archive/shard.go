@@ -149,15 +149,21 @@ func (s *Shard) Get(h uint64) ([]byte, error) {
 		return nil, ErrNotPresent
 	}
 	if e.Length > maxBlockBytes {
-		return nil, fmt.Errorf("absurd block length %d at height %d", e.Length, h)
+		return nil, fmt.Errorf(
+			"absurd block length %d at height %d  (file=%s offset=%d  idx may be corrupt)",
+			e.Length, h, s.blocksPath, int64(e.Offset)+4)
 	}
 	// .blocks layout: [u32 length][block bytes]. Skip the prefix.
 	buf := make([]byte, e.Length)
 	if _, err := s.blocks.ReadAt(buf, int64(e.Offset)+4); err != nil {
-		return nil, fmt.Errorf("read block bytes: %w", err)
+		return nil, fmt.Errorf(
+			"read block bytes at height %d: %w  (file=%s offset=%d length=%d)",
+			h, err, s.blocksPath, int64(e.Offset)+4, e.Length)
 	}
 	if got := crc32.ChecksumIEEE(buf); got != e.CRC32 {
-		return nil, fmt.Errorf("crc mismatch at height %d: stored=%08x got=%08x", h, e.CRC32, got)
+		return nil, fmt.Errorf(
+			"crc mismatch at height %d: stored=%08x got=%08x  (file=%s offset=%d length=%d)",
+			h, e.CRC32, got, s.blocksPath, int64(e.Offset)+4, e.Length)
 	}
 	return buf, nil
 }
@@ -295,6 +301,163 @@ func (s *Shard) PresentRange() (min, max uint64, count int) {
 		return 0, 0, 0
 	}
 	return s.base + uint64(first), s.base + uint64(last), count
+}
+
+// FSCKReport is the output of WalkBlocks.
+type FSCKReport struct {
+	BlocksPath string
+	IdxPath    string
+
+	// IdxEntries: number of slots with length>0 in .idx
+	IdxEntries int
+	// IdxBadEntries: idx entries whose length > maxBlockBytes (corrupt)
+	IdxBadEntries int
+
+	// .blocks self-walk via length prefixes
+	BlocksFileSize int64
+	WalkRecords    int
+	WalkLastEnd    int64
+	WalkErrors     []string
+
+	// Cross-checks (idx vs walk)
+	OrphanBytesAfterWalk int64 // bytes in .blocks past the last record we could parse
+	OrphanRecords        int   // records found in walk but no matching idx entry
+	IdxNotInBlocks       int   // idx entries pointing past EOF
+	IdxLengthMismatch    int   // idx says length=L but length-prefix says L'
+
+	// CRC checks (limited to MaxCRC, otherwise the caller can run verify)
+	CRCChecked int
+	CRCBad     int
+
+	// Fatal: per-shard go-no-go.
+	Errors []string
+}
+
+// FSCK runs a deep consistency check on this shard:
+//   - Walks .blocks from offset 0 using length prefixes (independent of .idx).
+//   - For each .blocks record, looks up the corresponding .idx entry by
+//     scanning idx entries with matching offset.
+//   - Counts orphan bytes (in .blocks but unreachable via .idx).
+//   - Counts idx entries that point past EOF or have absurd lengths.
+//
+// maxCRC limits how many records get a full CRC32 check (-1 = all).
+func (s *Shard) FSCK(maxCRC int) (FSCKReport, error) {
+	rep := FSCKReport{
+		BlocksPath: s.blocksPath,
+		IdxPath:    s.idxPath,
+	}
+	bs, err := s.blocks.Stat()
+	if err != nil {
+		return rep, fmt.Errorf("stat .blocks: %w", err)
+	}
+	rep.BlocksFileSize = bs.Size()
+
+	// Build a map of expected idx entries by offset, for cross-check.
+	full := int64(ChunkSize) * int64(indexEntrySize)
+	idxBuf := make([]byte, full)
+	if _, err := s.idx.ReadAt(idxBuf, int64(headerLen)); err != nil && err != io.EOF {
+		return rep, fmt.Errorf("read full idx: %w", err)
+	}
+	type idxRef struct {
+		height uint64
+		entry  IndexEntry
+	}
+	byOffset := make(map[uint64]idxRef, ChunkSize/4)
+	for i := 0; i < ChunkSize; i++ {
+		var e IndexEntry
+		_ = e.UnmarshalBinary(idxBuf[i*indexEntrySize:])
+		if e.Length == 0 {
+			continue
+		}
+		rep.IdxEntries++
+		if e.Length > maxBlockBytes {
+			rep.IdxBadEntries++
+			rep.Errors = append(rep.Errors, fmt.Sprintf(
+				"idx entry h=%d has absurd length %d", s.base+uint64(i), e.Length))
+			continue
+		}
+		// idx points past EOF?
+		needEnd := int64(e.Offset) + 4 + int64(e.Length)
+		if needEnd > rep.BlocksFileSize {
+			rep.IdxNotInBlocks++
+			rep.Errors = append(rep.Errors, fmt.Sprintf(
+				"idx entry h=%d points past EOF: needs offset %d..%d, file size %d",
+				s.base+uint64(i), e.Offset, needEnd, rep.BlocksFileSize))
+			continue
+		}
+		byOffset[e.Offset] = idxRef{height: s.base + uint64(i), entry: e}
+	}
+
+	// Walk .blocks from 0, following length prefixes.
+	var off int64
+	for off < rep.BlocksFileSize {
+		var lenPrefix [4]byte
+		if _, err := s.blocks.ReadAt(lenPrefix[:], off); err != nil {
+			rep.WalkErrors = append(rep.WalkErrors, fmt.Sprintf(
+				"can't read length prefix at offset %d: %v", off, err))
+			break
+		}
+		recLen := int64(binary.BigEndian.Uint32(lenPrefix[:]))
+		if recLen <= 0 || recLen > maxBlockBytes {
+			rep.WalkErrors = append(rep.WalkErrors, fmt.Sprintf(
+				"bad length prefix %d at offset %d (.blocks may be truncated/corrupt here)",
+				recLen, off))
+			break
+		}
+		nextOff := off + 4 + recLen
+		if nextOff > rep.BlocksFileSize {
+			rep.WalkErrors = append(rep.WalkErrors, fmt.Sprintf(
+				"record at offset %d claims length %d but extends past EOF (file size %d)",
+				off, recLen, rep.BlocksFileSize))
+			break
+		}
+
+		// Cross-check against idx.
+		if ref, ok := byOffset[uint64(off)]; ok {
+			if uint32(recLen) != ref.entry.Length {
+				rep.IdxLengthMismatch++
+				rep.Errors = append(rep.Errors, fmt.Sprintf(
+					"idx vs .blocks length mismatch at offset %d (h=%d): idx says %d, length-prefix says %d",
+					off, ref.height, ref.entry.Length, recLen))
+			}
+			if maxCRC < 0 || rep.CRCChecked < maxCRC {
+				buf := make([]byte, recLen)
+				if _, err := s.blocks.ReadAt(buf, off+4); err == nil {
+					if got := crc32.ChecksumIEEE(buf); got != ref.entry.CRC32 {
+						rep.CRCBad++
+						rep.Errors = append(rep.Errors, fmt.Sprintf(
+							"crc mismatch at offset %d (h=%d): stored=%08x got=%08x",
+							off, ref.height, ref.entry.CRC32, got))
+					}
+					rep.CRCChecked++
+				}
+			}
+			delete(byOffset, uint64(off))
+		} else {
+			rep.OrphanRecords++
+			rep.Errors = append(rep.Errors, fmt.Sprintf(
+				"orphan record at offset %d length %d — present in .blocks but no idx entry points here",
+				off, recLen))
+		}
+
+		rep.WalkRecords++
+		rep.WalkLastEnd = nextOff
+		off = nextOff
+	}
+
+	// Anything left in byOffset = idx-claimed records we couldn't find via walk.
+	for _, ref := range byOffset {
+		rep.Errors = append(rep.Errors, fmt.Sprintf(
+			"idx says h=%d at offset %d length %d, but blocks-walk never reached that offset",
+			ref.height, ref.entry.Offset, ref.entry.Length))
+	}
+
+	// Trailing bytes after the last successful walk record (no records expected past here).
+	if rep.WalkLastEnd < rep.BlocksFileSize {
+		rep.OrphanBytesAfterWalk = rep.BlocksFileSize - rep.WalkLastEnd
+	}
+
+	return rep, nil
 }
 
 // PresentBitmap returns a slice of length ChunkSize where bit i is 1 if

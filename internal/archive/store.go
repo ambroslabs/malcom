@@ -206,6 +206,28 @@ func (s *Store) Ranges() ([]Range, uint64, error) {
 	return out, total, nil
 }
 
+// FSCKAll runs a deep consistency check on every shard. Reports indexed
+// by base height, in ascending order.
+func (s *Store) FSCKAll(maxCRCPerShard int) (map[uint64]FSCKReport, error) {
+	bases, err := s.ShardBases()
+	if err != nil {
+		return nil, err
+	}
+	out := make(map[uint64]FSCKReport, len(bases))
+	for _, b := range bases {
+		sh, err := s.shard(b)
+		if err != nil {
+			return out, err
+		}
+		rep, err := sh.FSCK(maxCRCPerShard)
+		if err != nil {
+			return out, fmt.Errorf("fsck shard %d: %w", b, err)
+		}
+		out[b] = rep
+	}
+	return out, nil
+}
+
 // Missing returns the gap ranges between Lo and Hi (inclusive) that are
 // not present on disk. Useful for the downloader's work-queue.
 func (s *Store) Missing(lo, hi uint64) ([]Range, uint64, error) {
