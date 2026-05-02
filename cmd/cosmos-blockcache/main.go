@@ -10,10 +10,13 @@ import (
 	"flag"
 	"fmt"
 	"log"
+	"net"
 	"os"
 	"os/signal"
 	"path/filepath"
 	"sort"
+	"strings"
+	"sync"
 	"syscall"
 	"time"
 
@@ -21,6 +24,7 @@ import (
 	cmtlog "github.com/cometbft/cometbft/libs/log"
 	"github.com/cometbft/cometbft/p2p"
 	"github.com/cometbft/cometbft/p2p/conn"
+	tmp2pproto "github.com/cometbft/cometbft/proto/tendermint/p2p"
 	"github.com/cometbft/cometbft/version"
 
 	"github.com/zrbecker/cosmos-p2p/internal/blockcache"
@@ -158,11 +162,13 @@ func main() {
 	// Pull every known cosmoshub-4 peer; the dial loop cycles through them
 	// and only the responsive ones will end up connected. Bound is set high
 	// so we don't artificially restrict the outbound pool.
+	dialer := NewDialer()
 	candidates := pickPeers(*cumulativeDB, 4096)
-	if len(candidates) == 0 {
+	dialer.AddAll(candidates)
+	if dialer.Size() == 0 {
 		log.Fatalf("no candidate peers in %s", *cumulativeDB)
 	}
-	logger.Info("connecting", "candidates", len(candidates), "want_outbound", *maxPeers, "self_id", nodeKey.ID())
+	logger.Info("connecting", "initial_candidates", dialer.Size(), "want_outbound", *maxPeers, "self_id", nodeKey.ID())
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -175,7 +181,13 @@ func main() {
 	}()
 
 	// Start dialing in the background; keep adding peers until we hit the cap.
-	go dialUntilFull(ctx, sw, candidates, *maxPeers, logger.With("module", "blockcache"))
+	go dialUntilFull(ctx, sw, dialer, *maxPeers, logger.With("module", "blockcache"))
+
+	// Feed PEX-discovered peers into the dialer.
+	go consumePEX(ctx, pexR, dialer, logger.With("module", "blockcache"))
+
+	// Periodically re-issue PexRequest so seeds give us fresh batches.
+	go rePEXLoop(ctx, sw, logger.With("module", "blockcache"))
 
 	// Drive the sync loop.
 	go reactor.SyncLoop(ctx)
@@ -431,8 +443,71 @@ func discoveriesLoop(ctx context.Context, reactor *blockcache.Reactor, path stri
 	}
 }
 
-func dialUntilFull(ctx context.Context, sw *p2p.Switch, candidates []string, want int, logger cmtlog.Logger) {
-	idx := 0
+// Dialer is a thread-safe pool of nodeID@host:port candidates that grows
+// over time as PEX gossips new addresses to us. It cycles forever; the dial
+// loop just keeps pulling the next candidate.
+type Dialer struct {
+	mu     sync.Mutex
+	seen   map[string]struct{}
+	queue  []string
+	cursor int
+}
+
+func NewDialer() *Dialer {
+	return &Dialer{seen: make(map[string]struct{})}
+}
+
+// Add registers a candidate. Returns true if it was new.
+func (d *Dialer) Add(addr string) bool {
+	at := strings.IndexByte(addr, '@')
+	if at <= 0 {
+		return false
+	}
+	nodeID := addr[:at]
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	if _, ok := d.seen[nodeID]; ok {
+		return false
+	}
+	d.seen[nodeID] = struct{}{}
+	d.queue = append(d.queue, addr)
+	return true
+}
+
+// AddAll dedups and returns the count of newly-added addresses.
+func (d *Dialer) AddAll(addrs []string) int {
+	n := 0
+	for _, a := range addrs {
+		if d.Add(a) {
+			n++
+		}
+	}
+	return n
+}
+
+// Next returns the next candidate to try (round-robin), or "" if empty.
+func (d *Dialer) Next() string {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	if len(d.queue) == 0 {
+		return ""
+	}
+	if d.cursor >= len(d.queue) {
+		d.cursor = 0
+	}
+	addr := d.queue[d.cursor]
+	d.cursor++
+	return addr
+}
+
+// Size reports the current pool size.
+func (d *Dialer) Size() int {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	return len(d.queue)
+}
+
+func dialUntilFull(ctx context.Context, sw *p2p.Switch, dialer *Dialer, want int, logger cmtlog.Logger) {
 	for {
 		select {
 		case <-ctx.Done():
@@ -444,23 +519,69 @@ func dialUntilFull(ctx context.Context, sw *p2p.Switch, candidates []string, wan
 			time.Sleep(2 * time.Second)
 			continue
 		}
-		if idx >= len(candidates) {
-			// Cycle the list — many candidates fail; we keep retrying.
+		addr := dialer.Next()
+		if addr == "" {
 			time.Sleep(5 * time.Second)
-			idx = 0
 			continue
 		}
-		addr := candidates[idx]
-		idx++
 		na, err := p2p.NewNetAddressString(addr)
 		if err != nil {
 			continue
 		}
-		err = sw.DialPeerWithAddress(na)
-		if err != nil {
+		if err := sw.DialPeerWithAddress(na); err != nil {
 			logger.Debug("dial failed", "peer", na.ID, "err", err)
 		} else {
 			logger.Info("connected", "peer", na.ID)
+		}
+	}
+}
+
+// consumePEX pulls every PexAddrs batch we receive and feeds new addresses
+// into the dialer. This is the missing wire that turns PEX from "we ask but
+// drop the answer" into a self-growing peer pool.
+func consumePEX(ctx context.Context, pexR *pex.Reactor, dialer *Dialer, logger cmtlog.Logger) {
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case ev := <-pexR.Out:
+			added := 0
+			for _, na := range ev.Addrs {
+				if na.IP == "" || na.Port == 0 || na.ID == "" {
+					continue
+				}
+				host := na.IP
+				if ip := net.ParseIP(host); ip != nil && ip.To4() == nil {
+					host = "[" + host + "]" // bracket IPv6
+				}
+				addr := fmt.Sprintf("%s@%s:%d", na.ID, host, na.Port)
+				if dialer.Add(addr) {
+					added++
+				}
+			}
+			if added > 0 {
+				logger.Info("pex grew dialer pool", "new", added, "from", ev.Source[:10], "queue_size", dialer.Size())
+			}
+		}
+	}
+}
+
+// rePEXLoop periodically asks every connected peer for fresh addresses.
+// Cometbft enforces a min interval ≈ 40 s (defaultEnsurePeersPeriod + 10s)
+// per peer; asking more often gets us disconnected with
+// ErrReceivedPEXRequestTooSoon. 60 s leaves margin.
+func rePEXLoop(ctx context.Context, sw *p2p.Switch, logger cmtlog.Logger) {
+	t := time.NewTicker(60 * time.Second)
+	defer t.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-t.C:
+			req := &tmp2pproto.PexRequest{}
+			for _, p := range sw.Peers().List() {
+				p.TrySend(p2p.Envelope{ChannelID: pex.Channel, Message: req})
+			}
 		}
 	}
 }
