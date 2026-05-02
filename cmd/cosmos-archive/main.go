@@ -8,6 +8,7 @@ package main
 
 import (
 	"context"
+	"crypto/sha256"
 	"encoding/json"
 	"flag"
 	"fmt"
@@ -52,6 +53,7 @@ Subcommands:
   status     one-screen dashboard (latest [archive] line + ranges + disk)
   verify     read every (or sampled) block on disk and check CRC + proto + height
   verify-chain  sequential per-range walk: Block.ValidateBasic + prev↔current chain linkage
+  verify-genesis  recompute genesis-block header fields from genesis.json and compare
   fsck       deep on-disk integrity check (.blocks self-walk, idx cross-check, CRC, orphan detection)
   download   fetch missing blocks from archive peers (long-running)
 
@@ -79,6 +81,8 @@ func main() {
 		runVerifyChain(os.Args[2:])
 	case "fsck":
 		runFSCK(os.Args[2:])
+	case "verify-genesis":
+		runVerifyGenesis(os.Args[2:])
 	case "download":
 		runDownload(os.Args[2:])
 	case "-h", "--help", "help":
@@ -429,6 +433,152 @@ func fmtDur(s float64) string {
 		return fmt.Sprintf("%.1fs", s)
 	}
 	return d.Truncate(time.Second).String()
+}
+
+// runVerifyGenesis recomputes header fields of the chain's genesis block
+// from genesis.json and compares them against the block on disk. Verifies
+// that our archive's earliest block is the cryptographic start of the
+// chain described by the genesis file.
+//
+// Most fields can be recomputed from genesis.json alone (chain ID, height,
+// time, validator-set merkle root, consensus-params hash, the various
+// "empty" canonical hashes for LastCommit/Data/Evidence/LastResults, etc.).
+//
+// Two fields can NOT be derived from genesis.json without running the
+// app's InitChain: AppHash (computed by cosmos-sdk processing app_state)
+// and ProposerAddress (chain-specific proposer-selection rule). They're
+// reported as observed-from-block but not independently verified.
+func runVerifyGenesis(args []string) {
+	fs := flag.NewFlagSet("verify-genesis", flag.ExitOnError)
+	dir := fs.String("archive", "/mnt/data/cosmos-archive/cosmoshub-4", "archive root directory")
+	genesisPath := fs.String("genesis", "", "path to genesis.json (required)")
+	_ = fs.Parse(args)
+
+	if *genesisPath == "" {
+		fmt.Fprintln(os.Stderr, "error: -genesis is required")
+		os.Exit(2)
+	}
+
+	loadStart := time.Now()
+	genDoc, err := types.GenesisDocFromFile(*genesisPath)
+	if err != nil {
+		log.Fatalf("read genesis: %v", err)
+	}
+	if err := genDoc.ValidateAndComplete(); err != nil {
+		log.Fatalf("genesis validate: %v", err)
+	}
+	fmt.Printf("loaded %s in %s\n", *genesisPath, time.Since(loadStart).Truncate(time.Millisecond))
+	fmt.Printf("genesis: chain_id=%s  initial_height=%d  time=%s  validators=%d\n\n",
+		genDoc.ChainID, genDoc.InitialHeight,
+		genDoc.GenesisTime.UTC().Format(time.RFC3339Nano),
+		len(genDoc.Validators))
+
+	st, err := archive.New(*dir)
+	if err != nil {
+		log.Fatalf("open archive: %v", err)
+	}
+	defer st.Close()
+
+	rawBytes, err := st.Get(uint64(genDoc.InitialHeight))
+	if err != nil {
+		log.Fatalf("read genesis block (h=%d): %v", genDoc.InitialHeight, err)
+	}
+	var pb cmtproto.Block
+	if err := proto.Unmarshal(rawBytes, &pb); err != nil {
+		log.Fatalf("decode genesis block: %v", err)
+	}
+	block, err := types.BlockFromProto(&pb)
+	if err != nil {
+		log.Fatalf("BlockFromProto: %v", err)
+	}
+	hdr := block.Header
+
+	fmt.Printf("genesis block on disk: hash=%X size=%d bytes\n\n",
+		block.Hash(), len(rawBytes))
+
+	// Track results.
+	var (
+		pass int
+		fail int
+	)
+	check := func(name, expected, got string) {
+		ok := expected == got
+		marker := "✓"
+		if !ok {
+			marker = "✗"
+			fail++
+		} else {
+			pass++
+		}
+		fmt.Printf("  %s %-22s  %s\n", marker, name, got)
+		if !ok {
+			fmt.Printf("                            expected: %s\n", expected)
+		}
+	}
+	hexEq := func(name string, want, got []byte) {
+		check(name, fmt.Sprintf("%X", want), fmt.Sprintf("%X", got))
+	}
+
+	fmt.Println("─── header fields recomputed from genesis.json ───")
+
+	check("ChainID", genDoc.ChainID, hdr.ChainID)
+	check("Height", fmt.Sprintf("%d", genDoc.InitialHeight), fmt.Sprintf("%d", hdr.Height))
+	check("Time",
+		genDoc.GenesisTime.UTC().Format(time.RFC3339Nano),
+		hdr.Time.UTC().Format(time.RFC3339Nano))
+
+	// ValidatorsHash + NextValidatorsHash both equal merkle of genesis validators.
+	expVH := genDoc.ValidatorHash()
+	hexEq("ValidatorsHash", expVH, []byte(hdr.ValidatorsHash))
+	hexEq("NextValidatorsHash", expVH, []byte(hdr.NextValidatorsHash))
+
+	// ConsensusHash from genesis params.
+	expCH := genDoc.ConsensusParams.Hash()
+	hexEq("ConsensusHash", expCH, []byte(hdr.ConsensusHash))
+
+	// LastBlockID empty for genesis.
+	var emptyBID types.BlockID
+	check("LastBlockID", emptyBID.String(), hdr.LastBlockID.String())
+
+	// LastCommitHash, DataHash, EvidenceHash all hashes-of-empty.
+	emptyCommit := &types.Commit{}
+	hexEq("LastCommitHash", emptyCommit.Hash(), []byte(hdr.LastCommitHash))
+
+	emptyData := types.Data{}
+	hexEq("DataHash", emptyData.Hash(), []byte(hdr.DataHash))
+
+	var emptyEv types.EvidenceData
+	hexEq("EvidenceHash", emptyEv.Hash(), []byte(hdr.EvidenceHash))
+
+	// LastResultsHash for genesis is the canonical hash-of-empty (no prior
+	// block has any tx results to hash). Cometbft uses sha256(nil), which is
+	// the same constant we see for empty Data/Commit/Evidence above.
+	emptySha := sha256.Sum256(nil)
+	hexEq("LastResultsHash", emptySha[:], []byte(hdr.LastResultsHash))
+
+	fmt.Println()
+	fmt.Println("─── fields that genesis.json alone does NOT determine ───")
+	fmt.Printf("  ? AppHash               %X\n", []byte(hdr.AppHash))
+	if len(genDoc.AppHash) > 0 {
+		fmt.Printf("                            genesis.app_hash: %X\n", []byte(genDoc.AppHash))
+		fmt.Printf("                            (would only match if no InitChain transformation; cosmoshub-4 runs InitChain so they differ)\n")
+	} else {
+		fmt.Printf("                            genesis.app_hash is empty (cosmos-sdk's InitChain produced this AppHash)\n")
+	}
+	fmt.Printf("  ? ProposerAddress       %X\n", []byte(hdr.ProposerAddress))
+	fmt.Printf("                            (chain-specific genesis-proposer rule; not derived here)\n")
+
+	fmt.Println()
+	fmt.Println("─────────────────────────────────────────────────────────")
+	fmt.Printf("verifiable header fields: %d/%d match\n", pass, pass+fail)
+	if fail == 0 {
+		fmt.Println()
+		fmt.Println("✓ The first block on disk is provably the genesis block of the chain")
+		fmt.Println("  described by this genesis.json. Combined with verify-chain forward")
+		fmt.Println("  to a recent trust anchor, the entire archive is anchored.")
+	} else {
+		os.Exit(1)
+	}
 }
 
 // runFSCK runs a deep on-disk integrity check across every shard:
