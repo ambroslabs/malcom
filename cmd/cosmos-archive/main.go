@@ -16,6 +16,7 @@ import (
 	"os/signal"
 	"path/filepath"
 	"sort"
+	"strings"
 	"sync"
 	"syscall"
 	"time"
@@ -24,10 +25,13 @@ import (
 	cmtlog "github.com/cometbft/cometbft/libs/log"
 	"github.com/cometbft/cometbft/p2p"
 	"github.com/cometbft/cometbft/p2p/conn"
+	tmp2pproto "github.com/cometbft/cometbft/proto/tendermint/p2p"
 	"github.com/cometbft/cometbft/version"
+	gnet "net"
 
 	"github.com/zrbecker/cosmos-p2p/internal/archive"
 	"github.com/zrbecker/cosmos-p2p/internal/archivesync"
+	"github.com/zrbecker/cosmos-p2p/internal/pex"
 )
 
 func usage() {
@@ -245,6 +249,80 @@ func runStats(args []string) {
 	_ = totalCount
 }
 
+// chainRegistrySeeds: hand-curated cosmoshub seeds (PEX-rich nodes that
+// hand out address batches). Same list cosmos-blockcache uses.
+func chainRegistrySeeds() []string {
+	return []string{
+		"ba3bacc714817218562f743178228f23678b2873@public-seed-node.cosmoshub.certus.one:26656",
+		"ade4d8bc8cbe014af6ebdf3cb7b1e9ad36f412c0@seeds.polkachu.com:14956",
+		"20e1000e88125698264454a884812746c2eb4807@seeds.lavenderfive.com:14956",
+		"57a5297537b9b6ef8b105c08a8ad3f6ac452c423@seeds.goldenratiostaking.net:1618",
+		"c28827cb96c14c905b127b92065a3fb4cd77d7f6@seeds.whispernode.com:14956",
+		"8542cd7e6bf9d260fef543bc49e59be5a3fa9074@seed.publicnode.com:26656",
+		"400f3d9e30b69e78a7fb891f60d76fa3c73f0ecc@cosmoshub.rpc.kjnodes.com:11359",
+		"fe21dd474640247888fc7c4dce82da8da08a8bfd@seed-cosmos-hub-01.stakeflow.io:26656",
+		"11c6114a18f7b380e536b0bd17c031f4746e4ded@seed-node.mms.team:43656",
+		"87ccc1dcc0b846fc1623ab9a5ab55682e8e2ad2e@seed-cosmoshub.freshstaking.com:26656",
+		"b85358e035343a3b15e77e1102857dcdaf70053b@seeds.bluestake.net:28156",
+		"00bf1f9d3c65137dc99c40cd03864384ce0ef7c3@cosmoshub-mainnet-seed.itrocket.net:34656",
+		"10ed1e176d874c8bb3c7c065685d2da6a4b86475@seed-cosmos.ibs.team:16685",
+		"d567c93fa5b646c8cca8ba0a2d7499bca6aeba52@mainnet.seednode.citizenweb3.com:26656",
+	}
+}
+
+// loadAllPeers returns every peer address from the cumulative DB,
+// regardless of base height. Used as a low-priority dial pool feeder so we
+// keep many connections open for PEX gossip.
+func loadAllPeers(path string) []string {
+	f, err := os.Open(path)
+	if err != nil {
+		return nil
+	}
+	defer f.Close()
+	var all []peerCand
+	if err := json.NewDecoder(f).Decode(&all); err != nil {
+		return nil
+	}
+	out := make([]string, 0, len(all))
+	for _, p := range all {
+		if p.Network == "" || p.Network == "cosmoshub-4" {
+			if p.Addr != "" {
+				out = append(out, p.Addr)
+			}
+		}
+	}
+	return out
+}
+
+// consumePEX pulls every PexAddrs batch into the dialer. The reactor's
+// backoff and seen-set make this idempotent.
+func consumePEX(ctx context.Context, pexR *pex.Reactor, d *dialer, logger cmtlog.Logger) {
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case ev := <-pexR.Out:
+			added := 0
+			for _, na := range ev.Addrs {
+				if na.IP == "" || na.Port == 0 || na.ID == "" {
+					continue
+				}
+				host := na.IP
+				if ip := gnet.ParseIP(host); ip != nil && ip.To4() == nil {
+					host = "[" + host + "]"
+				}
+				addr := fmt.Sprintf("%s@%s:%d", na.ID, host, na.Port)
+				if d.add(addr) {
+					added++
+				}
+			}
+			if added > 0 {
+				logger.Info("pex grew dialer", "new", added, "from", ev.Source[:10], "pool_size", d.size())
+			}
+		}
+	}
+}
+
 // peerCand mirrors what the cosmos-blockcache cumulative DB stores.
 type peerCand struct {
 	Addr         string `json:"addr"`
@@ -297,10 +375,11 @@ func runDownload(args []string) {
 	listen := fs.String("listen", "tcp://0.0.0.0:0", "p2p bind address")
 	moniker := fs.String("moniker", "cosmos-archive-fetcher", "self moniker")
 	peersDB := fs.String("peers", "data/peers-cumulative.json", "load archive peers from this cumulative DB")
-	maxPeers := fs.Int("max-peers", 16, "concurrent outbound peer connections")
+	maxPeers := fs.Int("max-peers", 50, "concurrent outbound peer connections (most are non-archive; we keep them for PEX gossip and only BlockRequest archive-eligible peers)")
 	maxInflight := fs.Int("max-inflight", 512, "global concurrent BlockRequests")
 	maxInflightPeer := fs.Int("max-inflight-per-peer", 32, "concurrent BlockRequests per peer (cosmoshub archive nodes seem to handle ≥32 fine)")
-	dialWorkers := fs.Int("dial-workers", 8, "parallel dial workers (helps when target peers are slow to handshake)")
+	dialWorkers := fs.Int("dial-workers", 16, "parallel dial workers (helps when target peers are slow to handshake)")
+	externalAddr := fs.String("external-addr", "", "publicly-dialable host:port to advertise via PEX. Empty disables PEX-server-side. (e.g. 64.23.187.105:26656)")
 	loFlag := fs.Int64("lo", 5_200_791, "lowest height to download")
 	hiFlag := fs.Int64("hi", 0, "highest height to download (0 ⇒ derived from peer status, capped to network tip)")
 	debug := fs.Bool("debug", false, "verbose logging")
@@ -362,13 +441,17 @@ func runDownload(args []string) {
 	if err != nil {
 		log.Fatal(err)
 	}
+	advertisedAddr := listenAddr.DialString()
+	if *externalAddr != "" {
+		advertisedAddr = *externalAddr
+	}
 	nodeInfo := p2p.DefaultNodeInfo{
 		ProtocolVersion: p2p.NewProtocolVersion(version.P2PProtocol, version.BlockProtocol, 0),
 		DefaultNodeID:   nodeKey.ID(),
-		ListenAddr:      listenAddr.DialString(),
+		ListenAddr:      advertisedAddr,
 		Network:         *chainID,
 		Version:         version.TMCoreSemVer,
-		Channels:        []byte{archivesync.Channel},
+		Channels:        []byte{pex.Channel, archivesync.Channel},
 		Moniker:         *moniker,
 		Other:           p2p.DefaultNodeInfoOther{TxIndex: "off"},
 	}
@@ -392,21 +475,48 @@ func runDownload(args []string) {
 	reactor.MaxInflightPerPeer = *maxInflightPeer
 	reactor.MinPeerBase = *loFlag
 
+	pexR := pex.NewReactor(logger.With("module", "pex"))
+	if *externalAddr != "" {
+		if naSelf, err := p2p.NewNetAddressString(p2p.IDAddressString(nodeKey.ID(), "tcp://"+*externalAddr)); err == nil {
+			pexR.SetSelf(*naSelf)
+		}
+	}
+
 	sw := p2p.NewSwitch(p2pCfg, transport)
 	sw.SetLogger(logger.With("module", "p2p"))
 	sw.SetNodeKey(nodeKey)
 	sw.SetNodeInfo(nodeInfo)
+	sw.AddReactor("PEX", pexR)
 	sw.AddReactor("ARCHIVE", reactor)
 	if err := sw.Start(); err != nil {
 		log.Fatalf("switch.Start: %v", err)
 	}
 	defer func() { _ = sw.Stop() }()
 
-	candidates := loadArchivePeers(*peersDB, *loFlag)
-	if len(candidates) == 0 {
-		log.Fatalf("no archive-eligible peers in %s (require base ≤ %d)", *peersDB, *loFlag)
+	// Build the dial pool with three sources:
+	//   1. The 8 known archive nodes (highest priority — pinned first).
+	//   2. Chain-registry seed nodes (PEX-rich; gossip more peers to us).
+	//   3. The full cumulative DB (most non-archive but we keep them for
+	//      PEX gossip; the archivesync reactor's MinPeerBase filter means
+	//      we won't BlockRequest from them).
+	dialer := newDialer(string(nodeKey.ID()))
+	archiveCands := loadArchivePeers(*peersDB, *loFlag)
+	for _, a := range archiveCands {
+		dialer.add(a)
 	}
-	logger.Info("archive-eligible peer candidates", "count", len(candidates))
+	for _, a := range chainRegistrySeeds() {
+		dialer.add(a)
+	}
+	for _, a := range loadAllPeers(*peersDB) {
+		dialer.add(a)
+	}
+	if dialer.size() == 0 {
+		log.Fatalf("no peer candidates")
+	}
+	logger.Info("dial pool",
+		"archive_nodes", len(archiveCands),
+		"chain_registry_seeds", len(chainRegistrySeeds()),
+		"total_initial", dialer.size())
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -420,11 +530,32 @@ func runDownload(args []string) {
 		cancel()
 	}()
 
-	// Dial candidates in parallel; each worker pulls from a shared cursor.
-	pool := &dialPoolState{}
+	// Dial workers pull from the shared dialer (with per-peer backoff).
 	for i := 0; i < *dialWorkers; i++ {
-		go dialCycle(ctx, sw, candidates, *maxPeers, pool, logger.With("module", "archivesync", "dial", i))
+		go dialCycle(ctx, sw, dialer, *maxPeers, logger.With("module", "archivesync", "dial", i))
 	}
+
+	// PEX consumer: every PexAddrs batch we receive feeds into the dialer.
+	go consumePEX(ctx, pexR, dialer, logger.With("module", "archivesync"))
+
+	// Periodic re-PEX: ask each currently-connected peer for fresh peer
+	// addresses every 60s. Cometbft enforces a 40s minimum between PEX
+	// requests; 60s leaves margin.
+	go func() {
+		t := time.NewTicker(60 * time.Second)
+		defer t.Stop()
+		req := &tmp2pproto.PexRequest{}
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-t.C:
+				for _, p := range sw.Peers().List() {
+					p.TrySend(p2p.Envelope{ChannelID: pex.Channel, Message: req})
+				}
+			}
+		}
+	}()
 
 	// Drive the reactor.
 	go reactor.SyncLoop(ctx)
@@ -477,19 +608,133 @@ func runDownload(args []string) {
 	}
 }
 
-// dialPoolState shares a round-robin cursor across parallel dialCycle workers.
-type dialPoolState struct {
-	mu     sync.Mutex
-	cursor int
+// dialer is a thread-safe pool of nodeID@host:port candidates with
+// per-peer exponential backoff after failures. Cycles forever; the dial
+// loop pulls the next ready candidate.
+//
+// Backoff schedule: failure i waits min(initialBackoff << i, maxBackoff)
+// before the peer is eligible again. Successful dials reset the counter.
+type dialer struct {
+	self string
+	mu   sync.Mutex
+	// Stable arrival order so we always retry the original archive nodes
+	// first, even after PEX adds thousands of new entries.
+	order   []string
+	state   map[string]*dialState
+	cursor  int
+
+	initialBackoff time.Duration
+	maxBackoff     time.Duration
 }
 
-// dialCycle keeps trying candidates until we hit `want` outbound peers,
-// pulling from a shared cursor so multiple instances don't all attempt
-// the same address at once.
-func dialCycle(ctx context.Context, sw *p2p.Switch, candidates []string, want int, pool *dialPoolState, logger cmtlog.Logger) {
-	if pool == nil {
-		pool = &dialPoolState{}
+type dialState struct {
+	failures   int
+	nextOK     time.Time
+	lastResult string
+}
+
+func newDialer(self string) *dialer {
+	return &dialer{
+		self:           self,
+		state:          make(map[string]*dialState),
+		initialBackoff: 1 * time.Second,
+		maxBackoff:     5 * time.Minute,
 	}
+}
+
+// add registers a candidate. Returns true if it was new.
+func (d *dialer) add(addr string) bool {
+	at := strings.IndexByte(addr, '@')
+	if at <= 0 {
+		return false
+	}
+	if addr[:at] == d.self {
+		return false
+	}
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	if _, ok := d.state[addr]; ok {
+		return false
+	}
+	d.state[addr] = &dialState{}
+	d.order = append(d.order, addr)
+	return true
+}
+
+func (d *dialer) size() int {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	return len(d.order)
+}
+
+// next returns the next candidate that's past its backoff window. Returns
+// "" if every candidate is currently in cooldown.
+func (d *dialer) next() string {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	if len(d.order) == 0 {
+		return ""
+	}
+	now := time.Now()
+	for tries := 0; tries < len(d.order); tries++ {
+		if d.cursor >= len(d.order) {
+			d.cursor = 0
+		}
+		addr := d.order[d.cursor]
+		d.cursor++
+		st, ok := d.state[addr]
+		if !ok {
+			continue
+		}
+		if now.Before(st.nextOK) {
+			continue
+		}
+		// Pre-emptively push the next attempt out by a tiny amount so two
+		// workers don't pick the same address at once before the first one
+		// records a result.
+		st.nextOK = now.Add(500 * time.Millisecond)
+		return addr
+	}
+	return ""
+}
+
+// recordResult notes the outcome of a dial attempt. err==nil ⇒ success.
+func (d *dialer) recordResult(addr string, err error) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	st, ok := d.state[addr]
+	if !ok {
+		return
+	}
+	if err == nil {
+		st.failures = 0
+		st.nextOK = time.Time{}
+		st.lastResult = "ok"
+		return
+	}
+	st.failures++
+	wait := d.initialBackoff << uint(min(st.failures-1, 10))
+	if wait > d.maxBackoff || wait <= 0 {
+		wait = d.maxBackoff
+	}
+	st.nextOK = time.Now().Add(wait)
+	emsg := err.Error()
+	if len(emsg) > 80 {
+		emsg = emsg[:80]
+	}
+	st.lastResult = emsg
+}
+
+func min(a, b int) int {
+	if a < b {
+		return a
+	}
+	return b
+}
+
+// dialCycle keeps trying ready candidates until we hit `want` outbound
+// peers, then idles. Multiple instances share one dialer.
+func dialCycle(ctx context.Context, sw *p2p.Switch, d *dialer, want int, logger cmtlog.Logger) {
 	for {
 		select {
 		case <-ctx.Done():
@@ -501,26 +746,24 @@ func dialCycle(ctx context.Context, sw *p2p.Switch, candidates []string, want in
 			time.Sleep(2 * time.Second)
 			continue
 		}
-		// Pop the next candidate.
-		pool.mu.Lock()
-		if pool.cursor >= len(candidates) {
-			pool.cursor = 0
-			pool.mu.Unlock()
+		addr := d.next()
+		if addr == "" {
+			// All candidates in cooldown; nap before re-checking.
 			time.Sleep(2 * time.Second)
 			continue
 		}
-		addr := candidates[pool.cursor]
-		pool.cursor++
-		pool.mu.Unlock()
-
 		na, err := p2p.NewNetAddressString(addr)
 		if err != nil {
+			d.recordResult(addr, err)
 			continue
 		}
 		if na.ID == sw.NodeInfo().ID() {
+			d.recordResult(addr, fmt.Errorf("self"))
 			continue
 		}
-		if err := sw.DialPeerWithAddress(na); err != nil {
+		err = sw.DialPeerWithAddress(na)
+		d.recordResult(addr, err)
+		if err != nil {
 			logger.Debug("dial failed", "peer", na.ID, "err", err)
 		} else {
 			logger.Info("connected", "peer", na.ID)
