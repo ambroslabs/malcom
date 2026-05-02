@@ -7,6 +7,7 @@ import (
 	"context"
 	"fmt"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/cometbft/cometbft/libs/log"
@@ -48,6 +49,10 @@ type Reactor struct {
 	mu       sync.Mutex
 	peers    map[p2p.ID]*peerState
 	inflight map[int64]inflightEntry // height → peer asked + deadline
+
+	// Per-channel byte tally (only channel 0x40 here).
+	bytesRecv int64
+	bytesSent int64
 
 	// archiveLogged is the set of node IDs we've already announced as archive
 	// (base < ArchiveThreshold). One [ARCHIVE] line per peer per run.
@@ -111,6 +116,16 @@ func (r *Reactor) GetChannels() []*conn.ChannelDescriptor {
 	}}
 }
 
+// noteSent counts bytes for outbound messages (called immediately after a
+// successful send/trysend on channel 0x40). Atomic so it's safe to call
+// from inside paths that already hold r.mu — re-entrant lock would deadlock.
+func (r *Reactor) noteSent(msg proto.Message) {
+	if msg == nil {
+		return
+	}
+	atomic.AddInt64(&r.bytesSent, int64(proto.Size(msg)))
+}
+
 func (r *Reactor) AddPeer(peer p2p.Peer) {
 	r.mu.Lock()
 	ps := &peerState{
@@ -150,14 +165,14 @@ func (r *Reactor) AddPeer(peer p2p.Peer) {
 
 	// Tell them what we have, then ask what they have.
 	base, tip := r.cache.Range()
-	peer.Send(p2p.Envelope{
-		ChannelID: Channel,
-		Message:   &bcproto.StatusResponse{Base: base, Height: tip},
-	})
-	peer.Send(p2p.Envelope{
-		ChannelID: Channel,
-		Message:   &bcproto.StatusRequest{},
-	})
+	srResp := &bcproto.StatusResponse{Base: base, Height: tip}
+	if peer.Send(p2p.Envelope{ChannelID: Channel, Message: srResp}) {
+		r.noteSent(srResp)
+	}
+	srReq := &bcproto.StatusRequest{}
+	if peer.Send(p2p.Envelope{ChannelID: Channel, Message: srReq}) {
+		r.noteSent(srReq)
+	}
 }
 
 func (r *Reactor) RemovePeer(peer p2p.Peer, reason interface{}) {
@@ -175,15 +190,18 @@ func (r *Reactor) RemovePeer(peer p2p.Peer, reason interface{}) {
 
 func (r *Reactor) Receive(env p2p.Envelope) {
 	pid := env.Src.ID()
+	if pm, ok := env.Message.(proto.Message); ok {
+		atomic.AddInt64(&r.bytesRecv, int64(proto.Size(pm)))
+	}
 	switch m := env.Message.(type) {
 
 	case *bcproto.StatusRequest:
 		// Peer wants to know our (base, tip).
 		base, tip := r.cache.Range()
-		env.Src.Send(p2p.Envelope{
-			ChannelID: Channel,
-			Message:   &bcproto.StatusResponse{Base: base, Height: tip},
-		})
+		resp := &bcproto.StatusResponse{Base: base, Height: tip}
+		if env.Src.Send(p2p.Envelope{ChannelID: Channel, Message: resp}) {
+			r.noteSent(resp)
+		}
 		r.mu.Lock()
 		r.statusServed++
 		if ps, ok := r.peers[pid]; ok {
@@ -225,10 +243,10 @@ func (r *Reactor) Receive(env p2p.Envelope) {
 		parsed := r.cache.GetParsed(m.Height)
 		raw := r.cache.GetRaw(m.Height)
 		if parsed != nil {
-			env.Src.Send(p2p.Envelope{
-				ChannelID: Channel,
-				Message:   &bcproto.BlockResponse{Block: parsed},
-			})
+			resp := &bcproto.BlockResponse{Block: parsed}
+			if env.Src.Send(p2p.Envelope{ChannelID: Channel, Message: resp}) {
+				r.noteSent(resp)
+			}
 			r.mu.Lock()
 			r.servedBlocks++
 			if ps, ok := r.peers[pid]; ok {
@@ -238,10 +256,10 @@ func (r *Reactor) Receive(env p2p.Envelope) {
 			}
 			r.mu.Unlock()
 		} else {
-			env.Src.Send(p2p.Envelope{
-				ChannelID: Channel,
-				Message:   &bcproto.NoBlockResponse{Height: m.Height},
-			})
+			resp := &bcproto.NoBlockResponse{Height: m.Height}
+			if env.Src.Send(p2p.Envelope{ChannelID: Channel, Message: resp}) {
+				r.noteSent(resp)
+			}
 			r.mu.Lock()
 			r.missedBlocks++
 			if ps, ok := r.peers[pid]; ok {
@@ -305,11 +323,11 @@ func (r *Reactor) pollStatus() {
 	if r.Switch == nil {
 		return
 	}
+	req := &bcproto.StatusRequest{}
 	for _, peer := range r.Switch.Peers().List() {
-		peer.TrySend(p2p.Envelope{
-			ChannelID: Channel,
-			Message:   &bcproto.StatusRequest{},
-		})
+		if peer.TrySend(p2p.Envelope{ChannelID: Channel, Message: req}) {
+			r.noteSent(req)
+		}
 	}
 }
 
@@ -392,10 +410,11 @@ func (r *Reactor) fillGaps() {
 		if picked == nil {
 			continue
 		}
-		ok := picked.TrySend(p2p.Envelope{
-			ChannelID: Channel,
-			Message:   &bcproto.BlockRequest{Height: h},
-		})
+		req := &bcproto.BlockRequest{Height: h}
+		ok := picked.TrySend(p2p.Envelope{ChannelID: Channel, Message: req})
+		if ok {
+			r.noteSent(req)
+		}
 		if !ok {
 			continue
 		}
@@ -429,6 +448,8 @@ type Counters struct {
 	PeerCount     int
 	OutboundPeers int
 	InboundPeers  int
+	BytesRecv     int64 // channel 0x40 inbound
+	BytesSent     int64 // channel 0x40 outbound
 }
 
 func (r *Reactor) Counters() Counters {
@@ -450,6 +471,8 @@ func (r *Reactor) Counters() Counters {
 			c.InboundPeers++
 		}
 	}
+	c.BytesRecv = atomic.LoadInt64(&r.bytesRecv)
+	c.BytesSent = atomic.LoadInt64(&r.bytesSent)
 	return c
 }
 

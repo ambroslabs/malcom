@@ -10,6 +10,7 @@ import (
 	"encoding/hex"
 	"fmt"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/cometbft/cometbft/libs/log"
@@ -31,7 +32,8 @@ const (
 	EvidenceChannel    = byte(0x38) // Evidence — DuplicateVote, LightClientAttack
 )
 
-// Counters is a snapshot of per-message-type counts.
+// Counters is a snapshot of per-message-type counts. Plain int64 values for
+// caller convenience; the live atomics inside Reactor get loaded into here.
 type Counters struct {
 	// Consensus
 	NewRoundSteps  int64
@@ -45,10 +47,10 @@ type Counters struct {
 	VoteSetBits    int64
 
 	// Mempool
-	TxBatches int64 // number of envelope batches received (each may carry many txs)
-	Txs       int64 // total individual txs received
-	UniqueTxs int64 // unique tx hashes seen this run
-	TxBytes   int64 // total tx bytes seen
+	TxBatches int64
+	Txs       int64
+	UniqueTxs int64
+	TxBytes   int64
 
 	// Relay
 	VotesRelayed      int64
@@ -58,10 +60,6 @@ type Counters struct {
 
 	// Evidence
 	EvidenceItems int64
-
-	// Unhandled message types — for debugging which types peers actually
-	// send us. Keyed by Go type name (e.g. "*types.Vote").
-	unknownTypes map[string]int64
 }
 
 // MaxSeenTx is the cap on unique-tx-hash dedup entries. After this we stop
@@ -72,17 +70,44 @@ type Reactor struct {
 	p2p.BaseReactor
 	logger log.Logger
 
-	mu       sync.Mutex
-	counters Counters
-	seenTx   map[[32]byte]struct{}
+	// All hot-path counters are atomic int64 keyed by channel ID into a
+	// fixed-size array. Avoids the lock contention that starves MConn
+	// ping/pong responses under high inbound traffic.
+	bytesRecv [256]int64
+	bytesSent [256]int64
 
-	// SampleEvery, if > 0, logs roughly 1 in N tx hashes for inspection.
-	SampleEvery int
-	// LastTxHashes is a small ring of the most recently observed tx hashes
-	// (deduplicated), surfaced for diagnostics. Capacity 32.
+	// Message-type counters (also atomic; one Receive event = one increment).
+	cNewRoundSteps  int64
+	cNewValidBlocks int64
+	cProposals      int64
+	cProposalPols   int64
+	cBlockParts     int64
+	cVotes          int64
+	cHasVotes       int64
+	cVoteSetMaj23   int64
+	cVoteSetBits    int64
+	cTxBatches      int64
+	cTxs            int64
+	cUniqueTxs      int64
+	cTxBytes        int64
+	cEvidenceItems  int64
+
+	// Relay activity (atomic; only meaningful when RelayConsensus / RelayTxs).
+	cVotesRelayed      int64
+	cBlockPartsRelayed int64
+	cProposalsRelayed  int64
+	cTxsRelayed        int64
+	stepSent           int64
+
+	// SeenTx is a map and needs a mutex; same for the ring buffer.
+	muSeen          sync.Mutex
+	seenTx          map[[32]byte]struct{}
 	lastTxRing      [32]string
 	lastTxRingHead  int
 	lastTxRingCount int
+
+	// SampleEvery, if > 0, logs roughly 1 in N tx hashes.
+	SampleEvery int
 
 	// tipFn returns the height of the latest block in our cache. We claim
 	// that we're working on tipFn()+1 in NewRoundStep messages so peers
@@ -94,13 +119,6 @@ type Reactor struct {
 	// peers' tracking advances as our cache does.
 	HeartbeatInterval time.Duration
 
-	// Counters of relay activity.
-	votesRelayed      int64
-	blockPartsRelayed int64
-	proposalsRelayed  int64
-	txsRelayed        int64
-	stepSent          int64
-
 	// RelayTxs, when true, forwards each unique mempool tx (deduped via
 	// seenTx) to all connected peers except the sender. We do NOT run
 	// CheckTx — chain-agnostic. Receivers run CheckTx themselves and drop
@@ -108,6 +126,15 @@ type Reactor struct {
 	// per bad tx (no further amplification because the receivers don't
 	// re-gossip what they reject).
 	RelayTxs bool
+
+	// RelayConsensus, when true, forwards every received Vote / BlockPart /
+	// Proposal to all connected peers except the sender. WITHOUT a per-vote
+	// dedup, this is N²-amplifying: each unique vote that all N peers send
+	// us once gets relayed N×(N-1) times in total. At cosmoshub's ~60
+	// unique votes/sec × 50 peers, that's ~150K send events/sec ≈ 30 MB/s
+	// outbound just from votes, plus block parts and proposals.
+	// Default OFF; only enable if you have bandwidth to spend.
+	RelayConsensus bool
 }
 
 func NewReactor(logger log.Logger) *Reactor {
@@ -115,9 +142,9 @@ func NewReactor(logger log.Logger) *Reactor {
 		logger:            logger,
 		seenTx:            make(map[[32]byte]struct{}, 4096),
 		SampleEvery:       0,
-		counters:          Counters{unknownTypes: make(map[string]int64, 16)},
 		HeartbeatInterval: 3 * time.Second,
-		RelayTxs:          true,
+		RelayTxs:          false,
+		RelayConsensus:    false,
 	}
 	r.BaseReactor = *p2p.NewBaseReactor("observer", r)
 	r.BaseReactor.SetLogger(logger)
@@ -127,10 +154,9 @@ func NewReactor(logger log.Logger) *Reactor {
 // SetTipFn provides a callback returning the height of the latest block we
 // have. We claim height = tip+1 in NewRoundStep so peers gate-keeping mempool
 // and consensus gossip on peerState.GetHeight() let traffic through.
+// Call before Start; not safe to change at runtime.
 func (r *Reactor) SetTipFn(fn func() int64) {
-	r.mu.Lock()
 	r.tipFn = fn
-	r.mu.Unlock()
 }
 
 func (r *Reactor) GetChannels() []*conn.ChannelDescriptor {
@@ -159,27 +185,23 @@ func (r *Reactor) RemovePeer(p2p.Peer, any) {}
 // Peers gate Vote/Proposal/BlockPart and (importantly) mempool Tx gossip on
 // our claimed height matching their consensus height.
 func (r *Reactor) sendStateClaim(peer p2p.Peer) {
-	r.mu.Lock()
-	tipFn := r.tipFn
-	r.mu.Unlock()
-	if tipFn == nil {
+	if r.tipFn == nil {
 		return
 	}
-	tip := tipFn()
+	tip := r.tipFn()
 	if tip <= 0 {
 		return
 	}
 	msg := &cmtcons.NewRoundStep{
-		Height:                tip + 1, // we're "voting on" the next block
+		Height:                tip + 1,
 		Round:                 0,
-		Step:                  1, // RoundStepNewHeight
+		Step:                  1,
 		SecondsSinceStartTime: 0,
 		LastCommitRound:       0,
 	}
 	if peer.TrySend(p2p.Envelope{ChannelID: StateChannel, Message: msg}) {
-		r.mu.Lock()
-		r.stepSent++
-		r.mu.Unlock()
+		atomic.AddInt64(&r.stepSent, 1)
+		atomic.AddInt64(&r.bytesSent[StateChannel], int64(gogoproto.Size(msg)))
 	}
 }
 
@@ -211,13 +233,18 @@ func (r *Reactor) relayConsensus(env p2p.Envelope, ch byte, msg gogoproto.Messag
 		return
 	}
 	senderID := env.Src.ID()
+	wire := int64(gogoproto.Size(msg))
+	sent := int64(0)
 	for _, p := range r.Switch.Peers().List() {
 		if p.ID() == senderID {
 			continue
 		}
 		// TrySend so a slow peer doesn't block our hot path.
-		p.TrySend(p2p.Envelope{ChannelID: ch, Message: msg})
+		if p.TrySend(p2p.Envelope{ChannelID: ch, Message: msg}) {
+			sent++
+		}
 	}
+	atomic.AddInt64(&r.bytesSent[ch], wire*sent)
 }
 
 // relayTxs forwards a batch of mempool txs to every connected peer except
@@ -232,103 +259,108 @@ func (r *Reactor) relayTxs(sender p2p.ID, txs [][]byte) {
 		return
 	}
 	msg := &protomem.Txs{Txs: txs}
+	wire := int64(gogoproto.Size(msg))
+	sent := int64(0)
 	for _, p := range r.Switch.Peers().List() {
 		if p.ID() == sender {
 			continue
 		}
-		p.TrySend(p2p.Envelope{ChannelID: MempoolChannel, Message: msg})
+		if p.TrySend(p2p.Envelope{ChannelID: MempoolChannel, Message: msg}) {
+			sent++
+		}
 	}
+	atomic.AddInt64(&r.bytesSent[MempoolChannel], wire*sent)
 }
 
 func (r *Reactor) Receive(env p2p.Envelope) {
 	// Cometbft auto-unwraps oneof Messages before handing them to Receive,
 	// so env.Message is the *inner* type (e.g. *Vote, *Proposal, *Txs).
 	//
-	// We only hold mu while updating counters; relays (which can block in
-	// peer.TrySend → MConn) happen after we drop the lock.
-	var relayCh byte
-	var relayMsg gogoproto.Message
+	// Hot path is lock-free: all counters are atomic int64. We only take a
+	// mutex around the seenTx/lastTxRing update for mempool dedup. This
+	// avoids serializing every inbound message on a shared lock and starving
+	// MConn ping/pongs (which caused mass disconnects under cosmoshub load).
+	if pm, ok := env.Message.(gogoproto.Message); ok {
+		atomic.AddInt64(&r.bytesRecv[env.ChannelID], int64(gogoproto.Size(pm)))
+	}
 
-	r.mu.Lock()
 	switch m := env.Message.(type) {
 
-	// Consensus messages.
 	case *cmtcons.NewRoundStep:
-		r.counters.NewRoundSteps++
+		atomic.AddInt64(&r.cNewRoundSteps, 1)
 	case *cmtcons.NewValidBlock:
-		r.counters.NewValidBlocks++
+		atomic.AddInt64(&r.cNewValidBlocks, 1)
 	case *cmtcons.Proposal:
-		r.counters.Proposals++
-		r.proposalsRelayed++
-		relayCh, relayMsg = DataChannel, m
+		atomic.AddInt64(&r.cProposals, 1)
+		if r.RelayConsensus {
+			atomic.AddInt64(&r.cProposalsRelayed, 1)
+			r.relayConsensus(env, DataChannel, m)
+		}
 	case *cmtcons.ProposalPOL:
-		r.counters.ProposalPols++
+		atomic.AddInt64(&r.cProposalPols, 1)
 	case *cmtcons.BlockPart:
-		r.counters.BlockParts++
-		r.blockPartsRelayed++
-		relayCh, relayMsg = DataChannel, m
+		atomic.AddInt64(&r.cBlockParts, 1)
+		if r.RelayConsensus {
+			atomic.AddInt64(&r.cBlockPartsRelayed, 1)
+			r.relayConsensus(env, DataChannel, m)
+		}
 	case *cmtcons.Vote:
-		r.counters.Votes++
-		r.votesRelayed++
-		relayCh, relayMsg = VoteChannel, m
+		atomic.AddInt64(&r.cVotes, 1)
+		if r.RelayConsensus {
+			atomic.AddInt64(&r.cVotesRelayed, 1)
+			r.relayConsensus(env, VoteChannel, m)
+		}
 	case *cmtcons.HasVote:
-		r.counters.HasVotes++
+		atomic.AddInt64(&r.cHasVotes, 1)
 	case *cmtcons.VoteSetMaj23:
-		r.counters.VoteSetMaj23++
+		atomic.AddInt64(&r.cVoteSetMaj23, 1)
 	case *cmtcons.VoteSetBits:
-		r.counters.VoteSetBits++
+		atomic.AddInt64(&r.cVoteSetBits, 1)
 
-	// Mempool transactions.
 	case *protomem.Txs:
 		if m == nil {
 			return
 		}
-		r.counters.TxBatches++
-		// Collect first-sight txs to relay (after dropping the lock).
+		atomic.AddInt64(&r.cTxBatches, 1)
+		// Hash all txs first (CPU work) then dedup under muSeen briefly.
+		hashes := make([][32]byte, len(m.Txs))
+		for i, tx := range m.Txs {
+			hashes[i] = sha256.Sum256(tx)
+			atomic.AddInt64(&r.cTxs, 1)
+			atomic.AddInt64(&r.cTxBytes, int64(len(tx)))
+		}
 		var freshTxs [][]byte
-		for _, tx := range m.Txs {
-			r.counters.Txs++
-			r.counters.TxBytes += int64(len(tx))
-			h := sha256.Sum256(tx)
-			fresh := false
+		r.muSeen.Lock()
+		for i, h := range hashes {
 			if len(r.seenTx) < MaxSeenTx {
 				if _, seen := r.seenTx[h]; !seen {
 					r.seenTx[h] = struct{}{}
-					r.counters.UniqueTxs++
 					hh := hex.EncodeToString(h[:])
 					r.lastTxRing[r.lastTxRingHead] = hh
 					r.lastTxRingHead = (r.lastTxRingHead + 1) % len(r.lastTxRing)
 					if r.lastTxRingCount < len(r.lastTxRing) {
 						r.lastTxRingCount++
 					}
-					fresh = true
+					atomic.AddInt64(&r.cUniqueTxs, 1)
+					if r.RelayTxs {
+						freshTxs = append(freshTxs, m.Txs[i])
+					}
 				}
 			} else if _, seen := r.seenTx[h]; !seen {
-				r.counters.UniqueTxs++
-				fresh = true
-			}
-			if fresh && r.RelayTxs {
-				freshTxs = append(freshTxs, tx)
+				atomic.AddInt64(&r.cUniqueTxs, 1)
+				if r.RelayTxs {
+					freshTxs = append(freshTxs, m.Txs[i])
+				}
 			}
 		}
+		r.muSeen.Unlock()
 		if len(freshTxs) > 0 {
-			r.txsRelayed += int64(len(freshTxs))
-			// Defer the relay until after the lock is released.
-			defer r.relayTxs(env.Src.ID(), freshTxs)
+			atomic.AddInt64(&r.cTxsRelayed, int64(len(freshTxs)))
+			r.relayTxs(env.Src.ID(), freshTxs)
 		}
 
-	// Evidence (sent as a list, not via Message wrapper).
 	case *cmtproto.EvidenceList:
-		r.counters.EvidenceItems += int64(len(m.Evidence))
-
-	default:
-		// Helpful when a message type isn't matched.
-		r.counters.unknownTypes[goTypeName(m)]++
-	}
-	r.mu.Unlock()
-
-	if relayMsg != nil {
-		r.relayConsensus(env, relayCh, relayMsg)
+		atomic.AddInt64(&r.cEvidenceItems, int64(len(m.Evidence)))
 	}
 }
 
@@ -340,32 +372,51 @@ func goTypeName(v interface{}) string {
 	return t
 }
 
+// Snapshot returns a consistent copy of all counters via atomic loads.
 func (r *Reactor) Snapshot() Counters {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	c := r.counters
-	c.VotesRelayed = r.votesRelayed
-	c.BlockPartsRelayed = r.blockPartsRelayed
-	c.ProposalsRelayed = r.proposalsRelayed
-	c.TxsRelayed = r.txsRelayed
-	return c
+	return Counters{
+		NewRoundSteps:     atomic.LoadInt64(&r.cNewRoundSteps),
+		NewValidBlocks:    atomic.LoadInt64(&r.cNewValidBlocks),
+		Proposals:         atomic.LoadInt64(&r.cProposals),
+		ProposalPols:      atomic.LoadInt64(&r.cProposalPols),
+		BlockParts:        atomic.LoadInt64(&r.cBlockParts),
+		Votes:             atomic.LoadInt64(&r.cVotes),
+		HasVotes:          atomic.LoadInt64(&r.cHasVotes),
+		VoteSetMaj23:      atomic.LoadInt64(&r.cVoteSetMaj23),
+		VoteSetBits:       atomic.LoadInt64(&r.cVoteSetBits),
+		TxBatches:         atomic.LoadInt64(&r.cTxBatches),
+		Txs:               atomic.LoadInt64(&r.cTxs),
+		UniqueTxs:         atomic.LoadInt64(&r.cUniqueTxs),
+		TxBytes:           atomic.LoadInt64(&r.cTxBytes),
+		EvidenceItems:     atomic.LoadInt64(&r.cEvidenceItems),
+		VotesRelayed:      atomic.LoadInt64(&r.cVotesRelayed),
+		BlockPartsRelayed: atomic.LoadInt64(&r.cBlockPartsRelayed),
+		ProposalsRelayed:  atomic.LoadInt64(&r.cProposalsRelayed),
+		TxsRelayed:        atomic.LoadInt64(&r.cTxsRelayed),
+	}
 }
 
-// UnknownTypes returns a copy of the unknown-message-type histogram.
-func (r *Reactor) UnknownTypes() map[string]int64 {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	out := make(map[string]int64, len(r.counters.unknownTypes))
-	for k, v := range r.counters.unknownTypes {
-		out[k] = v
+// BytesPerChannel returns recv/sent byte counters keyed by channel ID.
+func (r *Reactor) BytesPerChannel() (recv, sent map[byte]int64) {
+	recv = make(map[byte]int64, 8)
+	sent = make(map[byte]int64, 8)
+	for ch := 0; ch < 256; ch++ {
+		rb := atomic.LoadInt64(&r.bytesRecv[ch])
+		sb := atomic.LoadInt64(&r.bytesSent[ch])
+		if rb > 0 {
+			recv[byte(ch)] = rb
+		}
+		if sb > 0 {
+			sent[byte(ch)] = sb
+		}
 	}
-	return out
+	return
 }
 
 // RecentTxHashes returns up to 32 most recently seen unique tx hashes.
 func (r *Reactor) RecentTxHashes() []string {
-	r.mu.Lock()
-	defer r.mu.Unlock()
+	r.muSeen.Lock()
+	defer r.muSeen.Unlock()
 	out := make([]string, 0, r.lastTxRingCount)
 	for i := 0; i < r.lastTxRingCount; i++ {
 		idx := (r.lastTxRingHead - 1 - i + len(r.lastTxRing)) % len(r.lastTxRing)

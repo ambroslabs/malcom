@@ -45,6 +45,12 @@ func main() {
 		discoveriesPath = flag.String("discoveries", "data/peers-discovered.json", "append every connecting peer (in or out) here, deduped by node_id")
 		maxPeers     = flag.Int("max-peers", 8, "how many concurrent outbound peer connections to maintain")
 		maxInbound   = flag.Int("max-inbound", 64, "max accepted inbound peer connections")
+		dialWorkers  = flag.Int("dial-workers", 16, "concurrent dial workers; higher drains the candidate pool faster")
+		sendRate     = flag.Int64("send-rate", 5000, "per-peer outbound rate cap in bytes/sec (cometbft MConnConfig.SendRate). Default 5 KB/s per peer × max-peers ≈ aggregate cap.")
+		recvRate     = flag.Int64("recv-rate", 5000, "per-peer inbound rate cap in bytes/sec (cometbft MConnConfig.RecvRate).")
+		relayCons    = flag.Bool("relay-consensus", false, "relay vote/proposal/blockpart messages to other peers. OFF by default — every received message gets multiplied by (peer_count-1) on the wire, an easy way to use a lot of bandwidth.")
+		relayTxs     = flag.Bool("relay-txs", false, "relay mempool txs to other peers (deduped, no-echo). OFF by default for the same reason as relay-consensus, plus we don't run CheckTx so we'd be trusting upstream peers blindly.")
+		observe      = flag.Bool("observe", false, "advertise consensus + mempool + evidence channels and count gossip. OFF by default — the volume can starve MConn ping/pong on a busy chain.")
 		moniker2     = flag.String("upstream-min-range", "", "(unused; placeholder)")
 		debug        = flag.Bool("debug", false, "verbose p2p logging")
 	)
@@ -99,13 +105,7 @@ func main() {
 		ListenAddr:      advertisedAddr,
 		Network:         *chainID,
 		Version:         version.TMCoreSemVer,
-		Channels: []byte{
-			pex.Channel,
-			observer.StateChannel, observer.DataChannel,
-			observer.VoteChannel, observer.VoteSetBitsChannel,
-			observer.MempoolChannel, observer.EvidenceChannel,
-			blockcache.Channel,
-		},
+		Channels: buildChannels(*observe),
 		Moniker:         *moniker,
 		Other: p2p.DefaultNodeInfoOther{
 			TxIndex:    "off",
@@ -123,6 +123,20 @@ func main() {
 	p2pConfig.MaxNumOutboundPeers = *maxPeers
 	p2pConfig.MaxNumInboundPeers = *maxInbound
 	mConfig := conn.DefaultMConnConfig()
+	if *sendRate > 0 {
+		mConfig.SendRate = *sendRate
+	}
+	if *recvRate > 0 {
+		mConfig.RecvRate = *recvRate
+	}
+	logger.Info("rate cap",
+		"per_peer_send_bytes_per_s", mConfig.SendRate,
+		"per_peer_recv_bytes_per_s", mConfig.RecvRate,
+		"max_outbound", *maxPeers,
+		"max_inbound", *maxInbound,
+		"aggregate_send_bps_max", (mConfig.SendRate*int64(*maxPeers+*maxInbound))*8,
+		"aggregate_recv_bps_max", (mConfig.RecvRate*int64(*maxPeers+*maxInbound))*8,
+	)
 
 	transport := p2p.NewMultiplexTransport(nodeInfo, *nodeKey, mConfig)
 	if err := transport.Listen(*listenAddr); err != nil {
@@ -145,6 +159,8 @@ func main() {
 		_, tip := cache.Range()
 		return tip
 	})
+	obsR.RelayConsensus = *relayCons
+	obsR.RelayTxs = *relayTxs
 
 	sw := p2p.NewSwitch(p2pConfig, transport)
 	sw.SetLogger(logger.With("module", "p2p"))
@@ -162,7 +178,7 @@ func main() {
 	// Pull every known cosmoshub-4 peer; the dial loop cycles through them
 	// and only the responsive ones will end up connected. Bound is set high
 	// so we don't artificially restrict the outbound pool.
-	dialer := NewDialer()
+	dialer := NewDialer(string(nodeKey.ID()))
 	candidates := pickPeers(*cumulativeDB, 4096)
 	dialer.AddAll(candidates)
 	if dialer.Size() == 0 {
@@ -180,8 +196,12 @@ func main() {
 		cancel()
 	}()
 
-	// Start dialing in the background; keep adding peers until we hit the cap.
-	go dialUntilFull(ctx, sw, dialer, *maxPeers, logger.With("module", "blockcache"))
+	// Start dialing in the background; N concurrent workers all pull from the
+	// same dialer pool. Switch dedup handles the race when two workers happen
+	// to pick the same addr.
+	for i := 0; i < *dialWorkers; i++ {
+		go dialUntilFull(ctx, sw, dialer, *maxPeers, logger.With("module", "blockcache", "dialer", i))
+	}
 
 	// Feed PEX-discovered peers into the dialer.
 	go consumePEX(ctx, pexR, dialer, logger.With("module", "blockcache"))
@@ -236,11 +256,15 @@ func main() {
 			pexServed := pexR.ServedCount()
 			obs := obsR.Snapshot()
 			dt := now.Sub(prevAt).Seconds()
-			fmt.Printf("[stat] cache: %d/%d tip=%d bytes=%dKB  fetched=%d served=%d (Δ%d) status_served=%d pex_served=%d  peers=%d (out=%d in=%d)\n",
+			fmt.Printf("[peers]  out=%d/%d  in=%d/%d  total=%d  dial_pool=%d\n",
+				c.OutboundPeers, *maxPeers,
+				c.InboundPeers, *maxInbound,
+				c.PeerCount,
+				dialer.Size())
+			fmt.Printf("[stat] cache: %d/%d tip=%d bytes=%dKB  fetched=%d served=%d (Δ%d) status_served=%d pex_served=%d\n",
 				s.Count, s.Capacity, s.Tip, s.BytesRAM/1024,
 				c.Fetched, c.ServedBlocks, c.ServedBlocks-prevC.ServedBlocks,
-				c.StatusServed, pexServed,
-				c.PeerCount, c.OutboundPeers, c.InboundPeers)
+				c.StatusServed, pexServed)
 			fmt.Printf("[gossip] txs=%d (uniq=%d, Δ%d %.1f/s) batches=%d  votes=%d (Δ%d %.0f/s)  block_parts=%d (Δ%d)  proposals=%d (Δ%d)  hasVote=%d  newRoundStep=%d  evidence=%d\n",
 				obs.Txs, obs.UniqueTxs, obs.Txs-prevObs.Txs, float64(obs.Txs-prevObs.Txs)/dt,
 				obs.TxBatches,
@@ -253,8 +277,105 @@ func main() {
 				obs.VotesRelayed, obs.VotesRelayed-prevObs.VotesRelayed,
 				obs.BlockPartsRelayed, obs.BlockPartsRelayed-prevObs.BlockPartsRelayed,
 				obs.ProposalsRelayed, obs.ProposalsRelayed-prevObs.ProposalsRelayed)
+			printBandwidth(pexR, obsR, reactor, dt)
 			prevC, prevObs, prevAt = c, obs, now
 		}
+	}
+}
+
+var (
+	bwPrevRecv = map[byte]int64{}
+	bwPrevSent = map[byte]int64{}
+)
+
+// printBandwidth aggregates per-channel byte counters from each reactor and
+// prints a [bw] line with delta + rate per channel since the last call.
+// Channel labels match cometbft's well-known IDs.
+// buildChannels returns the NodeInfo.Channels list. With -observe=false we
+// only advertise PEX + blocksync; consensus/mempool/evidence are gated
+// behind -observe because their inbound volume on cosmoshub-4 (votes flood
+// at 1000+/s) can starve cometbft's MConn ping/pong loop and trigger mass
+// peer disconnects.
+func buildChannels(observe bool) []byte {
+	channels := []byte{pex.Channel, blockcache.Channel}
+	if observe {
+		channels = append(channels,
+			observer.StateChannel, observer.DataChannel,
+			observer.VoteChannel, observer.VoteSetBitsChannel,
+			observer.MempoolChannel, observer.EvidenceChannel)
+	}
+	return channels
+}
+
+func printBandwidth(pexR *pex.Reactor, obsR *observer.Reactor, bcR *blockcache.Reactor, dt float64) {
+	if dt <= 0 {
+		dt = 1
+	}
+	recv := map[byte]int64{}
+	sent := map[byte]int64{}
+	pr, ps := pexR.Bytes()
+	recv[pex.Channel] = pr
+	sent[pex.Channel] = ps
+	or, os := obsR.BytesPerChannel()
+	for c, b := range or {
+		recv[c] += b
+	}
+	for c, b := range os {
+		sent[c] += b
+	}
+	bc := bcR.Counters()
+	recv[blockcache.Channel] = bc.BytesRecv
+	sent[blockcache.Channel] = bc.BytesSent
+
+	chList := []byte{
+		pex.Channel,
+		observer.StateChannel, observer.DataChannel,
+		observer.VoteChannel, observer.VoteSetBitsChannel,
+		observer.MempoolChannel, observer.EvidenceChannel,
+		blockcache.Channel,
+	}
+	labels := map[byte]string{
+		pex.Channel:                "0x00:pex",
+		observer.StateChannel:      "0x20:state",
+		observer.DataChannel:       "0x21:data",
+		observer.VoteChannel:       "0x22:vote",
+		observer.VoteSetBitsChannel: "0x23:vsb",
+		observer.MempoolChannel:    "0x30:mem",
+		observer.EvidenceChannel:   "0x38:evid",
+		blockcache.Channel:         "0x40:blk",
+	}
+
+	var totalRD, totalSD int64
+	parts := make([]string, 0, len(chList))
+	for _, c := range chList {
+		dr := recv[c] - bwPrevRecv[c]
+		ds := sent[c] - bwPrevSent[c]
+		bwPrevRecv[c] = recv[c]
+		bwPrevSent[c] = sent[c]
+		totalRD += dr
+		totalSD += ds
+		if dr == 0 && ds == 0 && recv[c] == 0 && sent[c] == 0 {
+			continue
+		}
+		parts = append(parts, fmt.Sprintf("%s in=%s/s out=%s/s",
+			labels[c], humanRate(dr, dt), humanRate(ds, dt)))
+	}
+	fmt.Printf("[bw]     %s | TOTAL in=%s/s out=%s/s\n",
+		strings.Join(parts, "  "),
+		humanRate(totalRD, dt), humanRate(totalSD, dt))
+}
+
+// humanRate formats bytes/sec as KB/s or MB/s (decimal, base-10) for
+// readability in stat lines.
+func humanRate(bytes int64, dt float64) string {
+	rate := float64(bytes) / dt // bytes/sec
+	switch {
+	case rate >= 1_000_000:
+		return fmt.Sprintf("%.2fMB", rate/1_000_000)
+	case rate >= 1_000:
+		return fmt.Sprintf("%.1fKB", rate/1_000)
+	default:
+		return fmt.Sprintf("%.0fB", rate)
 	}
 }
 
@@ -445,16 +566,19 @@ func discoveriesLoop(ctx context.Context, reactor *blockcache.Reactor, path stri
 
 // Dialer is a thread-safe pool of nodeID@host:port candidates that grows
 // over time as PEX gossips new addresses to us. It cycles forever; the dial
-// loop just keeps pulling the next candidate.
+// loop just keeps pulling the next candidate. Our own NodeID is rejected
+// because cometbft v0.38's Switch.addOutboundPeerWithConfig nil-derefs on
+// the addrbook when it detects a self-dial (we don't set an addrbook).
 type Dialer struct {
+	self   string
 	mu     sync.Mutex
 	seen   map[string]struct{}
 	queue  []string
 	cursor int
 }
 
-func NewDialer() *Dialer {
-	return &Dialer{seen: make(map[string]struct{})}
+func NewDialer(selfID string) *Dialer {
+	return &Dialer{self: selfID, seen: make(map[string]struct{})}
 }
 
 // Add registers a candidate. Returns true if it was new.
@@ -464,6 +588,9 @@ func (d *Dialer) Add(addr string) bool {
 		return false
 	}
 	nodeID := addr[:at]
+	if nodeID == d.self {
+		return false // never dial ourselves
+	}
 	d.mu.Lock()
 	defer d.mu.Unlock()
 	if _, ok := d.seen[nodeID]; ok {

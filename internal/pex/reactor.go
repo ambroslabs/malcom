@@ -14,6 +14,7 @@ import (
 	"github.com/cometbft/cometbft/p2p"
 	"github.com/cometbft/cometbft/p2p/conn"
 	tmp2p "github.com/cometbft/cometbft/proto/tendermint/p2p"
+	"github.com/cosmos/gogoproto/proto"
 )
 
 // Channel is the CometBFT PEX channel ID.
@@ -30,9 +31,11 @@ type Reactor struct {
 	logger log.Logger
 	Out    chan AddrEvent
 
-	mu       sync.Mutex
-	self     *p2p.NetAddress // advertised; only address we hand out via PEX
-	servedTo int64
+	mu        sync.Mutex
+	self      *p2p.NetAddress // advertised; only address we hand out via PEX
+	servedTo  int64
+	bytesRecv int64
+	bytesSent int64
 
 	// AskOnAdd, when true, sends a PexRequest to every peer we connect to
 	// so we keep learning about other peers. Defaults to true.
@@ -84,16 +87,24 @@ func (r *Reactor) GetChannels() []*conn.ChannelDescriptor {
 
 func (r *Reactor) AddPeer(peer p2p.Peer) {
 	if r.AskOnAdd {
-		if !peer.Send(p2p.Envelope{
-			ChannelID: Channel,
-			Message:   &tmp2p.PexRequest{},
-		}) {
+		req := &tmp2p.PexRequest{}
+		if peer.Send(p2p.Envelope{ChannelID: Channel, Message: req}) {
+			r.mu.Lock()
+			r.bytesSent += int64(proto.Size(req))
+			r.mu.Unlock()
+		} else {
 			r.logger.Error("PexRequest send queue full", "peer", peer.ID())
 		}
 	}
 }
 
 func (r *Reactor) Receive(env p2p.Envelope) {
+	r.mu.Lock()
+	if pm, ok := env.Message.(proto.Message); ok {
+		r.bytesRecv += int64(proto.Size(pm))
+	}
+	r.mu.Unlock()
+
 	switch m := env.Message.(type) {
 	case *tmp2p.PexRequest:
 		// Only ever announce ourselves. We don't relay other peers' addrs.
@@ -103,18 +114,15 @@ func (r *Reactor) Receive(env p2p.Envelope) {
 		if self == nil {
 			return
 		}
-		ok := env.Src.Send(p2p.Envelope{
-			ChannelID: Channel,
-			Message: &tmp2p.PexAddrs{
-				Addrs: p2p.NetAddressesToProto([]*p2p.NetAddress{self}),
-			},
-		})
+		resp := &tmp2p.PexAddrs{Addrs: p2p.NetAddressesToProto([]*p2p.NetAddress{self})}
+		ok := env.Src.Send(p2p.Envelope{ChannelID: Channel, Message: resp})
 		if !ok {
 			r.logger.Error("PexAddrs send queue full", "peer", env.Src.ID())
 			return
 		}
 		r.mu.Lock()
 		r.servedTo++
+		r.bytesSent += int64(proto.Size(resp))
 		r.mu.Unlock()
 		r.logger.Info("PEX served self", "peer", env.Src.ID(), "self", self.String())
 
@@ -126,4 +134,11 @@ func (r *Reactor) Receive(env p2p.Envelope) {
 			r.logger.Error("pex Out channel full; dropping", "peer", env.Src.ID(), "n", len(m.Addrs))
 		}
 	}
+}
+
+// Bytes returns recv/sent byte counters for channel 0x00 (PEX).
+func (r *Reactor) Bytes() (recv, sent int64) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.bytesRecv, r.bytesSent
 }
