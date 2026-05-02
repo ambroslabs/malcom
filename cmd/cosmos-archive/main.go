@@ -25,9 +25,13 @@ import (
 	cmtlog "github.com/cometbft/cometbft/libs/log"
 	"github.com/cometbft/cometbft/p2p"
 	"github.com/cometbft/cometbft/p2p/conn"
+	cmtproto "github.com/cometbft/cometbft/proto/tendermint/types"
 	tmp2pproto "github.com/cometbft/cometbft/proto/tendermint/p2p"
 	"github.com/cometbft/cometbft/version"
+	"github.com/cosmos/gogoproto/proto"
+	mrand "math/rand"
 	gnet "net"
+	"sync/atomic"
 
 	"github.com/zrbecker/cosmos-p2p/internal/archive"
 	"github.com/zrbecker/cosmos-p2p/internal/archivesync"
@@ -45,6 +49,7 @@ Subcommands:
   missing    show height ranges we don't have within [lo, hi]
   stats      per-shard counts and the global summary
   status     one-screen dashboard (latest [archive] line + ranges + disk)
+  verify     read every (or sampled) block on disk and check CRC + proto + height
   download   fetch missing blocks from archive peers (long-running)
 
 Run any subcommand with -h for its flags.
@@ -65,6 +70,8 @@ func main() {
 		runStats(os.Args[2:])
 	case "status":
 		runStatus(os.Args[2:])
+	case "verify":
+		runVerify(os.Args[2:])
 	case "download":
 		runDownload(os.Args[2:])
 	case "-h", "--help", "help":
@@ -250,6 +257,171 @@ func runStats(args []string) {
 	fmt.Printf("─────────────────────────────────────────────────────────────\n")
 	fmt.Printf("shards=%d  blocks=%s  ranges=%d\n", len(bases), commafmt(total), len(allRanges))
 	_ = totalCount
+}
+
+// runVerify reads every (or a sampled subset of) on-disk block and runs
+// the integrity checks: CRC32 of stored bytes matches index, the bytes
+// proto-decode as cmtproto.Block, the embedded Header.Height equals what
+// we asked for. Safe to run concurrently with an active download — reads
+// use pread and don't contend with Put's Seek+Write.
+func runVerify(args []string) {
+	fs := flag.NewFlagSet("verify", flag.ExitOnError)
+	dir := fs.String("archive", "/mnt/data/cosmos-archive/cosmoshub-4", "archive root directory")
+	lo := fs.Uint64("lo", 0, "lowest height to check (0 ⇒ first present)")
+	hi := fs.Uint64("hi", 0, "highest height to check (0 ⇒ last present)")
+	sample := fs.Int("sample", 0, "if > 0, randomly sample N heights from the present set instead of full scan")
+	parallel := fs.Int("parallel", 8, "concurrent verifier goroutines")
+	progEvery := fs.Int("progress-every", 5000, "print a progress line every N heights checked")
+	_ = fs.Parse(args)
+
+	st, err := archive.New(*dir)
+	if err != nil {
+		log.Fatalf("open archive: %v", err)
+	}
+	defer st.Close()
+
+	// Collect target heights.
+	ranges, total, err := st.Ranges()
+	if err != nil {
+		log.Fatalf("scan ranges: %v", err)
+	}
+	if total == 0 {
+		fmt.Println("(no blocks present)")
+		return
+	}
+	if *lo == 0 {
+		*lo = ranges[0].Lo
+	}
+	if *hi == 0 {
+		*hi = ranges[len(ranges)-1].Hi
+	}
+	var targets []uint64
+	for _, r := range ranges {
+		l, h := r.Lo, r.Hi
+		if l < *lo {
+			l = *lo
+		}
+		if h > *hi {
+			h = *hi
+		}
+		if l > h {
+			continue
+		}
+		for x := l; x <= h; x++ {
+			targets = append(targets, x)
+		}
+	}
+	if *sample > 0 && *sample < len(targets) {
+		// Reservoir-style: shuffle then take first N. Determinism not required.
+		rng := mrand.New(mrand.NewSource(time.Now().UnixNano()))
+		rng.Shuffle(len(targets), func(i, j int) { targets[i], targets[j] = targets[j], targets[i] })
+		targets = targets[:*sample]
+	}
+
+	fmt.Printf("verifying %s blocks across [%s, %s] with %d workers...\n",
+		commafmt(uint64(len(targets))), commafmt(*lo), commafmt(*hi), *parallel)
+	startT := time.Now()
+
+	type result struct {
+		ok      int64
+		bad     int64
+		errs    []string
+		errsMu  sync.Mutex
+	}
+	res := &result{}
+	jobs := make(chan uint64, *parallel*4)
+	var wg sync.WaitGroup
+
+	for w := 0; w < *parallel; w++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for h := range jobs {
+				raw, err := st.Get(h)
+				if err != nil {
+					atomic.AddInt64(&res.bad, 1)
+					res.errsMu.Lock()
+					if len(res.errs) < 20 {
+						res.errs = append(res.errs, fmt.Sprintf("h=%d: %v", h, err))
+					}
+					res.errsMu.Unlock()
+					continue
+				}
+				var pb cmtproto.Block
+				if err := proto.Unmarshal(raw, &pb); err != nil {
+					atomic.AddInt64(&res.bad, 1)
+					res.errsMu.Lock()
+					if len(res.errs) < 20 {
+						res.errs = append(res.errs, fmt.Sprintf("h=%d decode: %v", h, err))
+					}
+					res.errsMu.Unlock()
+					continue
+				}
+				if uint64(pb.Header.Height) != h {
+					atomic.AddInt64(&res.bad, 1)
+					res.errsMu.Lock()
+					if len(res.errs) < 20 {
+						res.errs = append(res.errs, fmt.Sprintf("h=%d header.Height=%d mismatch", h, pb.Header.Height))
+					}
+					res.errsMu.Unlock()
+					continue
+				}
+				atomic.AddInt64(&res.ok, 1)
+			}
+		}()
+	}
+
+	go func() {
+		t := time.NewTicker(2 * time.Second)
+		defer t.Stop()
+		for {
+			select {
+			case <-t.C:
+				ok := atomic.LoadInt64(&res.ok)
+				bad := atomic.LoadInt64(&res.bad)
+				done := ok + bad
+				dt := time.Since(startT).Seconds()
+				rate := 0.0
+				if dt > 0 {
+					rate = float64(done) / dt
+				}
+				fmt.Printf("[verify] %s / %s checked  ok=%s bad=%d  (%.0f blk/s)\n",
+					commafmt(uint64(done)), commafmt(uint64(len(targets))),
+					commafmt(uint64(ok)), bad, rate)
+			}
+		}
+	}()
+
+	progN := *progEvery
+	for i, h := range targets {
+		jobs <- h
+		if progN > 0 && (i+1)%progN == 0 {
+			// progress goroutine handles printing on a timer; nothing to do here.
+		}
+	}
+	close(jobs)
+	wg.Wait()
+
+	dt := time.Since(startT).Seconds()
+	fmt.Printf("\ndone in %s. %s ok / %d errors out of %s checked  (%.0f blk/s avg)\n",
+		fmtDur(dt), commafmt(uint64(res.ok)), res.bad, commafmt(uint64(len(targets))), float64(len(targets))/dt)
+	if len(res.errs) > 0 {
+		fmt.Println("first errors:")
+		for _, e := range res.errs {
+			fmt.Println("  " + e)
+		}
+	}
+	if res.bad > 0 {
+		os.Exit(1)
+	}
+}
+
+func fmtDur(s float64) string {
+	d := time.Duration(s * float64(time.Second))
+	if d < time.Minute {
+		return fmt.Sprintf("%.1fs", s)
+	}
+	return d.Truncate(time.Second).String()
 }
 
 // runStatus prints a snapshot of download progress + on-disk state. Use
