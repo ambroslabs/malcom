@@ -44,6 +44,7 @@ Subcommands:
   ranges     show contiguous-present height ranges
   missing    show height ranges we don't have within [lo, hi]
   stats      per-shard counts and the global summary
+  status     one-screen dashboard (latest [archive] line + ranges + disk)
   download   fetch missing blocks from archive peers (long-running)
 
 Run any subcommand with -h for its flags.
@@ -62,6 +63,8 @@ func main() {
 		runMissing(os.Args[2:])
 	case "stats":
 		runStats(os.Args[2:])
+	case "status":
+		runStatus(os.Args[2:])
 	case "download":
 		runDownload(os.Args[2:])
 	case "-h", "--help", "help":
@@ -247,6 +250,128 @@ func runStats(args []string) {
 	fmt.Printf("─────────────────────────────────────────────────────────────\n")
 	fmt.Printf("shards=%d  blocks=%s  ranges=%d\n", len(bases), commafmt(total), len(allRanges))
 	_ = totalCount
+}
+
+// runStatus prints a snapshot of download progress + on-disk state. Use
+// with `watch` for a live dashboard:
+//   watch -n 2 'cosmos-archive status'
+func runStatus(args []string) {
+	fs := flag.NewFlagSet("status", flag.ExitOnError)
+	dir := fs.String("archive", "/mnt/data/cosmos-archive/cosmoshub-4", "archive root directory")
+	logPath := fs.String("log", "/mnt/data/cosmos-archive/logs/download-current.out", "downloader stdout log to tail")
+	tailN := fs.Int("n", 3, "number of recent [archive] lines to show")
+	_ = fs.Parse(args)
+
+	// process running?
+	running := false
+	if out, err := os.ReadFile("/proc/self/status"); err == nil {
+		_ = out
+	}
+	// pgrep cosmos-archive download
+	if entries, err := os.ReadDir("/proc"); err == nil {
+		for _, e := range entries {
+			if !e.IsDir() {
+				continue
+			}
+			cmdline, err := os.ReadFile(filepath.Join("/proc", e.Name(), "cmdline"))
+			if err != nil {
+				continue
+			}
+			s := string(cmdline)
+			if strings.Contains(s, "cosmos-archive") && strings.Contains(s, "download") {
+				running = true
+				fmt.Printf("downloader: running (pid %s)\n", e.Name())
+				break
+			}
+		}
+	}
+	if !running {
+		fmt.Println("downloader: NOT running")
+	}
+
+	// last N [archive] lines from the log
+	if data, err := os.ReadFile(*logPath); err == nil {
+		lines := strings.Split(strings.TrimRight(string(data), "\n"), "\n")
+		var hits []string
+		for _, l := range lines {
+			if strings.HasPrefix(l, "[archive]") {
+				hits = append(hits, l)
+			}
+		}
+		fmt.Printf("\n=== last %d [archive] lines ===\n", *tailN)
+		from := 0
+		if len(hits) > *tailN {
+			from = len(hits) - *tailN
+		}
+		for _, l := range hits[from:] {
+			fmt.Println(l)
+		}
+	} else {
+		fmt.Printf("\n(log %s unavailable: %v)\n", *logPath, err)
+	}
+
+	// ranges
+	st, err := archive.New(*dir)
+	if err != nil {
+		fmt.Printf("\nopen archive: %v\n", err)
+		return
+	}
+	defer st.Close()
+	ranges, total, err := st.Ranges()
+	if err == nil {
+		fmt.Printf("\n=== on-disk ranges ===\n")
+		if len(ranges) == 0 {
+			fmt.Println("(no blocks present)")
+		} else {
+			for _, r := range ranges {
+				fmt.Printf("  %14s .. %14s  (%14s blocks)\n",
+					commafmt(r.Lo), commafmt(r.Hi), commafmt(r.Count()))
+			}
+			fmt.Printf("  total: %s blocks across %d range(s)\n",
+				commafmt(total), len(ranges))
+		}
+	}
+
+	// disk usage of the shards dir
+	shardsDir := filepath.Join(*dir, "shards")
+	if du, err := dirSize(shardsDir); err == nil {
+		fmt.Printf("\n=== disk ===\n")
+		fmt.Printf("  shards: %s on disk (%s files)\n", humanBytes(du.bytes), commafmt(uint64(du.files)))
+	}
+}
+
+type duInfo struct {
+	bytes int64
+	files int
+}
+
+func dirSize(dir string) (duInfo, error) {
+	var info duInfo
+	ents, err := os.ReadDir(dir)
+	if err != nil {
+		return info, err
+	}
+	for _, e := range ents {
+		fi, err := e.Info()
+		if err != nil {
+			continue
+		}
+		info.bytes += fi.Size()
+		info.files++
+	}
+	return info, nil
+}
+
+func humanBytes(n int64) string {
+	switch {
+	case n >= 1<<30:
+		return fmt.Sprintf("%.2f GiB", float64(n)/(1<<30))
+	case n >= 1<<20:
+		return fmt.Sprintf("%.1f MiB", float64(n)/(1<<20))
+	case n >= 1<<10:
+		return fmt.Sprintf("%.1f KiB", float64(n)/(1<<10))
+	}
+	return fmt.Sprintf("%d B", n)
 }
 
 // chainRegistrySeeds: hand-curated cosmoshub seeds (PEX-rich nodes that

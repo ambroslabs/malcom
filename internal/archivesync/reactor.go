@@ -125,7 +125,7 @@ func (r *Reactor) RemovePeer(peer p2p.Peer, reason interface{}) {
 	for h, e := range r.inflight {
 		if e.peer == peer.ID() {
 			delete(r.inflight, h)
-			r.queue.Add(h) // make sure the height is still pending
+			r.queue.Retry(h) // bump to retry queue so a different peer gets it fast
 		}
 	}
 	r.mu.Unlock()
@@ -210,7 +210,9 @@ func (r *Reactor) Receive(env p2p.Envelope) {
 			}
 		}
 		r.mu.Unlock()
-		// Leave height in the queue so another peer is tried.
+		// Bump to retry queue so a different peer is asked immediately,
+		// not waiting for the cursor to wrap the entire fresh queue.
+		r.queue.Retry(m.Height)
 	}
 }
 
@@ -274,7 +276,7 @@ func (r *Reactor) assignWork() {
 			if ps, ok := r.peers[e.peer]; ok && ps.inflight > 0 {
 				ps.inflight--
 			}
-			r.queue.Add(h)
+			r.queue.Retry(h)
 			expired++
 		}
 	}
@@ -317,19 +319,19 @@ func (r *Reactor) assignWork() {
 			}
 		}
 		if !havePicked {
-			// No peer can serve h right now — we already removed it via
-			// queue.Next, put it back at the end.
-			r.queue.Add(h)
+			// No peer can serve h right now — bump it to retry so we
+			// look at it again on the next tick.
+			r.queue.Retry(h)
 			break
 		}
 		peer, ok := peerByID[picked.id]
 		if !ok {
-			r.queue.Add(h)
+			r.queue.Retry(h)
 			continue
 		}
 		req := &bcproto.BlockRequest{Height: h}
 		if !peer.TrySend(p2p.Envelope{ChannelID: Channel, Message: req}) {
-			r.queue.Add(h)
+			r.queue.Retry(h)
 			continue
 		}
 		r.mu.Lock()
