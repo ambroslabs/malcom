@@ -27,6 +27,7 @@ import (
 	"github.com/cometbft/cometbft/p2p/conn"
 	cmtproto "github.com/cometbft/cometbft/proto/tendermint/types"
 	tmp2pproto "github.com/cometbft/cometbft/proto/tendermint/p2p"
+	"github.com/cometbft/cometbft/types"
 	"github.com/cometbft/cometbft/version"
 	"github.com/cosmos/gogoproto/proto"
 	mrand "math/rand"
@@ -50,6 +51,7 @@ Subcommands:
   stats      per-shard counts and the global summary
   status     one-screen dashboard (latest [archive] line + ranges + disk)
   verify     read every (or sampled) block on disk and check CRC + proto + height
+  verify-chain  sequential per-range walk: Block.ValidateBasic + prev↔current chain linkage
   download   fetch missing blocks from archive peers (long-running)
 
 Run any subcommand with -h for its flags.
@@ -72,6 +74,8 @@ func main() {
 		runStatus(os.Args[2:])
 	case "verify":
 		runVerify(os.Args[2:])
+	case "verify-chain":
+		runVerifyChain(os.Args[2:])
 	case "download":
 		runDownload(os.Args[2:])
 	case "-h", "--help", "help":
@@ -422,6 +426,205 @@ func fmtDur(s float64) string {
 		return fmt.Sprintf("%.1fs", s)
 	}
 	return d.Truncate(time.Second).String()
+}
+
+// runVerifyChain walks every contiguous range sequentially, checking:
+//
+//   Level 1 — internal hash consistency: types.Block.ValidateBasic checks
+//     header.LastCommitHash == LastCommit.Hash()
+//     header.DataHash       == Data.Hash()
+//     header.EvidenceHash   == Evidence.Hash()
+//   plus Header.ValidateBasic (length checks, version, etc).
+//
+//   Level 2 — chain linkage between adjacent blocks within a range:
+//     block(H).Hash() == block(H+1).Header.LastBlockID.Hash
+//
+// At range boundaries the predecessor isn't on disk, so the lower-edge
+// pair-check is reported as "skipped". Ranges run in parallel goroutines
+// (capped by -parallel); within each range the walk is sequential because
+// each iteration's prev-hash feeds the next.
+func runVerifyChain(args []string) {
+	fs := flag.NewFlagSet("verify-chain", flag.ExitOnError)
+	dir := fs.String("archive", "/mnt/data/cosmos-archive/cosmoshub-4", "archive root directory")
+	parallel := fs.Int("parallel", 4, "concurrent ranges to verify")
+	maxErrs := fs.Int("max-errors", 5, "max error examples to print per range")
+	_ = fs.Parse(args)
+
+	st, err := archive.New(*dir)
+	if err != nil {
+		log.Fatalf("open archive: %v", err)
+	}
+	defer st.Close()
+
+	ranges, total, err := st.Ranges()
+	if err != nil {
+		log.Fatalf("scan ranges: %v", err)
+	}
+	if total == 0 {
+		fmt.Println("(no blocks present)")
+		return
+	}
+
+	type result struct {
+		rng           archive.Range
+		l1Ok, l1Bad   int64
+		l2Ok, l2Bad   int64
+		boundaryNote  string // "skipped: prev block X absent"
+		errs          []string
+	}
+	results := make([]result, len(ranges))
+
+	sem := make(chan struct{}, *parallel)
+	var wg sync.WaitGroup
+	startT := time.Now()
+
+	// Periodic progress.
+	var done int64
+	go func() {
+		t := time.NewTicker(2 * time.Second)
+		defer t.Stop()
+		for {
+			<-t.C
+			d := atomic.LoadInt64(&done)
+			dt := time.Since(startT).Seconds()
+			rate := 0.0
+			if dt > 0 {
+				rate = float64(d) / dt
+			}
+			fmt.Printf("[verify-chain] %s / %s checked  (%.0f blk/s)\n",
+				commafmt(uint64(d)), commafmt(total), rate)
+		}
+	}()
+
+	for i, r := range ranges {
+		i, r := i, r
+		sem <- struct{}{}
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			defer func() { <-sem }()
+
+			res := result{rng: r}
+			res.boundaryNote = fmt.Sprintf("skipped: prev block %s absent", commafmt(r.Lo-1))
+
+			var prevHash []byte
+			for h := r.Lo; h <= r.Hi; h++ {
+				raw, err := st.Get(h)
+				if err != nil {
+					res.l1Bad++
+					if len(res.errs) < *maxErrs {
+						res.errs = append(res.errs, fmt.Sprintf("h=%d Get: %v", h, err))
+					}
+					prevHash = nil
+					atomic.AddInt64(&done, 1)
+					continue
+				}
+				var pb cmtproto.Block
+				if err := proto.Unmarshal(raw, &pb); err != nil {
+					res.l1Bad++
+					if len(res.errs) < *maxErrs {
+						res.errs = append(res.errs, fmt.Sprintf("h=%d unmarshal: %v", h, err))
+					}
+					prevHash = nil
+					atomic.AddInt64(&done, 1)
+					continue
+				}
+				block, err := types.BlockFromProto(&pb)
+				if err != nil {
+					res.l1Bad++
+					if len(res.errs) < *maxErrs {
+						res.errs = append(res.errs, fmt.Sprintf("h=%d BlockFromProto: %v", h, err))
+					}
+					prevHash = nil
+					atomic.AddInt64(&done, 1)
+					continue
+				}
+
+				// Level 1.
+				if err := block.ValidateBasic(); err != nil {
+					res.l1Bad++
+					if len(res.errs) < *maxErrs {
+						res.errs = append(res.errs, fmt.Sprintf("h=%d ValidateBasic: %v", h, err))
+					}
+					prevHash = nil
+					atomic.AddInt64(&done, 1)
+					continue
+				}
+				res.l1Ok++
+
+				// Level 2.
+				if prevHash != nil {
+					actual := block.Header.LastBlockID.Hash
+					if !bytesEqual(prevHash, actual) {
+						res.l2Bad++
+						if len(res.errs) < *maxErrs {
+							res.errs = append(res.errs, fmt.Sprintf(
+								"h=%d chain linkage broken: header.LastBlockID.Hash=%x prev block hash=%x",
+								h, actual, prevHash))
+						}
+					} else {
+						res.l2Ok++
+					}
+				}
+				prevHash = block.Hash()
+				atomic.AddInt64(&done, 1)
+			}
+			results[i] = res
+		}()
+	}
+	wg.Wait()
+
+	// Print per-range + totals.
+	fmt.Println()
+	var totL1Ok, totL1Bad, totL2Ok, totL2Bad int64
+	totSkipped := 0
+	for _, r := range results {
+		fmt.Printf("range %s .. %s  (%s blocks)\n",
+			commafmt(r.rng.Lo), commafmt(r.rng.Hi), commafmt(r.rng.Count()))
+		fmt.Printf("  internal hash (ValidateBasic):  %s ok / %d bad\n",
+			commafmt(uint64(r.l1Ok)), r.l1Bad)
+		fmt.Printf("  pair linkage:                   %s ok / %d mismatch\n",
+			commafmt(uint64(r.l2Ok)), r.l2Bad)
+		fmt.Printf("  boundary at lo: %s\n", r.boundaryNote)
+		if len(r.errs) > 0 {
+			fmt.Printf("  first errors:\n")
+			for _, e := range r.errs {
+				fmt.Printf("    %s\n", e)
+			}
+		}
+		totL1Ok += r.l1Ok
+		totL1Bad += r.l1Bad
+		totL2Ok += r.l2Ok
+		totL2Bad += r.l2Bad
+		totSkipped++
+	}
+	dt := time.Since(startT).Seconds()
+	fmt.Println()
+	fmt.Println("─────────────────────────────────────────────────────────")
+	fmt.Println("totals")
+	fmt.Printf("  internal hash:  %s ok / %d bad\n",
+		commafmt(uint64(totL1Ok)), totL1Bad)
+	fmt.Printf("  pair linkage:   %s ok / %d mismatch / %d skipped boundaries\n",
+		commafmt(uint64(totL2Ok)), totL2Bad, totSkipped)
+	fmt.Printf("  ran in %s (%.0f blk/s)\n", fmtDur(dt), float64(total)/dt)
+
+	if totL1Bad > 0 || totL2Bad > 0 {
+		os.Exit(1)
+	}
+}
+
+// bytesEqual is a small wrapper so the imports list stays minimal. Same as
+// bytes.Equal but local so we don't import "bytes" just for one call.
+func bytesEqual(a, b []byte) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i] != b[i] {
+			return false
+		}
+	}
+	return true
 }
 
 // runStatus prints a snapshot of download progress + on-disk state. Use
