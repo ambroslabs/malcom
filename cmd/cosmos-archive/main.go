@@ -16,6 +16,7 @@ import (
 	"os/signal"
 	"path/filepath"
 	"sort"
+	"sync"
 	"syscall"
 	"time"
 
@@ -296,9 +297,10 @@ func runDownload(args []string) {
 	listen := fs.String("listen", "tcp://0.0.0.0:0", "p2p bind address")
 	moniker := fs.String("moniker", "cosmos-archive-fetcher", "self moniker")
 	peersDB := fs.String("peers", "data/peers-cumulative.json", "load archive peers from this cumulative DB")
-	maxPeers := fs.Int("max-peers", 8, "concurrent outbound peer connections")
-	maxInflight := fs.Int("max-inflight", 256, "global concurrent BlockRequests")
-	maxInflightPeer := fs.Int("max-inflight-per-peer", 16, "concurrent BlockRequests per peer")
+	maxPeers := fs.Int("max-peers", 16, "concurrent outbound peer connections")
+	maxInflight := fs.Int("max-inflight", 512, "global concurrent BlockRequests")
+	maxInflightPeer := fs.Int("max-inflight-per-peer", 32, "concurrent BlockRequests per peer (cosmoshub archive nodes seem to handle ≥32 fine)")
+	dialWorkers := fs.Int("dial-workers", 8, "parallel dial workers (helps when target peers are slow to handshake)")
 	loFlag := fs.Int64("lo", 5_200_791, "lowest height to download")
 	hiFlag := fs.Int64("hi", 0, "highest height to download (0 ⇒ derived from peer status, capped to network tip)")
 	debug := fs.Bool("debug", false, "verbose logging")
@@ -418,8 +420,11 @@ func runDownload(args []string) {
 		cancel()
 	}()
 
-	// Dial candidates; cycle to maintain target.
-	go dialCycle(ctx, sw, candidates, *maxPeers, logger.With("module", "archivesync"))
+	// Dial candidates in parallel; each worker pulls from a shared cursor.
+	pool := &dialPoolState{}
+	for i := 0; i < *dialWorkers; i++ {
+		go dialCycle(ctx, sw, candidates, *maxPeers, pool, logger.With("module", "archivesync", "dial", i))
+	}
 
 	// Drive the reactor.
 	go reactor.SyncLoop(ctx)
@@ -472,10 +477,19 @@ func runDownload(args []string) {
 	}
 }
 
-// dialCycle keeps trying candidates until we hit `want` outbound peers.
-// Cycles forever so disconnects get re-dialed.
-func dialCycle(ctx context.Context, sw *p2p.Switch, candidates []string, want int, logger cmtlog.Logger) {
-	idx := 0
+// dialPoolState shares a round-robin cursor across parallel dialCycle workers.
+type dialPoolState struct {
+	mu     sync.Mutex
+	cursor int
+}
+
+// dialCycle keeps trying candidates until we hit `want` outbound peers,
+// pulling from a shared cursor so multiple instances don't all attempt
+// the same address at once.
+func dialCycle(ctx context.Context, sw *p2p.Switch, candidates []string, want int, pool *dialPoolState, logger cmtlog.Logger) {
+	if pool == nil {
+		pool = &dialPoolState{}
+	}
 	for {
 		select {
 		case <-ctx.Done():
@@ -487,26 +501,26 @@ func dialCycle(ctx context.Context, sw *p2p.Switch, candidates []string, want in
 			time.Sleep(2 * time.Second)
 			continue
 		}
-		if idx >= len(candidates) {
-			time.Sleep(5 * time.Second)
-			idx = 0
+		// Pop the next candidate.
+		pool.mu.Lock()
+		if pool.cursor >= len(candidates) {
+			pool.cursor = 0
+			pool.mu.Unlock()
+			time.Sleep(2 * time.Second)
 			continue
 		}
-		addr := candidates[idx]
-		idx++
+		addr := candidates[pool.cursor]
+		pool.cursor++
+		pool.mu.Unlock()
+
 		na, err := p2p.NewNetAddressString(addr)
 		if err != nil {
 			continue
 		}
-		// Don't dial ourselves (cometbft's Switch nil-derefs on self-dial
-		// because we never set an addrbook).
-		// In archive mode our NodeID is unlikely to be in the candidate
-		// list (we're picking known-archive nodes), but guard anyway.
 		if na.ID == sw.NodeInfo().ID() {
 			continue
 		}
-		err = sw.DialPeerWithAddress(na)
-		if err != nil {
+		if err := sw.DialPeerWithAddress(na); err != nil {
 			logger.Debug("dial failed", "peer", na.ID, "err", err)
 		} else {
 			logger.Info("connected", "peer", na.ID)
