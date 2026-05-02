@@ -9,14 +9,17 @@ package main
 import (
 	"context"
 	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"flag"
 	"fmt"
 	"log"
+	"net/http"
 	"os"
 	"os/signal"
 	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"syscall"
@@ -54,6 +57,7 @@ Subcommands:
   verify     read every (or sampled) block on disk and check CRC + proto + height
   verify-chain  sequential per-range walk: Block.ValidateBasic + prev↔current chain linkage
   verify-genesis  recompute genesis-block header fields from genesis.json and compare
+  verify-anchor   compare archive's block at height H against a public RPC's hash for that height
   fsck       deep on-disk integrity check (.blocks self-walk, idx cross-check, CRC, orphan detection)
   download   fetch missing blocks from archive peers (long-running)
 
@@ -83,6 +87,8 @@ func main() {
 		runFSCK(os.Args[2:])
 	case "verify-genesis":
 		runVerifyGenesis(os.Args[2:])
+	case "verify-anchor":
+		runVerifyAnchor(os.Args[2:])
 	case "download":
 		runDownload(os.Args[2:])
 	case "-h", "--help", "help":
@@ -579,6 +585,122 @@ func runVerifyGenesis(args []string) {
 	} else {
 		os.Exit(1)
 	}
+}
+
+// runVerifyAnchor fetches a block from a public cosmoshub RPC and
+// compares its hash to our archive's block at the same height. Combined
+// with verify-genesis (anchors the bottom) and verify-chain (links every
+// adjacent pair forward), this closes the cryptographic trust chain at
+// the recent end.
+//
+// We default to the highest height present locally and the polkachu RPC.
+// You can override either with -height H -rpc URL.
+func runVerifyAnchor(args []string) {
+	fs := flag.NewFlagSet("verify-anchor", flag.ExitOnError)
+	dir := fs.String("archive", "/mnt/data/cosmos-archive/cosmoshub-4", "archive root directory")
+	rpcURL := fs.String("rpc", "https://cosmos-rpc.publicnode.com", "public cosmoshub RPC base URL (no trailing slash). publicnode.com works reliably; rpc.cosmos.network and rpc.polkachu.com/cosmos also work")
+	height := fs.Int64("height", 0, "height to anchor at (0 ⇒ our archive's highest block)")
+	timeout := fs.Duration("timeout", 30*time.Second, "RPC request timeout")
+	_ = fs.Parse(args)
+
+	st, err := archive.New(*dir)
+	if err != nil {
+		log.Fatalf("open archive: %v", err)
+	}
+	defer st.Close()
+
+	ranges, _, err := st.Ranges()
+	if err != nil {
+		log.Fatalf("scan ranges: %v", err)
+	}
+	if len(ranges) == 0 {
+		log.Fatalf("archive is empty")
+	}
+
+	if *height == 0 {
+		*height = int64(ranges[len(ranges)-1].Hi)
+		fmt.Printf("anchoring at our highest block: height=%d\n", *height)
+	}
+	if !st.Has(uint64(*height)) {
+		log.Fatalf("archive doesn't have height %d (use -height H for one we do)", *height)
+	}
+
+	// Fetch RPC.
+	url := fmt.Sprintf("%s/block?height=%d", *rpcURL, *height)
+	fmt.Printf("GET %s\n", url)
+	client := &http.Client{Timeout: *timeout}
+	startT := time.Now()
+	resp, err := client.Get(url)
+	if err != nil {
+		log.Fatalf("rpc fetch: %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != 200 {
+		log.Fatalf("rpc returned HTTP %d", resp.StatusCode)
+	}
+
+	var rpcResp struct {
+		Result struct {
+			BlockID struct {
+				Hash string `json:"hash"`
+			} `json:"block_id"`
+			Block struct {
+				Header struct {
+					Height string `json:"height"`
+				} `json:"header"`
+			} `json:"block"`
+		} `json:"result"`
+		Error *struct {
+			Data string `json:"data"`
+		} `json:"error,omitempty"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&rpcResp); err != nil {
+		log.Fatalf("decode rpc response: %v", err)
+	}
+	if rpcResp.Error != nil {
+		log.Fatalf("rpc error: %s", rpcResp.Error.Data)
+	}
+	rpcHashStr := rpcResp.Result.BlockID.Hash
+	rpcHeight, _ := strconv.ParseInt(rpcResp.Result.Block.Header.Height, 10, 64)
+	if rpcHashStr == "" || rpcHeight != *height {
+		log.Fatalf("rpc returned unexpected payload (height=%d, hash=%q)", rpcHeight, rpcHashStr)
+	}
+
+	rpcHash, err := hex.DecodeString(rpcHashStr)
+	if err != nil {
+		log.Fatalf("decode rpc hash: %v", err)
+	}
+	fmt.Printf("rpc reports block %d in %s\n", rpcHeight, time.Since(startT).Truncate(time.Millisecond))
+	fmt.Printf("  hash from rpc:  %X\n", rpcHash)
+
+	// Compute our local hash.
+	rawBytes, err := st.Get(uint64(*height))
+	if err != nil {
+		log.Fatalf("read local block %d: %v", *height, err)
+	}
+	var pb cmtproto.Block
+	if err := proto.Unmarshal(rawBytes, &pb); err != nil {
+		log.Fatalf("decode local block: %v", err)
+	}
+	block, err := types.BlockFromProto(&pb)
+	if err != nil {
+		log.Fatalf("BlockFromProto: %v", err)
+	}
+	localHash := block.Hash()
+	fmt.Printf("  hash from disk: %X\n", []byte(localHash))
+
+	if !bytesEqual(rpcHash, localHash) {
+		fmt.Println()
+		fmt.Println("✗ MISMATCH — our archive's block at this height does not match the public chain.")
+		fmt.Println("  Either the archive has been tampered with, or the RPC is on a different fork,")
+		fmt.Println("  or the height is in a chain restart (cosmoshub-3 vs cosmoshub-4).")
+		os.Exit(1)
+	}
+
+	fmt.Println()
+	fmt.Println("✓ Archive matches public chain at this height.")
+	fmt.Println("  Combined with verify-genesis (start) and verify-chain (every pair),")
+	fmt.Println("  the entire archive is cryptographically anchored to the live cosmoshub.")
 }
 
 // runFSCK runs a deep on-disk integrity check across every shard:
