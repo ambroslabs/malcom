@@ -9,6 +9,7 @@
 /cosmos-snapshot-apply
 /cosmos-snapshot-to-appdb
 /cosmos-statesync-probe
+/pebble-compact
 /bin/
 *.exe
 
