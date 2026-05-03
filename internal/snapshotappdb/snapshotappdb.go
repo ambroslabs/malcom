@@ -20,6 +20,7 @@ package snapshotappdb
 
 import (
 	"bufio"
+	"bytes"
 	"compress/zlib"
 	"encoding/binary"
 	"fmt"
@@ -85,14 +86,32 @@ func Import(snapshotDir, outDir string, height int64, backend Backend, extDir st
 	var storeInfos []storeInfo
 
 	var (
-		curStore string
-		curTree  *iavl.MutableTree
-		curImp   *iavl.Importer
+		curStore     string
+		curTree      *iavl.MutableTree
+		curImp       *iavl.Importer
+		curPrefixed  idb.DB        // prefixed view of rootDB at "s/k:<name>/"
+		curFastBatch corestore.Batch // batch buffering fast-storage entries for the current store
 	)
 
 	// Per-store names whose hashes we'll resolve at the end (after the
 	// final compaction makes reads fast). Order = import order.
 	var storeNamesForHash []string
+
+	const fastBatchFlushBytes = 16 << 20 // 16 MiB
+
+	flushFastBatch := func() error {
+		if curFastBatch == nil {
+			return nil
+		}
+		if err := curFastBatch.Write(); err != nil {
+			return fmt.Errorf("flush fast batch %q: %w", curStore, err)
+		}
+		if err := curFastBatch.Close(); err != nil {
+			return fmt.Errorf("close fast batch %q: %w", curStore, err)
+		}
+		curFastBatch = curPrefixed.NewBatch()
+		return nil
+	}
 
 	commitCurrent := func() error {
 		if curImp == nil {
@@ -103,6 +122,29 @@ func Import(snapshotDir, outDir string, height int64, backend Backend, extDir st
 			return fmt.Errorf("commit store %q: %w", curStore, err)
 		}
 		curImp.Close()
+		// Mark fast-storage as built for this store: write the metadata
+		// key 'm'+"storage_version" = "1.1.0-<height>". iavl's
+		// shouldForceFastStorageUpgrade compares versions[1] against
+		// the latest version on the tree (== height for snapshot
+		// import), and IsUpgradeable also checks
+		// hasUpgradedToFastStorage which returns true for versions
+		// >= "1.1.0". With this metadata in place, gaiad's
+		// LoadVersion sees fast-storage as already-built and skips
+		// the upgrade.
+		metaKey := append([]byte{'m'}, []byte("storage_version")...)
+		metaVal := []byte(fmt.Sprintf("1.1.0-%d", height))
+		if err := curFastBatch.Set(metaKey, metaVal); err != nil {
+			return fmt.Errorf("set metadata for store %q: %w", curStore, err)
+		}
+		// Flush remaining fast-storage writes for this store.
+		if err := curFastBatch.Write(); err != nil {
+			return fmt.Errorf("flush fast batch %q: %w", curStore, err)
+		}
+		if err := curFastBatch.Close(); err != nil {
+			return fmt.Errorf("close fast batch %q: %w", curStore, err)
+		}
+		curFastBatch = nil
+		curPrefixed = nil
 		// IMPORTANT: do not call LoadVersion + Hash here. With pebble in
 		// bulk-load mode, the LSM has hundreds of L0 SSTs and point
 		// lookups during LoadVersion are pathologically slow. We defer
@@ -110,7 +152,7 @@ func Import(snapshotDir, outDir string, height int64, backend Backend, extDir st
 		// has few large files and reads are fast.
 		storeNamesForHash = append(storeNamesForHash, curStore)
 		stats.Stores++
-		fmt.Printf("[appdb] commit store=%-22s in %s (hash deferred)\n",
+		fmt.Printf("[appdb] commit store=%-22s in %s (hash deferred, fast-storage written)\n",
 			curStore, time.Since(commitStart).Truncate(time.Millisecond))
 		curTree.Close()
 		curTree = nil
@@ -124,12 +166,42 @@ func Import(snapshotDir, outDir string, height int64, backend Backend, extDir st
 		}
 		curStore = name
 		prefixed := idb.NewPrefixDB(rootDB, storePrefix(name))
+		curPrefixed = prefixed
+		curFastBatch = prefixed.NewBatch()
 		curTree = iavl.NewMutableTree(prefixed, 0, true, iavl.NewNopLogger())
 		imp, err := curTree.Import(height)
 		if err != nil {
 			return fmt.Errorf("Import(%d) on store %q: %w", height, name, err)
 		}
 		curImp = imp
+		return nil
+	}
+
+	// writeFastNode appends the fast-storage entry for a leaf to the
+	// per-store batch. iavl's nodedb encoding:
+	//
+	//   key   = 'f' || leaf.Key
+	//   value = varint(version) || varint(len(value)) || value
+	writeFastNode := func(node *iavl.ExportNode) error {
+		fkey := make([]byte, 0, 1+len(node.Key))
+		fkey = append(fkey, 'f')
+		fkey = append(fkey, node.Key...)
+
+		var fval bytes.Buffer
+		var vbuf [binary.MaxVarintLen64]byte
+		n := binary.PutUvarint(vbuf[:], uint64(node.Version))
+		fval.Write(vbuf[:n])
+		n = binary.PutUvarint(vbuf[:], uint64(len(node.Value)))
+		fval.Write(vbuf[:n])
+		fval.Write(node.Value)
+
+		if err := curFastBatch.Set(fkey, fval.Bytes()); err != nil {
+			return err
+		}
+		// Periodic flush to bound memory in the batch.
+		if size, err := curFastBatch.GetByteSize(); err == nil && size > fastBatchFlushBytes {
+			return flushFastBatch()
+		}
 		return nil
 	}
 
@@ -192,6 +264,14 @@ func Import(snapshotDir, outDir string, height int64, backend Backend, extDir st
 			node := parseIAVLExportNode(body)
 			if err := curImp.Add(node); err != nil {
 				return stats, fmt.Errorf("import node into %q: %w", curStore, err)
+			}
+			// Path A: also write the fast-storage entry for leaves.
+			// Inner nodes (height > 0) are not in fast-storage —
+			// fast-storage is the flat-map of (leaf_key → leaf_value).
+			if node.Height == 0 {
+				if err := writeFastNode(node); err != nil {
+					return stats, fmt.Errorf("write fast-node into %q: %w", curStore, err)
+				}
 			}
 			stats.Items++
 			curStoreItems++
