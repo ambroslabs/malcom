@@ -67,11 +67,6 @@ type Reactor struct {
 	MaxInflight        int // global concurrent BlockRequests
 	MaxInflightPerPeer int
 	BatchSize          int // max BlockRequests issued per sync tick
-
-	// MinPeerBase: only request from peers whose StatusResponse.Base is at
-	// or below this height. We set this to (oldest height we want to
-	// download) to filter out non-archive nodes that won't have the data.
-	MinPeerBase int64
 }
 
 func NewReactor(store *archive.Store, q *Queue, logger log.Logger) *Reactor {
@@ -257,12 +252,10 @@ func (r *Reactor) assignWork() {
 	}
 	pts := make([]pt, 0, len(r.peers))
 	for id, ps := range r.peers {
-		// Filter: must report a meaningful tip and (if MinPeerBase set) be
-		// archival enough.
+		// Per-height eligibility (cand.base ≤ h ≤ cand.tip) at dispatch time
+		// is the canonical filter — see the inner loop below. We just skip
+		// peers that haven't given us a meaningful StatusResponse yet.
 		if ps.tip <= 0 {
-			continue
-		}
-		if r.MinPeerBase > 0 && ps.base > r.MinPeerBase {
 			continue
 		}
 		pts = append(pts, pt{id, ps.base, ps.tip, ps.inflight})
@@ -362,7 +355,7 @@ type Counters struct {
 	DecodeFailed int64
 	BytesIn      int64
 	Peers        int
-	EligibleP    int // peers passing MinPeerBase
+	EligibleP    int // peers that have responded with a non-zero tip (i.e. usable)
 	Inflight     int
 }
 
@@ -371,7 +364,7 @@ func (r *Reactor) Snapshot() Counters {
 	peers := len(r.peers)
 	elig := 0
 	for _, ps := range r.peers {
-		if ps.tip > 0 && (r.MinPeerBase == 0 || ps.base <= r.MinPeerBase) {
+		if ps.tip > 0 {
 			elig++
 		}
 	}

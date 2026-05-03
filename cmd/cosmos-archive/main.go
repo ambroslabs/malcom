@@ -13,6 +13,7 @@ import (
 	"encoding/json"
 	"flag"
 	"fmt"
+	"io"
 	"log"
 	"net/http"
 	"os"
@@ -42,6 +43,59 @@ import (
 	"github.com/zrbecker/cosmos-p2p/internal/archivesync"
 	"github.com/zrbecker/cosmos-p2p/internal/pex"
 )
+
+// openLogFiles creates download-<timestamp>.out/.err under logDir, updates
+// the download-current.{out,err} symlinks atomically, and returns the open
+// *os.File handles for the caller to use.
+//
+// We deliberately stay at the Go *os.File abstraction — no syscall.Dup,
+// no os.Stdout/os.Stderr mutation. The caller threads the returned files
+// to every output site (fmt.Fprintf, log.SetOutput, cometbft writer) and
+// closes them at shutdown. This trades a little plumbing for not needing
+// to reason about fd ownership across goroutines and GC.
+func openLogFiles(logDir string) (out, errF *os.File, err error) {
+	if err := os.MkdirAll(logDir, 0o755); err != nil {
+		return nil, nil, fmt.Errorf("mkdir %s: %w", logDir, err)
+	}
+	ts := time.Now().UTC().Format("20060102T150405Z")
+	outName := fmt.Sprintf("download-%s.out", ts)
+	errName := fmt.Sprintf("download-%s.err", ts)
+	outPath := filepath.Join(logDir, outName)
+	errPath := filepath.Join(logDir, errName)
+
+	out, err = os.OpenFile(outPath, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o644)
+	if err != nil {
+		return nil, nil, fmt.Errorf("open %s: %w", outPath, err)
+	}
+	errF, err = os.OpenFile(errPath, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o644)
+	if err != nil {
+		out.Close()
+		return nil, nil, fmt.Errorf("open %s: %w", errPath, err)
+	}
+
+	// Atomic symlink swap: write a temp link, then rename. Avoids a window
+	// where the symlink doesn't exist (would break a concurrent `status`).
+	swap := func(target, linkName string) error {
+		linkPath := filepath.Join(logDir, linkName)
+		tmp := linkPath + ".tmp"
+		_ = os.Remove(tmp)
+		if err := os.Symlink(target, tmp); err != nil {
+			return err
+		}
+		return os.Rename(tmp, linkPath)
+	}
+	if err := swap(outName, "download-current.out"); err != nil {
+		out.Close()
+		errF.Close()
+		return nil, nil, fmt.Errorf("swap out symlink: %w", err)
+	}
+	if err := swap(errName, "download-current.err"); err != nil {
+		out.Close()
+		errF.Close()
+		return nil, nil, fmt.Errorf("swap err symlink: %w", err)
+	}
+	return out, errF, nil
+}
 
 func usage() {
 	fmt.Fprintf(os.Stderr, `cosmos-archive — manage the on-disk block archive
@@ -1304,10 +1358,36 @@ func runDownload(args []string) {
 	externalAddr := fs.String("external-addr", "", "publicly-dialable host:port to advertise via PEX. Empty disables PEX-server-side. (e.g. 64.23.187.105:26656)")
 	loFlag := fs.Int64("lo", 5_200_791, "lowest height to download")
 	hiFlag := fs.Int64("hi", 0, "highest height to download (0 ⇒ derived from peer status, capped to network tip)")
+	newestFirst := fs.Bool("newest-first", false, "download newer blocks before older. (Per-peer eligibility at dispatch already uses each peer's reported (base, tip) so non-archive peers automatically serve heights they have.)")
+	logDir := fs.String("log-dir", "/mnt/data/cosmos-archive/logs", "if non-empty, redirect stdout/stderr to download-<timestamp>.out/.err under this dir, and update download-current.{out,err} symlinks. Empty disables.")
 	debug := fs.Bool("debug", false, "verbose logging")
 	_ = fs.Parse(args)
 
-	logger := cmtlog.NewTMLogger(cmtlog.NewSyncWriter(os.Stderr))
+	// Pick an io.Writer for our own [archive]/[exit] lines and another for
+	// cometbft logging + log.Fatalf. Default is stdout/stderr; if a log dir
+	// is configured we open dedicated files and route everything there.
+	var (
+		outW   io.Writer = os.Stdout
+		errW   io.Writer = os.Stderr
+		logOut *os.File
+		logErr *os.File
+	)
+	if *logDir != "" {
+		o, e, err := openLogFiles(*logDir)
+		if err != nil {
+			log.Fatalf("open log files: %v", err)
+		}
+		logOut, logErr = o, e
+		outW, errW = logOut, logErr
+		defer logOut.Close()
+		defer logErr.Close()
+	}
+	// Re-route the std `log` package (used by log.Fatalf throughout this
+	// command) to our error writer so failures are captured in the same
+	// file as the cometbft logger output.
+	log.SetOutput(errW)
+
+	logger := cmtlog.NewTMLogger(cmtlog.NewSyncWriter(errW))
 	if *debug {
 		logger = cmtlog.NewFilter(logger, cmtlog.AllowDebug())
 	} else {
@@ -1321,6 +1401,11 @@ func runDownload(args []string) {
 		log.Fatalf("open archive: %v", err)
 	}
 	defer st.Close()
+	// Take an exclusive writer lock so a second download can't run against
+	// the same archive and corrupt it. Reader commands don't need the lock.
+	if err := st.LockWriter(); err != nil {
+		log.Fatalf("acquire writer lock: %v\n(is another `cosmos-archive download` already running?)", err)
+	}
 
 	// Compute initial work queue from missing-set.
 	logger.Info("scanning archive", "root", *dir)
@@ -1344,6 +1429,7 @@ func runDownload(args []string) {
 		log.Fatalf("compute missing: %v", err)
 	}
 	queue := archivesync.NewQueue()
+	queue.Descending = *newestFirst
 	for _, g := range gaps {
 		queue.AddRange(int64(g.Lo), int64(g.Hi))
 	}
@@ -1395,7 +1481,6 @@ func runDownload(args []string) {
 	reactor := archivesync.NewReactor(st, queue, logger.With("module", "archivesync"))
 	reactor.MaxInflight = *maxInflight
 	reactor.MaxInflightPerPeer = *maxInflightPeer
-	reactor.MinPeerBase = *loFlag
 
 	pexR := pex.NewReactor(logger.With("module", "pex"))
 	if *externalAddr != "" {
@@ -1418,9 +1503,9 @@ func runDownload(args []string) {
 	// Build the dial pool with three sources:
 	//   1. The 8 known archive nodes (highest priority — pinned first).
 	//   2. Chain-registry seed nodes (PEX-rich; gossip more peers to us).
-	//   3. The full cumulative DB (most non-archive but we keep them for
-	//      PEX gossip; the archivesync reactor's MinPeerBase filter means
-	//      we won't BlockRequest from them).
+	//   3. The full cumulative DB (most non-archive, but the per-height
+	//      eligibility check (cand.base ≤ h ≤ cand.tip) at dispatch time
+	//      lets them serve recent heights they actually have).
 	dialer := newDialer(string(nodeKey.ID()))
 	archiveCands := loadArchivePeers(*peersDB, *loFlag)
 	for _, a := range archiveCands {
@@ -1507,7 +1592,7 @@ func runDownload(args []string) {
 		case <-ctx.Done():
 			s := reactor.Snapshot()
 			elapsed := time.Since(startTime).Seconds()
-			fmt.Printf("[exit] received=%d written=%d noblock=%d timedout=%d  inflight=%d  bytes_in=%dKB  over %.0fs (%.1f blk/s)\n",
+			fmt.Fprintf(outW, "[exit] received=%d written=%d noblock=%d timedout=%d  inflight=%d  bytes_in=%dKB  over %.0fs (%.1f blk/s)\n",
 				s.Received, s.Written, s.NoBlock, s.TimedOut, s.Inflight, s.BytesIn/1024, elapsed, float64(s.Written)/elapsed)
 			return
 		case now := <-t.C:
@@ -1519,7 +1604,7 @@ func runDownload(args []string) {
 			if rate > 0 {
 				eta = time.Duration(float64(pending)/rate) * time.Second
 			}
-			fmt.Printf("[archive] queue=%d written=%d (Δ%d, %.1f/s) recv=%d noblock=%d timedout=%d  peers=%d (eligible=%d)  inflight=%d  eta=%s\n",
+			fmt.Fprintf(outW, "[archive] queue=%d written=%d (Δ%d, %.1f/s) recv=%d noblock=%d timedout=%d  peers=%d (eligible=%d)  inflight=%d  eta=%s\n",
 				pending,
 				s.Written, s.Written-prev.Written, rate,
 				s.Received, s.NoBlock, s.TimedOut,

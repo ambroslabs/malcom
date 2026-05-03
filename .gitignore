@@ -2,8 +2,19 @@
 /cosmos-p2p
 /cosmos-crawl
 /cosmos-blockcache
+/cosmos-archive
+/cosmos-snapshot-fetch
+/cosmos-snapshot-inspect
+/cosmos-snapshot-diff
+/cosmos-snapshot-apply
+/cosmos-snapshot-to-appdb
+/cosmos-statesync-probe
 /bin/
 *.exe
+
+# Local convenience symlinks to log dirs on the data mount
+/download-current.out
+/download-current.err
 
 # Runtime data: node identity (private key!), block cache, addrbook snapshots,
 # crawl results, per-peer activity dumps. Keep these out of git.

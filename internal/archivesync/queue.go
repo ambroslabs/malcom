@@ -23,10 +23,15 @@ import (
 type Queue struct {
 	mu        sync.Mutex
 	pending   map[int64]struct{}
-	fresh     []int64 // ordered (asc) main queue
+	fresh     []int64 // sorted main queue (asc by default, desc if Descending)
 	retry     []int64 // LIFO of heights to retry first
 	cursor    int
 	dirtySort bool
+
+	// Descending, when true, sorts fresh from highest height to lowest. Used
+	// when the operator wants newer blocks downloaded first (more useful for
+	// serving recent state, analytics, snapshot anchoring).
+	Descending bool
 }
 
 func NewQueue() *Queue {
@@ -120,7 +125,11 @@ func (q *Queue) Next() (int64, bool) {
 	}
 	// Then walk fresh round-robin.
 	if q.dirtySort {
-		sort.Slice(q.fresh, func(i, j int) bool { return q.fresh[i] < q.fresh[j] })
+		if q.Descending {
+			sort.Slice(q.fresh, func(i, j int) bool { return q.fresh[i] > q.fresh[j] })
+		} else {
+			sort.Slice(q.fresh, func(i, j int) bool { return q.fresh[i] < q.fresh[j] })
+		}
 		q.dirtySort = false
 	}
 	for steps := 0; steps < len(q.fresh); steps++ {
@@ -145,7 +154,11 @@ func (q *Queue) Compact() {
 	for h := range q.pending {
 		q.fresh = append(q.fresh, h)
 	}
-	sort.Slice(q.fresh, func(i, j int) bool { return q.fresh[i] < q.fresh[j] })
+	if q.Descending {
+		sort.Slice(q.fresh, func(i, j int) bool { return q.fresh[i] > q.fresh[j] })
+	} else {
+		sort.Slice(q.fresh, func(i, j int) bool { return q.fresh[i] < q.fresh[j] })
+	}
 	q.cursor = 0
 	q.dirtySort = false
 }

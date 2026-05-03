@@ -8,6 +8,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"syscall"
 )
 
 // Store is a directory of shards. Opens shards lazily on first access and
@@ -17,6 +18,10 @@ type Store struct {
 
 	mu     sync.Mutex
 	shards map[uint64]*Shard
+
+	// lockFile holds the exclusive flock when LockWriter has been called.
+	// nil means no lock is held (read-only or unlocked instance).
+	lockFile *os.File
 }
 
 // New opens (or creates) a Store rooted at dir.
@@ -35,7 +40,34 @@ func New(dir string) (*Store, error) {
 // Root returns the on-disk directory.
 func (s *Store) Root() string { return s.root }
 
-// Close releases all open shards.
+// LockWriter acquires an exclusive non-blocking flock on <root>/.lock.
+// Call this from any process that intends to write (the downloader) so a
+// second concurrent writer can't corrupt the archive. Reader-only commands
+// (ranges, fsck, verify-chain, status) skip this and continue to work
+// concurrently — writes are append-only so a stale read at the tail is the
+// worst case, no torn updates to existing data.
+//
+// Errors with a clear message if another process holds the lock.
+func (s *Store) LockWriter() error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.lockFile != nil {
+		return fmt.Errorf("LockWriter: lock already held in this process")
+	}
+	path := filepath.Join(s.root, ".lock")
+	f, err := os.OpenFile(path, os.O_RDWR|os.O_CREATE, 0o644)
+	if err != nil {
+		return fmt.Errorf("open lockfile: %w", err)
+	}
+	if err := syscall.Flock(int(f.Fd()), syscall.LOCK_EX|syscall.LOCK_NB); err != nil {
+		f.Close()
+		return fmt.Errorf("another writer is holding %s (flock: %w)", path, err)
+	}
+	s.lockFile = f
+	return nil
+}
+
+// Close releases all open shards and the writer lock if held.
 func (s *Store) Close() error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -46,6 +78,13 @@ func (s *Store) Close() error {
 		}
 	}
 	s.shards = nil
+	if s.lockFile != nil {
+		// Releasing the file handle releases the flock too; explicit unlock
+		// for clarity.
+		_ = syscall.Flock(int(s.lockFile.Fd()), syscall.LOCK_UN)
+		_ = s.lockFile.Close()
+		s.lockFile = nil
+	}
 	return firstErr
 }
 
