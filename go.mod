@@ -5,6 +5,17 @@ go 1.23.4
 require github.com/cometbft/cometbft v0.38.22
 
 require (
+	github.com/google/orderedcode v0.0.1 // indirect
+	github.com/gorilla/websocket v1.5.3 // indirect
+	github.com/hashicorp/golang-lru/v2 v2.0.7 // indirect
+	github.com/lib/pq v1.12.0 // indirect
+	github.com/minio/highwayhash v1.0.4 // indirect
+	github.com/rcrowley/go-metrics v0.0.0-20201227073835-cf1acfcdf475 // indirect
+	github.com/rs/cors v1.11.1 // indirect
+	golang.org/x/sync v0.12.0 // indirect
+)
+
+require (
 	cosmossdk.io/core v0.12.1-0.20240725072823-6a2d039e1212
 	github.com/DataDog/zstd v1.5.6 // indirect
 	github.com/beorn7/perks v1.0.1 // indirect
