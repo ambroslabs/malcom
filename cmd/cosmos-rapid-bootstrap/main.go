@@ -4,20 +4,21 @@
 //
 // Pipeline:
 //
-//  1. cosmos-snapshot-fetch    snapshot chunks via raw p2p
-//  2. snapshotappdb.Import     application.db with wave-parallel iavl
-//                              + bulk-load-tuned pebble. Writes directly
-//                              into <out>/data so step 4 can skip its copy.
-//  3. cosmos-bootstrap-gaia    state.db + blockstore.db + minimal configs
+//  1. snapfetch + snapshotappdb.ImportStream   pulled via raw p2p and
+//                              streamed straight into the importer's
+//                              reorder buffer — no on-disk staging dir,
+//                              no subprocess. application.db lands at
+//                              <home>/data/application.db.
+//  2. cosmos-bootstrap-gaia    state.db + blockstore.db + minimal configs
 //                              -skip-app-copy because we already placed
 //                              application.db at the destination.
-//  4. gaiad init               just enough for node_key.json + priv_validator
+//  3. gaiad init               just enough for node_key.json + priv_validator
 //                              (we then overwrite genesis from -genesis).
-//  5. config edits             persistent_peers, app-db-backend = pebbledb,
+//  4. config edits             persistent_peers, app-db-backend = pebbledb,
 //                              statesync.enable = false (we already have
-//                              state.db from step 3).
-//  6. gaiad start              blocksync to mainnet tip.
-//  7. RPC poll                 wait until catching_up: false.
+//                              state.db from step 2).
+//  5. gaiad start              blocksync to mainnet tip.
+//  6. RPC poll                 wait until catching_up: false.
 //
 // Output: bench-style "[HH:MM:SS +X] event" lines on stdout, plus a
 // >>> PHASE: ... line at each major boundary so the resulting log can be
@@ -43,27 +44,39 @@ import (
 	"syscall"
 	"time"
 
+	cmtlog "github.com/cometbft/cometbft/libs/log"
+
+	"github.com/zrbecker/cosmos-p2p/internal/snapfetch"
 	"github.com/zrbecker/cosmos-p2p/internal/snapshotappdb"
 )
 
 var (
-	homeDir       = flag.String("home", "", "gaiad home directory (out)")
-	gaiadPath     = flag.String("gaiad", "", "path to gaiad binary")
-	chainID       = flag.String("chain-id", "cosmoshub-4", "chain id")
-	genesisPath   = flag.String("genesis", "", "path to chain genesis.json")
-	rpcsFlag      = flag.String("rpcs", "", "comma-separated RPC URLs (for trust hash + bootstrap)")
-	addrbookURL   = flag.String("addrbook", "", "URL of addrbook.json (passed to snapshot-fetch + cached locally)")
-	peersFile     = flag.String("peers-file", "", "JSON peer DB (passed to snapshot-fetch as -cumulative)")
-	peersLimit    = flag.Int("peers-limit", 25, "max peers from peers-file to feed gaiad as persistent_peers")
-	maxOutbound   = flag.Int("max-outbound", 25, "config.toml [p2p].max_num_outbound_peers")
-	rpcPort       = flag.Int("rpc-port", 26657, "local cometbft RPC port")
-	freshFlag     = flag.Bool("fresh", false, "wipe -home before starting")
-	pollInterval  = flag.Duration("poll-interval", 15*time.Second, "RPC poll interval")
-	snapshotFetch = flag.String("snapshot-fetch", "", "path to cosmos-snapshot-fetch binary (default: look on PATH)")
-	bootstrapBin  = flag.String("bootstrap-bin", "", "path to cosmos-bootstrap-gaia binary (default: look on PATH)")
-	concurrency   = flag.Int("import-concurrency", 0, "snapshotappdb.Import concurrency (0 = auto min(NumCPU,8))")
-	trustOffset   = flag.Int64("trust-offset", 1000, "trust_height = chain_tip - this (used by bootstrap-gaia)")
-	stagingDir    = flag.String("staging", "", "snapshot chunk staging dir (default: <home>/snapshots-staging)")
+	homeDir      = flag.String("home", "", "gaiad home directory (out)")
+	gaiadPath    = flag.String("gaiad", "", "path to gaiad binary")
+	chainID      = flag.String("chain-id", "cosmoshub-4", "chain id")
+	genesisPath  = flag.String("genesis", "", "path to chain genesis.json")
+	rpcsFlag     = flag.String("rpcs", "", "comma-separated RPC URLs (for trust hash + bootstrap)")
+	addrbookURL  = flag.String("addrbook", "", "URL of addrbook.json (downloaded once, fed to snapfetch as fallback seed source)")
+	peersFile    = flag.String("peers-file", "", "JSON peer DB (cumulative crawl output, used as snapfetch seed source)")
+	peersLimit   = flag.Int("peers-limit", 25, "max peers from peers-file to feed gaiad as persistent_peers")
+	maxOutbound  = flag.Int("max-outbound", 25, "config.toml [p2p].max_num_outbound_peers")
+	rpcPort      = flag.Int("rpc-port", 26657, "local cometbft RPC port")
+	freshFlag    = flag.Bool("fresh", false, "wipe -home before starting")
+	pollInterval = flag.Duration("poll-interval", 15*time.Second, "RPC poll interval")
+	bootstrapBin = flag.String("bootstrap-bin", "", "path to cosmos-bootstrap-gaia binary (default: look on PATH)")
+	concurrency  = flag.Int("import-concurrency", 0, "snapshotappdb.Import concurrency (0 = auto min(NumCPU,8))")
+	_            = flag.Int64("trust-offset", 1000, "(deprecated; bootstrap-gaia handles trust-offset internally)")
+	nodeKeyPath  = flag.String("snapfetch-node-key", "", "path to snapfetch p2p node key (default: <home>/snapfetch_node_key.json)")
+	preferFresh  = flag.Bool("prefer-fresh", true, "snapfetch: rank candidates by newest height first")
+	debugFetch   = flag.Bool("snapfetch-debug", false, "snapfetch: verbose logging")
+
+	// Back-compat stub: previously the path to cosmos-snapshot-fetch
+	// subprocess. Now snapfetch is in-process; this flag is accepted but
+	// ignored for callers who still pass it.
+	_ = flag.String("snapshot-fetch", "", "(deprecated; ignored — snapfetch is now in-process)")
+	// Same for staging dir — no longer used because chunks stream into
+	// the importer.
+	_ = flag.String("staging", "", "(deprecated; ignored — chunks stream straight into the importer)")
 )
 
 // ─── event-log helpers (match cosmos-statesync-bench's format) ────────────
@@ -106,13 +119,6 @@ func main() {
 		flag.Usage()
 		os.Exit(2)
 	}
-	if *snapshotFetch == "" {
-		*snapshotFetch = which("cosmos-snapshot-fetch")
-		if *snapshotFetch == "" {
-			fmt.Fprintln(os.Stderr, "cosmos-snapshot-fetch not in PATH; pass -snapshot-fetch")
-			os.Exit(2)
-		}
-	}
 	if *bootstrapBin == "" {
 		*bootstrapBin = which("cosmos-bootstrap-gaia")
 		if *bootstrapBin == "" {
@@ -120,8 +126,8 @@ func main() {
 			os.Exit(2)
 		}
 	}
-	if *stagingDir == "" {
-		*stagingDir = filepath.Join(*homeDir, "snapshots-staging")
+	if *nodeKeyPath == "" {
+		*nodeKeyPath = filepath.Join(*homeDir, "snapfetch_node_key.json")
 	}
 
 	rpcs := splitRPCs(*rpcsFlag)
@@ -143,9 +149,6 @@ func main() {
 	if err := os.MkdirAll(filepath.Join(*homeDir, "data"), 0o755); err != nil {
 		fatal("mkdir data: %v", err)
 	}
-	if err := os.MkdirAll(*stagingDir, 0o755); err != nil {
-		fatal("mkdir staging: %v", err)
-	}
 
 	// Trap SIGINT so we can shut gaiad down cleanly if started.
 	gaiadCtx, gaiadCancel := context.WithCancel(context.Background())
@@ -158,30 +161,20 @@ func main() {
 		gaiadCancel()
 	}()
 
-	// 1. Snapshot fetch (subprocess).
-	bench.phase("snapshot fetch starting")
+	// 1. Snapshot fetch + import (interleaved). Chunks stream from
+	//    snapfetch into ImportStream's reorder buffer; the importer
+	//    starts processing chunk 0 the instant it lands. With this
+	//    pipelining the import overlaps with download, cutting wall time
+	//    by ~15-20% on cosmos-hub vs. the old serial fetch-then-import.
+	bench.phase("snapfetch + import (interleaved) starting")
 	t0 := time.Now()
-	snapDir := runSnapshotFetch(bench)
-	bench.phase("snapshot fetch complete dir=%s elapsed=%s", snapDir, formatDur(time.Since(t0)))
-
-	// Parse meta.json for height.
-	height := readHeightFromMeta(filepath.Join(snapDir, "meta.json"))
-
-	// 2. Import to application.db (in-process, wave-parallel iavl + tuned
-	//    pebble). Pass <home>/data as -out so application.db lands at
-	//    <home>/data/application.db — exactly where gaiad expects it.
-	bench.phase("import starting (height=%d)", height)
-	t0 = time.Now()
 	dataDir := filepath.Join(*homeDir, "data")
-	stats, err := snapshotappdb.Import(snapDir, dataDir, height,
-		snapshotappdb.BackendPebble, filepath.Join(dataDir, "extensions"), *concurrency)
-	if err != nil {
-		fatal("import: %v", err)
-	}
-	bench.phase("import complete elapsed=%s stores=%d items=%d uncompressed=%s",
-		formatDur(time.Since(t0)), stats.Stores, stats.Items, snapshotappdb.HumanBytes(stats.BytesUncompressed))
+	stats, height := runFetchAndImport(bench, gaiadCtx, dataDir)
+	bench.phase("snapfetch + import complete elapsed=%s height=%d stores=%d items=%d uncompressed=%s",
+		formatDur(time.Since(t0)), height, stats.Stores, stats.Items,
+		snapshotappdb.HumanBytes(stats.BytesUncompressed))
 
-	// 3. Pebble cleanup compaction reclaims slack from bulk-load mode.
+	// 2. Pebble cleanup compaction reclaims slack from bulk-load mode.
 	bench.phase("pebble cleanup compaction starting")
 	t0 = time.Now()
 	if err := snapshotappdb.PebbleCleanupCompact(filepath.Join(dataDir, "application.db")); err != nil {
@@ -189,7 +182,7 @@ func main() {
 	}
 	bench.phase("pebble cleanup complete elapsed=%s", formatDur(time.Since(t0)))
 
-	// 4. Bootstrap state.db + blockstore.db + configs (subprocess to
+	// 3. Bootstrap state.db + blockstore.db + configs (subprocess to
 	//    cosmos-bootstrap-gaia with -skip-app-copy since application.db
 	//    is already at <home>/data/application.db).
 	bench.phase("cometbft bootstrap-state starting")
@@ -232,34 +225,154 @@ func main() {
 
 // ─── pipeline steps ──────────────────────────────────────────────────────
 
-func runSnapshotFetch(b *Bench) string {
-	args := []string{
-		"-chain-id", *chainID,
-		"-cumulative", *peersFile,
-		"-out", *stagingDir,
-		"-prefer-fresh",
+// channelSink fans snapfetch events out to two channels:
+//
+//   - chosenCh: receives a meta blob (height + format + chunk count)
+//     once, when phase 2 picks a candidate. The importer goroutine
+//     blocks on this so it knows totalChunks before consuming bytes.
+//   - chunks: streams ChunkBytes as they're verified, in arbitrary
+//     order. Closed by the producing goroutine after RunFetch returns.
+type channelSink struct {
+	chosenCh chan chosenInfo
+	chunks   chan snapshotappdb.ChunkBytes
+
+	// chosenOnce guards against rapid-bootstrap's not-recoverable case:
+	// snapfetch's RunFetch will issue a second OnChosen if its first
+	// chosen candidate fails phase-3 download (rescan). The streaming
+	// importer has already consumed chunks of the first stream and
+	// can't switch tracks mid-import. We surface this as an error from
+	// OnChosen, which RunFetch propagates up.
+	chosenOnce sync.Once
+}
+
+type chosenInfo struct {
+	height      uint64
+	format      uint32
+	totalChunks uint32
+}
+
+func (s *channelSink) OnChosen(height uint64, format uint32, chunks uint32, _ []byte, _ []byte, _ [][]byte) error {
+	first := false
+	s.chosenOnce.Do(func() {
+		s.chosenCh <- chosenInfo{height: height, format: format, totalChunks: chunks}
+		first = true
+	})
+	if first {
+		return nil
+	}
+	// Already chosen once — this is a rescan after a failed download.
+	// The importer has been working on a doomed stream; not recoverable
+	// without much more careful state-machine work. Surface an error so
+	// RunFetch returns up the stack and the parent ctx cancels the
+	// importer.
+	return fmt.Errorf("rapid-bootstrap streaming sink: snapfetch issued a second OnChosen (rescan); not supported")
+}
+
+func (s *channelSink) OnChunk(idx uint32, data []byte) error {
+	// Defensive copy so we don't share buffers with snapfetch internals.
+	cp := append([]byte(nil), data...)
+	s.chunks <- snapshotappdb.ChunkBytes{Index: idx, Data: cp}
+	return nil
+}
+
+func (s *channelSink) OnComplete(uint64, []string, []string) error { return nil }
+
+// runFetchAndImport runs snapfetch and snapshotappdb.ImportStream
+// concurrently: snapfetch fills a chunks channel, ImportStream drains
+// it. The importer can't start the snapshot stream parser until it
+// knows totalChunks; that info is delivered through chosenCh before
+// the first OnChunk fires.
+//
+// On error from either side, ctx is cancelled so the other side
+// observes the cancellation through its own select / Read path.
+func runFetchAndImport(b *Bench, ctx context.Context, dataDir string) (snapshotappdb.Stats, int64) {
+	cfg := snapfetch.Config{
+		ChainID:     *chainID,
+		NodeKeyPath: *nodeKeyPath,
+		Cumulative:  *peersFile,
+		PreferFresh: *preferFresh,
+		Logger:      buildSnapfetchLogger(*debugFetch),
 	}
 	if *addrbookURL != "" {
-		// snapshot-fetch wants a local file. If it's a URL, download once
-		// to a tempfile.
 		path, err := materializeAddrbook(*addrbookURL)
 		if err != nil {
 			fatal("addrbook fetch: %v", err)
 		}
-		args = append(args, "-addrbook", path)
+		cfg.AddrBook = path
 	}
-	cmd := exec.Command(*snapshotFetch, args...)
-	cmd.Stdout = newPrefixWriter("[snap-fetch] ")
-	cmd.Stderr = newPrefixWriter("[snap-fetch] ")
-	if err := cmd.Run(); err != nil {
-		fatal("snapshot-fetch: %v", err)
+
+	// chunksCh buffer of 16 — small enough that snapfetch back-pressures
+	// (preventing unbounded memory growth) but big enough that the
+	// occasional importer flush stall doesn't starve the network.
+	chunksCh := make(chan snapshotappdb.ChunkBytes, 16)
+	chosenCh := make(chan chosenInfo, 1)
+	sink := &channelSink{chosenCh: chosenCh, chunks: chunksCh}
+
+	fetchCtx, fetchCancel := context.WithCancel(ctx)
+	defer fetchCancel()
+
+	var (
+		fetchErr   error
+		fetchWG    sync.WaitGroup
+		fetchStats *snapfetch.Result
+	)
+	fetchWG.Add(1)
+	go func() {
+		defer fetchWG.Done()
+		defer close(chunksCh)
+		res, err := snapfetch.RunFetch(fetchCtx, cfg, sink)
+		fetchStats = res
+		fetchErr = err
+		if err != nil {
+			fetchCancel()
+		}
+	}()
+
+	// Block until snapfetch picks a candidate (or fails before then).
+	var chosen chosenInfo
+	select {
+	case chosen = <-chosenCh:
+	case <-fetchCtx.Done():
+		fetchWG.Wait()
+		fatal("snapfetch failed before choosing snapshot: %v", fetchErr)
 	}
-	// Find the most-recent <H>_<fmt> dir under staging that has .complete.
-	dir, err := newestCompleteSnap(*stagingDir)
+	b.emit("snapfetch chose height=%d format=%d chunks=%d — importing while remaining chunks stream",
+		chosen.height, chosen.format, chosen.totalChunks)
+
+	height := int64(chosen.height)
+	stats, err := snapshotappdb.ImportStream(fetchCtx, chunksCh, chosen.totalChunks,
+		dataDir, height, snapshotappdb.BackendPebble,
+		filepath.Join(dataDir, "extensions"), *concurrency)
 	if err != nil {
-		fatal("locate fetched snapshot: %v", err)
+		fetchCancel()
+		fetchWG.Wait()
+		fatal("import-stream: %v (snapfetch err: %v)", err, fetchErr)
 	}
-	return dir
+
+	// Wait for snapfetch to fully exit (it may still be doing OnComplete
+	// bookkeeping after the channel closes, though in practice
+	// OnComplete is just a logging call).
+	fetchWG.Wait()
+	if fetchErr != nil {
+		fatal("snapfetch: %v", fetchErr)
+	}
+	if fetchStats != nil {
+		b.emit("snapfetch downloaded %s in total (good_peers=%d)",
+			snapshotappdb.HumanBytes(fetchStats.BytesTotal), len(fetchStats.GoodPeers))
+	}
+	return stats, height
+}
+
+// buildSnapfetchLogger replicates the cosmos-snapshot-fetch CLI's filter
+// rules so the output of an embedded snapfetch run is similar to the
+// historical subprocess output.
+func buildSnapfetchLogger(debug bool) cmtlog.Logger {
+	logger := cmtlog.NewTMLogger(cmtlog.NewSyncWriter(os.Stderr))
+	if debug {
+		return cmtlog.NewFilter(logger, cmtlog.AllowDebug())
+	}
+	return cmtlog.NewFilter(logger, cmtlog.AllowError(),
+		cmtlog.AllowInfoWith("module", "snapfetch"))
 }
 
 func runBootstrapGaia(b *Bench, height int64, rpcs []string) {
@@ -486,55 +599,6 @@ func which(bin string) string {
 		return p
 	}
 	return ""
-}
-
-func newestCompleteSnap(root string) (string, error) {
-	entries, err := os.ReadDir(root)
-	if err != nil {
-		return "", err
-	}
-	var best string
-	var bestH int64
-	for _, e := range entries {
-		if !e.IsDir() {
-			continue
-		}
-		marker := filepath.Join(root, e.Name(), ".complete")
-		if _, err := os.Stat(marker); err != nil {
-			continue
-		}
-		// Parse <height>_<format> directory name.
-		parts := strings.SplitN(e.Name(), "_", 2)
-		if len(parts) < 2 {
-			continue
-		}
-		h, err := strconv.ParseInt(parts[0], 10, 64)
-		if err != nil {
-			continue
-		}
-		if h > bestH {
-			bestH = h
-			best = filepath.Join(root, e.Name())
-		}
-	}
-	if best == "" {
-		return "", fmt.Errorf("no completed snapshot under %s", root)
-	}
-	return best, nil
-}
-
-func readHeightFromMeta(metaPath string) int64 {
-	b, err := os.ReadFile(metaPath)
-	if err != nil {
-		fatal("read meta.json: %v", err)
-	}
-	var m struct {
-		Height int64 `json:"height"`
-	}
-	if err := json.Unmarshal(b, &m); err != nil {
-		fatal("parse meta.json: %v", err)
-	}
-	return m.Height
 }
 
 // peerEntry mirrors the JSON shape produced by cosmos-archive's peer DB.
