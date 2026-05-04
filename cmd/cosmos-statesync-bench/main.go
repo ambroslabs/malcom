@@ -329,6 +329,18 @@ func (b *Bench) parseLine(line string, seenDisc map[int64]bool, rejected *int) {
 					b.emit("queued chunk %d/%d (handed to restorer goroutine)", c, t)
 				}
 			}
+		case strings.Contains(line, "Restored snapshot chunk"):
+			// Emitted by our forked cosmossdk.io/store: fires when the
+			// StreamReader's ChunkReader closes a chunk's
+			// io.ReadCloser, i.e. the chunk's compressed bytes have
+			// been fully fed into zlib → protobuf → IAVL writer. This
+			// is the closest signal we have to "chunk N has actually
+			// been restored" without instrumenting the IAVL writer.
+			c := extractInt(chunkRE, line)
+			t := extractInt(totalRE, line)
+			if c == 0 || c%25 == 0 || c >= t-3 {
+				b.emit("restored chunk %d/%d (drained from chunk channel)", c, t)
+			}
 		case strings.Contains(line, "Verified ABCI app"):
 			// Fires after the LAST RestoreChunk returned + appHash
 			// matched the trusted hash from the light client. This
@@ -873,10 +885,13 @@ func main() {
 
 	bench.emit("polling http://127.0.0.1:%d/status every %s until caught up", *rpcPort, *pollInterval)
 
+	// Two goroutines: log watcher + RPC poller. The dedicated
+	// heartbeat goroutine was removed in favour of the RPC poll's
+	// every-60s "peers: N connected" line, which already serves as
+	// a steady "I'm alive" cadence without the quiet-noise.
 	var wg sync.WaitGroup
-	wg.Add(3)
+	wg.Add(2)
 	go func() { defer wg.Done(); bench.watchLog(ctx) }()
-	go func() { defer wg.Done(); bench.runHeartbeat(ctx) }()
 	go func() { defer wg.Done(); bench.pollRPC(ctx, *rpcPort); cancel() }()
 
 	// Forward signals → graceful shutdown of bench (gaiad keeps running).
