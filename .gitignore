@@ -9,9 +9,14 @@
 /cosmos-snapshot-apply
 /cosmos-snapshot-to-appdb
 /cosmos-statesync-probe
+/cosmos-bootstrap-gaia
 /pebble-compact
 /bin/
+/build/
 *.exe
+
+# nohup default stdout sink when a launch script forgets to redirect
+/nohup.out
 
 # Local convenience symlinks to log dirs on the data mount
 /download-current.out
