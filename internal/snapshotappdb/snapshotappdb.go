@@ -32,6 +32,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -312,10 +313,24 @@ func firstWorkerError(workers []*storeWorker) error {
 }
 
 // storeWorker owns one store's iavl.Importer + fast-storage batch and
-// drains items off its channel. Workers are independent: each writes
-// only under its own "s/k:<name>/" prefix in the shared rootDB, with
-// its own iavl.Importer state. Pebble tolerates concurrent writers via
-// internal locking, so multiple workers can commit in parallel.
+// runs a 3-stage internal pipeline:
+//
+//	reader → items   → iavlLoop      → leaves → fastWriteLoop → flushQ → flushLoop
+//	                  (iavl.Add)              (writeFastNode +              (pebble
+//	                                           batch.Set)                    Commit)
+//
+// Splitting the work across goroutines lets iavl.Add (heavy: hashing
+// + node serialization + batch.Set on nodedb) overlap with
+// writeFastNode (varint encoding + batch.Set on fast batch), and the
+// occasional 16 MiB pebble flush no longer stalls the Add path. On a
+// single-flow store like bank or wasm — where the snapshot stream
+// gives no opportunity for inter-store overlap — this is the main
+// place actual intra-store CPU concurrency comes from.
+//
+// Workers across stores are independent: each writes only under its
+// own "s/k:<name>/" prefix in the shared rootDB. Pebble tolerates
+// concurrent writers via internal locking, so multiple workers (and
+// multiple flushLoops) can commit in parallel.
 type storeWorker struct {
 	name        string
 	height      int64
@@ -325,14 +340,22 @@ type storeWorker struct {
 	importStart time.Time
 	totalItems  *uint64 // shared across workers, atomic
 
-	items chan *iavl.ExportNode
-	done  chan struct{}
-	err   error
+	items  chan *iavl.ExportNode  // reader → iavlLoop
+	leaves chan *iavl.ExportNode  // iavlLoop → fastWriteLoop (leaves only)
+	flushQ chan corestore.Batch   // fastWriteLoop → flushLoop
+
+	done    chan struct{}
+	err     error
+	errOnce sync.Once
 
 	itemsAdded uint64 // atomic
 }
 
-const storeWorkerQueueSize = 1024
+const (
+	storeWorkerQueueSize = 1024 // reader → iavlLoop
+	leafQueueSize        = 1024 // iavlLoop → fastWriteLoop
+	flushQueueSize       = 4    // fastWriteLoop → flushLoop (16 MiB batches)
+)
 
 func newStoreWorker(rootDB rootStore, name string, height int64, importStart time.Time, totalItems *uint64) (*storeWorker, error) {
 	pref := idb.NewPrefixDB(rootDB, storePrefix(name))
@@ -350,53 +373,82 @@ func newStoreWorker(rootDB rootStore, name string, height int64, importStart tim
 		importStart: importStart,
 		totalItems:  totalItems,
 		items:       make(chan *iavl.ExportNode, storeWorkerQueueSize),
+		leaves:      make(chan *iavl.ExportNode, leafQueueSize),
+		flushQ:      make(chan corestore.Batch, flushQueueSize),
 		done:        make(chan struct{}),
 	}, nil
 }
 
-// run drains items from w.items, then commits the store. Errors set
-// w.err and exit early; the caller cancels the parent context after
-// observing w.err.
+// setErr records the first error from any of the worker's goroutines.
+// Subsequent errors are dropped — the first failure is the most
+// informative cause.
+func (w *storeWorker) setErr(err error) {
+	w.errOnce.Do(func() { w.err = err })
+}
+
+// run starts the 3-stage pipeline and waits for all stages to drain.
+// Stages exit in order: items closed → iavlLoop drains → leaves closed
+// → fastWriteLoop drains → flushQ closed → flushLoop drains. Any stage
+// that errors records via setErr and stops doing work; downstream
+// stages still drain so they exit cleanly (avoids deadlocks on channel
+// sends from upstream stages).
 func (w *storeWorker) run() {
 	defer close(w.done)
-	const fastBatchFlushBytes = 16 << 20 // 16 MiB
-	const reportInterval = 5 * time.Second
-	fbatch := w.pref.NewBatch()
+	var wg sync.WaitGroup
+	wg.Add(2)
+	go func() { defer wg.Done(); w.fastWriteLoop() }()
+	go func() { defer wg.Done(); w.flushLoop() }()
 
-	flushFast := func() error {
-		if err := fbatch.Write(); err != nil {
-			return fmt.Errorf("flush fast batch %q: %w", w.name, err)
-		}
-		if err := fbatch.Close(); err != nil {
-			return fmt.Errorf("close fast batch %q: %w", w.name, err)
-		}
-		fbatch = w.pref.NewBatch()
-		return nil
+	// iavlLoop runs in this goroutine so its Commit + Close happen
+	// before we report the commit-time line.
+	w.iavlLoop()
+
+	commitStart := time.Now()
+	// imp.Commit finalises the IAVL nodedb writes (under the same
+	// "s/k:<name>/" prefix as the fast-storage entries, but at
+	// distinct sub-keys). Safe to run concurrently with the still-
+	// draining fastWriteLoop / flushLoop.
+	if err := w.imp.Commit(); err != nil {
+		w.setErr(fmt.Errorf("commit store %q: %w", w.name, err))
+	} else {
+		w.imp.Close()
 	}
+	w.tree.Close()
 
+	// Wait for fastWriteLoop + flushLoop to finish — they handle the
+	// final fast batch including the storage_version metadata key.
+	wg.Wait()
+
+	if w.err == nil {
+		fmt.Printf("[appdb] commit store=%-22s in %s (hash deferred, fast-storage written)\n",
+			w.name, time.Since(commitStart).Truncate(time.Millisecond))
+	}
+}
+
+// iavlLoop drains items from w.items, calls iavl.Importer.Add, and
+// forwards leaves (Height==0) to fastWriteLoop. Inner nodes don't go
+// to fast-storage — fast-storage is the flat-map of leaf_key →
+// leaf_value. Closes w.leaves on exit so fastWriteLoop drains and
+// terminates.
+func (w *storeWorker) iavlLoop() {
+	defer close(w.leaves)
+	const reportInterval = 5 * time.Second
 	var (
 		lastReport        = time.Now()
 		lastItemsAtReport uint64
 	)
 	for node := range w.items {
-		if err := w.imp.Add(node); err != nil {
-			w.err = fmt.Errorf("import node into %q: %w", w.name, err)
-			return
+		if w.err != nil {
+			// A downstream stage errored. Drain remaining items so
+			// the reader doesn't deadlock on send, but don't do work.
+			continue
 		}
-		// Path A: write fast-storage entry for leaves only. Inner
-		// nodes (Height>0) aren't in fast-storage — fast-storage is
-		// the flat-map of (leaf_key → leaf_value).
+		if err := w.imp.Add(node); err != nil {
+			w.setErr(fmt.Errorf("import node into %q: %w", w.name, err))
+			continue
+		}
 		if node.Height == 0 {
-			if err := writeFastNode(fbatch, node); err != nil {
-				w.err = fmt.Errorf("write fast-node into %q: %w", w.name, err)
-				return
-			}
-			if size, err := fbatch.GetByteSize(); err == nil && size > fastBatchFlushBytes {
-				if err := flushFast(); err != nil {
-					w.err = err
-					return
-				}
-			}
+			w.leaves <- node
 		}
 		nLocal := atomic.AddUint64(&w.itemsAdded, 1)
 		nTotal := atomic.AddUint64(w.totalItems, 1)
@@ -415,16 +467,30 @@ func (w *storeWorker) run() {
 			lastItemsAtReport = nLocal
 		}
 	}
+}
 
-	// Commit phase. iavl.Importer.Commit + the storage_version
-	// metadata key + final fast-batch flush. We deliberately don't
-	// resolve hash here — that's done in bulk after FinalCompact.
-	commitStart := time.Now()
-	if err := w.imp.Commit(); err != nil {
-		w.err = fmt.Errorf("commit store %q: %w", w.name, err)
-		return
+// fastWriteLoop drains leaves, encodes each into the current fast-
+// storage batch, and on the 16 MiB threshold hands the full batch to
+// flushLoop. After w.leaves closes, sets the storage_version metadata
+// key on the final batch and sends it. Closes w.flushQ on exit so
+// flushLoop drains and terminates.
+func (w *storeWorker) fastWriteLoop() {
+	defer close(w.flushQ)
+	const fastBatchFlushBytes = 16 << 20 // 16 MiB
+	fbatch := w.pref.NewBatch()
+	for node := range w.leaves {
+		if w.err != nil {
+			continue
+		}
+		if err := writeFastNode(fbatch, node); err != nil {
+			w.setErr(fmt.Errorf("write fast-node into %q: %w", w.name, err))
+			continue
+		}
+		if size, err := fbatch.GetByteSize(); err == nil && size > fastBatchFlushBytes {
+			w.flushQ <- fbatch
+			fbatch = w.pref.NewBatch()
+		}
 	}
-	w.imp.Close()
 	// Mark fast-storage as built for this store: 'm'+"storage_version"
 	// = "1.1.0-<height>". iavl's shouldForceFastStorageUpgrade compares
 	// versions[1] against the latest version on the tree (== height
@@ -432,23 +498,34 @@ func (w *storeWorker) run() {
 	// hasUpgradedToFastStorage which returns true for versions
 	// >= "1.1.0". With this metadata in place, gaiad's LoadVersion
 	// sees fast-storage as already-built and skips the upgrade.
-	metaKey := append([]byte{'m'}, []byte("storage_version")...)
-	metaVal := []byte(fmt.Sprintf("1.1.0-%d", w.height))
-	if err := fbatch.Set(metaKey, metaVal); err != nil {
-		w.err = fmt.Errorf("set metadata for store %q: %w", w.name, err)
-		return
+	if w.err == nil {
+		metaKey := append([]byte{'m'}, []byte("storage_version")...)
+		metaVal := []byte(fmt.Sprintf("1.1.0-%d", w.height))
+		if err := fbatch.Set(metaKey, metaVal); err != nil {
+			w.setErr(fmt.Errorf("set metadata for store %q: %w", w.name, err))
+		}
 	}
-	if err := fbatch.Write(); err != nil {
-		w.err = fmt.Errorf("flush fast batch %q: %w", w.name, err)
-		return
+	w.flushQ <- fbatch
+}
+
+// flushLoop drains full batches from w.flushQ and commits each to
+// pebble. Batches arrive in produce order; pebble.Batch.Commit is
+// thread-safe across DBs but our own writes within one store are
+// serialised through this single goroutine, so a downstream reader of
+// fast-storage sees a consistent view.
+func (w *storeWorker) flushLoop() {
+	for batch := range w.flushQ {
+		if w.err != nil {
+			_ = batch.Close()
+			continue
+		}
+		if err := batch.Write(); err != nil {
+			w.setErr(fmt.Errorf("flush fast batch %q: %w", w.name, err))
+		}
+		if err := batch.Close(); err != nil && w.err == nil {
+			w.setErr(fmt.Errorf("close fast batch %q: %w", w.name, err))
+		}
 	}
-	if err := fbatch.Close(); err != nil {
-		w.err = fmt.Errorf("close fast batch %q: %w", w.name, err)
-		return
-	}
-	w.tree.Close()
-	fmt.Printf("[appdb] commit store=%-22s in %s (hash deferred, fast-storage written)\n",
-		w.name, time.Since(commitStart).Truncate(time.Millisecond))
 }
 
 // writeFastNode appends an iavl fast-storage entry for a leaf to batch.
