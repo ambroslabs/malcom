@@ -88,7 +88,6 @@ func main() {
 	if err != nil {
 		log.Fatalf("import: %v", err)
 	}
-	elapsed := time.Since(t0).Truncate(time.Millisecond)
 
 	// Move the staging dir to its final name. The goleveldb backend
 	// produces <staging>/application.db (since we passed name="application").
@@ -102,17 +101,6 @@ func main() {
 		_ = os.Remove(filepath.Join(*out, "appdb-staging"))
 	}
 
-	fmt.Printf("[appdb] complete in %s\n\n", elapsed)
-	fmt.Printf("  stores written:     %d\n", stats.Stores)
-	fmt.Printf("  IAVL nodes imported:%d\n", stats.Items)
-	fmt.Printf("  extensions:         %d\n", stats.Extensions)
-	fmt.Printf("  ext payloads:       %d\n", stats.ExtensionPayloads)
-	fmt.Printf("  raw bytes:          %s\n", snapshotappdb.HumanBytes(stats.BytesUncompressed))
-
-	if fi, err := dirSize(finalDB); err == nil {
-		fmt.Printf("  application.db:     %s  (%s)\n", finalDB, snapshotappdb.HumanBytes(uint64(fi)))
-	}
-
 	// Pebble's in-process Compact during Import queues obsolete L0
 	// files for deletion via the cleanup manager, but those deletions
 	// don't always drain before our Close. The result is ~8-10 GB of
@@ -121,15 +109,23 @@ func main() {
 	// reclaiming the slack. Skip for goleveldb (the slack issue is
 	// pebble-specific).
 	if snapshotappdb.Backend(*backendStr) == snapshotappdb.BackendPebble {
-		fmt.Printf("\n[appdb] cleanup compaction pass...\n")
+		fmt.Printf("[appdb] cleanup compaction pass...\n")
 		t := time.Now()
 		if err := snapshotappdb.PebbleCleanupCompact(finalDB); err != nil {
 			log.Fatalf("cleanup compact: %v", err)
 		}
 		fmt.Printf("[appdb] cleanup pass done in %s\n", time.Since(t).Truncate(time.Second))
-		if fi, err := dirSize(finalDB); err == nil {
-			fmt.Printf("  application.db (post-cleanup): %s  (%s)\n", finalDB, snapshotappdb.HumanBytes(uint64(fi)))
-		}
+	}
+
+	elapsed := time.Since(t0).Truncate(time.Millisecond)
+	fmt.Printf("[appdb] complete in %s\n\n", elapsed)
+	fmt.Printf("  stores written:     %d\n", stats.Stores)
+	fmt.Printf("  IAVL nodes imported:%d\n", stats.Items)
+	fmt.Printf("  extensions:         %d\n", stats.Extensions)
+	fmt.Printf("  ext payloads:       %d\n", stats.ExtensionPayloads)
+	fmt.Printf("  raw bytes:          %s\n", snapshotappdb.HumanBytes(stats.BytesUncompressed))
+	if fi, err := dirSize(finalDB); err == nil {
+		fmt.Printf("  application.db:     %s  (%s)\n", finalDB, snapshotappdb.HumanBytes(uint64(fi)))
 	}
 }
 
