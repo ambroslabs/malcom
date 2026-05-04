@@ -447,12 +447,17 @@ func (b *Bench) pollRPC(ctx context.Context, port int) {
 // ─── heartbeat ────────────────────────────────────────────────────────
 
 func (b *Bench) runHeartbeat(ctx context.Context) {
-	triggers := []int{5, 15, 30, 60, 120, 300}
+	// Quiet schedule: 30s, 1m, 2m, 5m, then +5m forever.
+	// Earlier-too-chatty thresholds (5s, 15s) were dropped per user
+	// preference once we learned how often "real" gaiad events
+	// land naturally.
+	triggers := []int{30, 60, 120, 300}
 	nextTrigger := func(i int) int {
 		if i < len(triggers) {
 			return triggers[i]
 		}
-		return 300 * (i - 4)
+		// i=4 → 600, i=5 → 900, i=6 → 1200, ...
+		return 300 * (i - 2)
 	}
 
 	i := 0
