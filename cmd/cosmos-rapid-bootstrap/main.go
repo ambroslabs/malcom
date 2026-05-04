@@ -64,11 +64,13 @@ var (
 	freshFlag    = flag.Bool("fresh", false, "wipe -home before starting")
 	pollInterval = flag.Duration("poll-interval", 15*time.Second, "RPC poll interval")
 	bootstrapBin = flag.String("bootstrap-bin", "", "path to cosmos-bootstrap-gaia binary (default: look on PATH)")
-	concurrency  = flag.Int("import-concurrency", 0, "snapshotappdb.Import concurrency (0 = auto min(NumCPU,8))")
+	concurrency  = flag.Int("import-concurrency", 0, "snapshotappdb.Import concurrency (0 = auto from pebble profile / NumCPU)")
 	_            = flag.Int64("trust-offset", 1000, "(deprecated; bootstrap-gaia handles trust-offset internally)")
 	nodeKeyPath  = flag.String("snapfetch-node-key", "", "path to snapfetch p2p node key (default: <home>/snapfetch_node_key.json)")
 	preferFresh  = flag.Bool("prefer-fresh", true, "snapfetch: rank candidates by newest height first")
 	debugFetch   = flag.Bool("snapfetch-debug", false, "snapfetch: verbose logging")
+	pebbleProfile = flag.String("pebble-profile", "auto", "pebble bulk-load profile: auto|high|mid|low|tiny (auto detects host RAM)")
+	memLimitPct   = flag.Float64("mem-limit-pct", 0.75, "set GOMEMLIMIT to this fraction of host MemAvailable (0 disables; honours existing GOMEMLIMIT env var if set)")
 
 	// Back-compat stub: previously the path to cosmos-snapshot-fetch
 	// subprocess. Now snapfetch is in-process; this flag is accepted but
@@ -138,6 +140,28 @@ func main() {
 
 	bench := &Bench{start: time.Now()}
 	bench.emit("[rapid-bootstrap] home=%s gaiad=%s chain=%s", *homeDir, *gaiadPath, *chainID)
+
+	// Apply GOMEMLIMIT first so all subsequent allocations honour it.
+	// 75% of MemAvailable by default; respects GOMEMLIMIT env if set.
+	snapshotappdb.ApplyMemoryLimit(*memLimitPct)
+
+	// Pebble profile selection: auto-detect from host RAM unless the
+	// caller pinned a specific profile.
+	switch *pebbleProfile {
+	case "auto", "":
+		bench.emit("pebble-profile=auto (will be set from detected RAM at first openPebbleDB)")
+	case "high":
+		snapshotappdb.SetPebbleProfile(snapshotappdb.AutoProfile(64 * 1024))
+	case "mid":
+		snapshotappdb.SetPebbleProfile(snapshotappdb.AutoProfile(32 * 1024))
+	case "low":
+		snapshotappdb.SetPebbleProfile(snapshotappdb.AutoProfile(16 * 1024))
+	case "tiny":
+		snapshotappdb.SetPebbleProfile(snapshotappdb.AutoProfile(8 * 1024))
+	default:
+		fmt.Fprintf(os.Stderr, "unknown -pebble-profile %q; valid: auto|high|mid|low|tiny\n", *pebbleProfile)
+		os.Exit(2)
+	}
 
 	// 0. Optional fresh wipe.
 	if *freshFlag {

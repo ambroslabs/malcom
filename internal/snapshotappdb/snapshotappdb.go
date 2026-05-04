@@ -80,9 +80,14 @@ func Import(snapshotDir, outDir string, height int64, backend Backend, extDir st
 	var stats Stats
 
 	if concurrency <= 0 {
-		concurrency = runtime.NumCPU()
-		if concurrency > 8 {
-			concurrency = 8
+		// Low-RAM profiles pin Concurrency=1; otherwise auto.
+		if p := CurrentPebbleProfile(); p.Concurrency > 0 {
+			concurrency = p.Concurrency
+		} else {
+			concurrency = runtime.NumCPU()
+			if concurrency > 8 {
+				concurrency = 8
+			}
 		}
 	}
 
@@ -229,7 +234,7 @@ func (w *storeWorker) run() {
 	wg.Wait()
 
 	if w.err == nil {
-		fmt.Printf("[appdb] commit store=%-22s in %s (hash deferred, fast-storage written)\n",
+		fmt.Printf("[appdb] commit %s in %s (hash deferred, fast-storage written)\n",
 			w.name, time.Since(commitStart).Truncate(time.Millisecond))
 	}
 }
@@ -241,7 +246,7 @@ func (w *storeWorker) run() {
 // terminates.
 func (w *storeWorker) iavlLoop() {
 	defer close(w.leaves)
-	const reportInterval = 5 * time.Second
+	const reportInterval = 30 * time.Second
 	var (
 		lastReport        = time.Now()
 		lastItemsAtReport uint64
@@ -264,14 +269,14 @@ func (w *storeWorker) iavlLoop() {
 
 		if time.Since(lastReport) >= reportInterval {
 			now := time.Now()
-			elapsed := now.Sub(w.importStart).Truncate(time.Second)
 			window := now.Sub(lastReport).Seconds()
 			if window < 0.1 {
 				window = 0.1
 			}
 			rate := float64(nLocal-lastItemsAtReport) / window
-			fmt.Printf("[appdb] %s store=%-22s store_items=%-12d total=%-12d %.0f items/s\n",
-				elapsed, w.name, nLocal, nTotal, rate)
+			fmt.Printf("[appdb] %s: %s items=%s total=%s rate=%.0f/s\n",
+				formatElapsed(now.Sub(w.importStart)),
+				w.name, formatCount(nLocal), formatCount(nTotal), rate)
 			lastReport = now
 			lastItemsAtReport = nLocal
 		}
@@ -323,17 +328,114 @@ func (w *storeWorker) fastWriteLoop() {
 // serialised through this single goroutine, so a downstream reader of
 // fast-storage sees a consistent view.
 func (w *storeWorker) flushLoop() {
+	var (
+		batchCount int
+		totalDur   time.Duration
+		maxDur     time.Duration
+		lastReport = time.Now()
+	)
+	const reportInterval = 30 * time.Second
 	for batch := range w.flushQ {
 		if w.err != nil {
 			_ = batch.Close()
 			continue
 		}
+		t0 := time.Now()
 		if err := batch.Write(); err != nil {
 			w.setErr(fmt.Errorf("flush fast batch %q: %w", w.name, err))
+		}
+		d := time.Since(t0)
+		batchCount++
+		totalDur += d
+		if d > maxDur {
+			maxDur = d
 		}
 		if err := batch.Close(); err != nil && w.err == nil {
 			w.setErr(fmt.Errorf("close fast batch %q: %w", w.name, err))
 		}
+		if time.Since(lastReport) >= reportInterval {
+			fmt.Printf("[appdb] %s: pebble flushes=%d avg=%s max=%s\n",
+				w.name, batchCount,
+				(totalDur / time.Duration(max1(batchCount))).Truncate(time.Millisecond),
+				maxDur.Truncate(time.Millisecond))
+			batchCount = 0
+			totalDur = 0
+			maxDur = 0
+			lastReport = time.Now()
+		}
+	}
+	if batchCount > 0 {
+		fmt.Printf("[appdb] %s: pebble flushes=%d avg=%s max=%s (final)\n",
+			w.name, batchCount,
+			(totalDur / time.Duration(max1(batchCount))).Truncate(time.Millisecond),
+			maxDur.Truncate(time.Millisecond))
+	}
+}
+
+func max1(n int) int {
+	if n < 1 {
+		return 1
+	}
+	return n
+}
+
+// runMemoryReporter periodically logs Go heap stats and (if rootDB is
+// pebble-backed) pebble's memtable + cache + L0 file count. Lets us
+// see during a stuck run whether RAM is going into iavl import
+// frontier (Go heap), pebble memtable backlog, or pebble block cache.
+func runMemoryReporter(ctx context.Context, rootDB rootStore) {
+	t := time.NewTicker(30 * time.Second)
+	defer t.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-t.C:
+		}
+		var ms runtime.MemStats
+		runtime.ReadMemStats(&ms)
+		heap := ms.HeapAlloc
+		sys := ms.Sys
+		stk := ms.StackInuse
+		// pebble metrics if available
+		var pebbleStr string
+		if pdb, ok := rootDB.(*pebbleDB); ok && pdb != nil && pdb.db != nil {
+			m := pdb.db.Metrics()
+			memSize := m.MemTable.Size
+			memCount := m.MemTable.Count
+			cacheSize := m.BlockCache.Size
+			l0 := m.Levels[0]
+			pebbleStr = fmt.Sprintf(" pebble=memtable:%dMiB×%d cache:%dMiB L0:%d files",
+				memSize>>20, memCount, cacheSize>>20, l0.NumFiles)
+		}
+		fmt.Printf("[mem] go=heap:%dMiB sys:%dMiB stack:%dMiB GCs=%d%s\n",
+			heap>>20, sys>>20, stk>>20, ms.NumGC, pebbleStr)
+	}
+}
+
+// formatElapsed renders a duration as a compact "Hh Mm Ss" / "Mm Ss" / "Ss" string.
+func formatElapsed(d time.Duration) string {
+	s := int(d.Seconds())
+	if s < 60 {
+		return fmt.Sprintf("%ds", s)
+	}
+	if s < 3600 {
+		return fmt.Sprintf("%dm%02ds", s/60, s%60)
+	}
+	return fmt.Sprintf("%dh%02dm%02ds", s/3600, (s%3600)/60, s%60)
+}
+
+// formatCount renders an integer with K/M/B suffix.
+func formatCount(n uint64) string {
+	switch {
+	case n < 10_000:
+		return fmt.Sprintf("%d", n)
+	case n < 10_000_000:
+		return fmt.Sprintf("%.1fK", float64(n)/1e3)
+	case n < 10_000_000_000:
+		return fmt.Sprintf("%.1fM", float64(n)/1e6)
+	default:
+		return fmt.Sprintf("%.2fB", float64(n)/1e9)
 	}
 }
 

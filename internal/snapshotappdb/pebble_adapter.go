@@ -4,12 +4,224 @@ import (
 	"errors"
 	"fmt"
 	"math"
+	"os"
+	"runtime"
+	"runtime/debug"
 	"strings"
+	"sync"
 	"time"
 
 	corestore "cosmossdk.io/core/store"
 	"github.com/cockroachdb/pebble"
 )
+
+// PebbleProfile bundles the bulk-load knobs that scale with available
+// host RAM. The defaults in this package target a 64 GiB+ host; lower
+// memory machines need this dialed down to avoid OOM or — worse — GC
+// thrash where the heap stays pinned at 99% and throughput collapses
+// from ~1M items/s to ~10/s.
+//
+// Set via SetPebbleProfile or pass auto-detected via AutoProfile.
+type PebbleProfile struct {
+	Name string // for logging
+
+	// MemTableSize is the size of each in-memory write buffer. Pebble
+	// caps this below 4 GiB; we cap at 2 GiB defensively.
+	MemTableSize uint64
+
+	// MemTableStopWrites is the in-flight memtable count after which
+	// pebble blocks new writes. Combined with MemTableSize this
+	// determines the max RAM held in memtables.
+	MemTableStopWrites int
+
+	// Cache is the pebble block cache size in bytes.
+	Cache int64
+
+	// MaxOpenFiles caps SST + WAL file descriptors held open.
+	MaxOpenFiles int
+
+	// MaxConcurrentCompactions limits parallel compactions (also gates
+	// memtable flushes — keep >= 2).
+	MaxConcurrentCompactions int
+
+	// DisableAutomaticCompactions: when true, no L0+ compactions during
+	// import — everything goes to L0 and we rely on a single big
+	// FinalCompact at the end. Maximum throughput at the cost of peak
+	// memory + disk amplification. Always false on memory-constrained
+	// profiles.
+	DisableAutomaticCompactions bool
+
+	// L0CompactionThreshold / L0StopWritesThreshold tune backpressure
+	// when DisableAutomaticCompactions=false. With AutomaticCompactions
+	// on, we want generous L0 thresholds to avoid stalling the stream.
+	L0CompactionThreshold int
+	L0StopWritesThreshold int
+
+	// Concurrency is the snapshotappdb store-worker concurrency. 1 =
+	// serial per-store (lowest peak iavl frontier RAM); >1 lets
+	// multiple stores import in parallel. 0 = auto via runtime.NumCPU()
+	// capped at 8.
+	Concurrency int
+}
+
+var (
+	profileMu      sync.RWMutex
+	activeProfile  *PebbleProfile
+)
+
+// AutoProfile returns a PebbleProfile sized for `availableMB` of host
+// RAM. The aim is to cap pebble's structurally-pinned memory (memtable
+// queue + cache) at ~30% of RAM, leaving headroom for iavl's mid-store
+// frontier (5–10 GiB peak for cosmoshub bank), Go runtime overhead, OS
+// page cache, and the streaming reorder buffer.
+//
+// Profile names match -pebble-profile flag values:
+//
+//	high  : 64 GiB+ — DisableAutomaticCompactions, max throughput
+//	mid   : 24-64 GiB
+//	low   : 12-24 GiB — automatic compactions on, concurrency=1
+//	tiny  : 6-12 GiB — smallest profile that still finishes
+//	(below 6 GiB this workload doesn't fit; consider snapshot-restore
+//	 or smaller-state chains.)
+func AutoProfile(availableMB int64) PebbleProfile {
+	switch {
+	case availableMB >= 56*1024:
+		return PebbleProfile{
+			Name:                        "high",
+			MemTableSize:                1 << 30, // 1 GiB
+			MemTableStopWrites:          8,
+			Cache:                       2 << 30, // 2 GiB
+			MaxOpenFiles:                4096,
+			MaxConcurrentCompactions:    4,
+			DisableAutomaticCompactions: true,
+			L0CompactionThreshold:       math.MaxInt32,
+			L0StopWritesThreshold:       math.MaxInt32,
+			Concurrency:                 0, // auto
+		}
+	case availableMB >= 24*1024:
+		return PebbleProfile{
+			Name:                        "mid",
+			MemTableSize:                512 << 20, // 512 MiB
+			MemTableStopWrites:          4,
+			Cache:                       1 << 30, // 1 GiB
+			MaxOpenFiles:                4096,
+			MaxConcurrentCompactions:    4,
+			DisableAutomaticCompactions: true,
+			L0CompactionThreshold:       math.MaxInt32,
+			L0StopWritesThreshold:       math.MaxInt32,
+			Concurrency:                 0,
+		}
+	case availableMB >= 12*1024:
+		return PebbleProfile{
+			Name:                        "low",
+			MemTableSize:                256 << 20, // 256 MiB
+			MemTableStopWrites:          2,
+			Cache:                       256 << 20, // 256 MiB
+			MaxOpenFiles:                2048,
+			MaxConcurrentCompactions:    2,
+			DisableAutomaticCompactions: false, // let pebble flush L0 during import
+			L0CompactionThreshold:       8,
+			L0StopWritesThreshold:       24,
+			Concurrency:                 1, // sequential per-store: iavl frontier doesn't stack
+		}
+	default:
+		return PebbleProfile{
+			Name:                        "tiny",
+			MemTableSize:                128 << 20, // 128 MiB
+			MemTableStopWrites:          2,
+			Cache:                       128 << 20, // 128 MiB
+			MaxOpenFiles:                1024,
+			MaxConcurrentCompactions:    2,
+			DisableAutomaticCompactions: false,
+			L0CompactionThreshold:       4,
+			L0StopWritesThreshold:       16,
+			Concurrency:                 1,
+		}
+	}
+}
+
+// ApplyMemoryLimit calls debug.SetMemoryLimit with a fraction of host
+// RAM, telling Go's GC pacer to GC harder as the heap approaches that
+// budget. This is a SOFT limit — Go can exceed it briefly under
+// burst allocation, but it dramatically reduces the chance of OOM
+// when paired with a sensible PebbleProfile and bounded reorder
+// buffer.
+//
+// Defaults are tuned for the snapshot-import workload: 75% of host
+// MemAvailable. The remaining 25% covers OS page cache for the
+// pebble SST mmap'd files, the kernel itself, and any concurrent
+// processes (e.g. gaiad after import completes).
+//
+// Honours the GOMEMLIMIT env var if already set (Go runtime parses it
+// before main() runs); only overrides when GOMEMLIMIT is unset, which
+// is the common case for our binaries.
+//
+// pct should be in (0, 1]. 0 or negative disables (returns the
+// previous limit unchanged).
+func ApplyMemoryLimit(pct float64) (limitBytes int64) {
+	if pct <= 0 || pct > 1 {
+		return debug.SetMemoryLimit(-1) // -1 returns current without changing
+	}
+	if os.Getenv("GOMEMLIMIT") != "" {
+		// Respect operator's explicit override.
+		return debug.SetMemoryLimit(-1)
+	}
+	mb := detectAvailableMB()
+	if mb == 0 {
+		return debug.SetMemoryLimit(-1)
+	}
+	bytes := int64(float64(mb*1024*1024) * pct)
+	debug.SetMemoryLimit(bytes)
+	fmt.Printf("[appdb] GOMEMLIMIT auto-set to %dMiB (%.0f%% of %dMiB available)\n",
+		bytes/(1<<20), pct*100, mb)
+	return bytes
+}
+
+// SetPebbleProfile overrides the auto-detected profile. Callers that
+// know the host's RAM budget should invoke this before Import /
+// ImportStream. The profile applies to subsequent openPebbleDB calls.
+func SetPebbleProfile(p PebbleProfile) {
+	profileMu.Lock()
+	activeProfile = &p
+	profileMu.Unlock()
+}
+
+// CurrentPebbleProfile returns the active profile, lazily initialising
+// it via AutoProfile() if SetPebbleProfile has not been called.
+func CurrentPebbleProfile() PebbleProfile {
+	profileMu.RLock()
+	if activeProfile != nil {
+		p := *activeProfile
+		profileMu.RUnlock()
+		return p
+	}
+	profileMu.RUnlock()
+
+	profileMu.Lock()
+	defer profileMu.Unlock()
+	if activeProfile == nil {
+		p := AutoProfile(detectAvailableMB())
+		activeProfile = &p
+	}
+	return *activeProfile
+}
+
+// detectAvailableMB returns OS-reported MemAvailable in MiB. Returns 0
+// on error so callers fall through to the safest profile.
+func detectAvailableMB() int64 {
+	// runtime.MemStats doesn't expose host memory; on Linux read
+	// /proc/meminfo MemAvailable. On other OSes, fall back to NumCPU
+	// heuristic (4 GiB per core, capped at 64 GiB). Reasonable in
+	// practice for both dev laptops and DO droplets.
+	if mb := readLinuxMemAvailableMB(); mb > 0 {
+		return mb
+	}
+	mb := int64(runtime.NumCPU()) * 4 * 1024
+	if mb > 64*1024 {
+		mb = 64 * 1024
+	}
+	return mb
+}
 
 // pebbleDB wraps *pebble.DB so it satisfies iavl/db.DB and
 // corestore.KVStoreWithBatch. Note: gaiad's "pebbledb" backend in
@@ -20,37 +232,68 @@ type pebbleDB struct {
 	db *pebble.DB
 }
 
-// openPebbleDB opens an application.db in bulk-load mode: automatic
-// compactions disabled, very high L0 thresholds (so writes never stall
-// on L0 file count), large memtable. The final compaction is run
-// explicitly in FinalCompact() after all writes are complete. This
-// matches the design in issue #3 — see that issue for context.
-func openPebbleDB(dir string) (*pebbleDB, error) {
-	opts := &pebble.Options{
-		// Disable L0+ compactions during bulk load — those are the
-		// expensive ones we want to defer to the end. Memtable
-		// flushes still run; pebble counts them as compactions for
-		// MaxConcurrentCompactions purposes, so we keep that >0.
-		DisableAutomaticCompactions: true,
-		L0CompactionThreshold:       math.MaxInt32,
-		L0StopWritesThreshold:       math.MaxInt32,
-
-		// MaxConcurrentCompactions gates memtable→L0 flushes too, not
-		// just L0+ compactions. Setting this to 0 blocks flushes and
-		// causes the importer to stall against the in-flight
-		// memtable cap. Give flushes plenty of budget.
-		MaxConcurrentCompactions: func() int { return 4 },
-
-		// Big memtable + many in-flight memtables so memtable flush
-		// never blocks the importer either.
-		MemTableSize:                1 << 30, // 1 GB
-		MemTableStopWritesThreshold: 8,
-
-		// Cache helps both the importer (for any reads it does
-		// internally) and the final compaction phase.
-		Cache:        pebble.NewCache(2 << 30), // 2 GB
-		MaxOpenFiles: 4096,
+// readLinuxMemAvailableMB parses /proc/meminfo's MemAvailable line.
+// Returns 0 if not on Linux or parse fails.
+func readLinuxMemAvailableMB() int64 {
+	b, err := osReadFile("/proc/meminfo")
+	if err != nil {
+		return 0
 	}
+	for _, line := range strings.Split(string(b), "\n") {
+		if !strings.HasPrefix(line, "MemAvailable:") {
+			continue
+		}
+		fields := strings.Fields(line)
+		if len(fields) < 2 {
+			return 0
+		}
+		var kb int64
+		_, _ = fmt.Sscanf(fields[1], "%d", &kb)
+		return kb / 1024
+	}
+	return 0
+}
+
+// indirection that tests can swap. Default reads via os.ReadFile.
+var osReadFile = os.ReadFile
+
+// openPebbleDB opens an application.db using the active PebbleProfile
+// (CurrentPebbleProfile, optionally set via SetPebbleProfile). The
+// profile fields determine memtable size, cache size, compaction
+// behaviour, and the snapshotappdb store-worker concurrency.
+func openPebbleDB(dir string) (*pebbleDB, error) {
+	p := CurrentPebbleProfile()
+	maxConcCompact := p.MaxConcurrentCompactions
+	if maxConcCompact < 1 {
+		maxConcCompact = 1
+	}
+
+	opts := &pebble.Options{
+		MemTableSize:                p.MemTableSize,
+		MemTableStopWritesThreshold: p.MemTableStopWrites,
+		Cache:                       pebble.NewCache(p.Cache),
+		MaxOpenFiles:                p.MaxOpenFiles,
+		MaxConcurrentCompactions:    func() int { return maxConcCompact },
+		DisableAutomaticCompactions: p.DisableAutomaticCompactions,
+		L0CompactionThreshold:       p.L0CompactionThreshold,
+		L0StopWritesThreshold:       p.L0StopWritesThreshold,
+	}
+	if p.L0CompactionThreshold == 0 {
+		opts.L0CompactionThreshold = math.MaxInt32
+	}
+	if p.L0StopWritesThreshold == 0 {
+		opts.L0StopWritesThreshold = math.MaxInt32
+	}
+
+	fmt.Printf("[appdb] pebble profile=%s memtable=%dMiB×%d cache=%dMiB max-conc-compact=%d auto-compact=%v concurrency=%d\n",
+		p.Name,
+		p.MemTableSize/(1<<20), p.MemTableStopWrites,
+		p.Cache/(1<<20),
+		maxConcCompact,
+		!p.DisableAutomaticCompactions,
+		p.Concurrency,
+	)
+
 	db, err := pebble.Open(dir, opts)
 	if err != nil {
 		return nil, err

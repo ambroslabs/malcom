@@ -57,9 +57,13 @@ func ImportStream(ctx context.Context, chunks <-chan ChunkBytes, totalChunks uin
 	var stats Stats
 
 	if concurrency <= 0 {
-		concurrency = runtime.NumCPU()
-		if concurrency > 8 {
-			concurrency = 8
+		if p := CurrentPebbleProfile(); p.Concurrency > 0 {
+			concurrency = p.Concurrency
+		} else {
+			concurrency = runtime.NumCPU()
+			if concurrency > 8 {
+				concurrency = 8
+			}
 		}
 	}
 
@@ -103,6 +107,11 @@ func runImportPipeline(ctx context.Context, rootDB rootStore, r *snapItemReader,
 	sem := make(chan struct{}, concurrency)
 	pipelineCtx, cancel := context.WithCancel(ctx)
 	defer cancel()
+
+	// Memory reporter: periodically log Go heap + pebble metrics so we
+	// can see WHICH subsystem is consuming RAM (iavl frontier vs pebble
+	// memtable backlog vs cache vs Go runtime slack).
+	go runMemoryReporter(pipelineCtx, rootDB)
 
 	var totalItems uint64
 
@@ -279,26 +288,25 @@ readLoop:
 // and serves bytes to its consumer (the zlib reader) in strict
 // chunk-index order.
 //
-// We don't bound the reorder buffer because:
-//  1. snapfetch caps in-flight chunks per peer at perPeer × peerCount,
-//     so the producer side has its own implicit bound;
-//  2. the importer naturally back-pressures: zlib.Read will block on
-//     Read once it consumes everything available, which causes the
-//     reorder buffer to drain naturally;
-//  3. for cosmos-hub the worst-case buffer is bounded by the number of
-//     good peers (typically 5–20) × perPeer (default 2) × ~10 MiB =
-//     ~200 MiB.
+// Bounded back-pressure: the reorder buffer holds at most maxAhead
+// chunks beyond the consumer's current read position. When snapfetch
+// tries to deliver a chunk past that horizon, pump blocks (which makes
+// snapfetch's `OnChunk → channel-send` block, which throttles snapfetch
+// at the per-peer-limit-of-2 inflight cap). This stops the failure mode
+// where the importer is downstream-bound by pebble compaction, the
+// frontier grows unboundedly behind the stalled writer, and the
+// reorder buffer keeps accepting more chunks until RAM pegs.
 //
 // Concurrency model: a single reader goroutine (the zlib decompressor's
-// caller) calls Read; a single producer (snapfetch) sends to the chunks
-// channel. The reader holds the lock during Read, including while
-// blocking on cond.Wait. The lock is released by sync.Cond.Wait, so the
-// channel-pump goroutine can acquire it to insert new chunks.
+// caller) calls Read; a single producer goroutine (pump) inserts into
+// the buffer. Both signal via cond on the same mutex. ctx cancellation
+// wakes any blocked party.
 type reorderReader struct {
-	ctx     context.Context
-	chunks  <-chan ChunkBytes
-	total   uint32
-	nextIdx uint32 // next chunk index the reader expects to consume
+	ctx      context.Context
+	chunks   <-chan ChunkBytes
+	total    uint32
+	maxAhead uint32 // max chunks the buffer can hold ahead of nextIdx
+	nextIdx  uint32 // next chunk index the reader expects to consume
 
 	mu     sync.Mutex
 	cond   *sync.Cond
@@ -307,18 +315,26 @@ type reorderReader struct {
 	curBuf []byte            // bytes pending consumption from buffer[nextIdx]
 }
 
+// defaultMaxAhead is the default "chunks ahead of consumer" cap.
+// 4 chunks × ~10 MiB = ~40 MiB peak buffer — small enough that on a
+// 16 GiB host the iavl frontier and pebble compaction get the lion's
+// share of RAM.
+const defaultMaxAhead uint32 = 4
+
 func newReorderReader(ctx context.Context, chunks <-chan ChunkBytes, total uint32) *reorderReader {
 	r := &reorderReader{
-		ctx:    ctx,
-		chunks: chunks,
-		total:  total,
-		buffer: make(map[uint32][]byte),
+		ctx:      ctx,
+		chunks:   chunks,
+		total:    total,
+		maxAhead: defaultMaxAhead,
+		buffer:   make(map[uint32][]byte),
 	}
 	r.cond = sync.NewCond(&r.mu)
 	go r.pump()
-	// Wake any blocked Read() if ctx is cancelled while we wait. Without
-	// this the reader can stall forever if the producer never closes
-	// the channel and never sends anything.
+	go r.reportLoop()
+	// Wake any blocked Read() / pump() if ctx is cancelled while we wait.
+	// Without this the reader can stall forever if the producer never
+	// closes the channel and never sends anything.
 	go func() {
 		<-ctx.Done()
 		r.mu.Lock()
@@ -328,9 +344,45 @@ func newReorderReader(ctx context.Context, chunks <-chan ChunkBytes, total uint3
 	return r
 }
 
+// reportLoop periodically logs reorder-buffer state so we can see when
+// the importer is producer-bound (buffer full) vs consumer-bound
+// (buffer empty). Exits when ctx cancels.
+func (r *reorderReader) reportLoop() {
+	t := time.NewTicker(15 * time.Second)
+	defer t.Stop()
+	var prevNext uint32
+	for {
+		select {
+		case <-r.ctx.Done():
+			return
+		case <-t.C:
+		}
+		r.mu.Lock()
+		next := r.nextIdx
+		bufN := len(r.buffer)
+		closed := r.closed
+		r.mu.Unlock()
+		state := "running"
+		if closed && bufN == 0 {
+			state = "closed-empty"
+		} else if closed {
+			state = "closed-draining"
+		}
+		fmt.Printf("[chunks] consumed=%d/%d buffered=%d (max-ahead=%d) state=%s delta=%d/15s\n",
+			next, r.total, bufN, r.maxAhead, state, next-prevNext)
+		prevNext = next
+		if closed && bufN == 0 {
+			return
+		}
+	}
+}
+
 // pump drains the chunks channel into the reorder buffer and broadcasts
-// to any reader blocked in Read. Exits when the channel closes (or ctx
-// cancels), then marks closed so Read can return io.EOF after draining.
+// to any reader blocked in Read. Blocks insertion if a chunk's index is
+// more than maxAhead beyond the reader's current nextIdx, which back-
+// pressures snapfetch when the importer falls behind. Exits when the
+// channel closes (or ctx cancels), then marks closed so Read can return
+// io.EOF after draining.
 func (r *reorderReader) pump() {
 	defer func() {
 		r.mu.Lock()
@@ -346,14 +398,30 @@ func (r *reorderReader) pump() {
 			if !ok {
 				return
 			}
+			// Wait until ch.Index is within the read horizon.
 			r.mu.Lock()
-			// Defensive copy: snapfetch's chunk buffer may be reused
-			// across requests in some configurations. We pay one extra
-			// copy here to be safe; for ~3 GB total this is ~3 GB of
-			// extra allocation across the lifetime of an import — fine.
+			for {
+				if r.ctx.Err() != nil {
+					r.mu.Unlock()
+					return
+				}
+				// Allow chunks at indices nextIdx .. nextIdx+maxAhead-1.
+				// A chunk arriving past that horizon means the consumer
+				// is slow; block and let the consumer drain first.
+				if ch.Index >= r.nextIdx && ch.Index < r.nextIdx+r.maxAhead {
+					break
+				}
+				if ch.Index < r.nextIdx {
+					// Late duplicate — drop silently.
+					r.mu.Unlock()
+					goto next
+				}
+				r.cond.Wait()
+			}
 			r.buffer[ch.Index] = append([]byte(nil), ch.Data...)
 			r.cond.Broadcast()
 			r.mu.Unlock()
+		next:
 		}
 	}
 }
@@ -376,6 +444,9 @@ func (r *reorderReader) Read(p []byte) (int, error) {
 			delete(r.buffer, r.nextIdx)
 			r.nextIdx++
 			r.curBuf = buf
+			// Wake pump in case it was blocked because the new
+			// chunk would have been past the maxAhead horizon.
+			r.cond.Broadcast()
 			continue
 		}
 		// Done condition: we've delivered every chunk the producer

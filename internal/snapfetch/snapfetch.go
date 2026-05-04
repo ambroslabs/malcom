@@ -838,7 +838,7 @@ func download(ctx context.Context, sw *p2p.Switch, ssR *statesync.Reactor,
 
 	startTime := time.Now()
 	lastProgress := time.Now()
-	progressEvery := 5 * time.Second
+	progressEvery := 15 * time.Second
 
 	tryRedial := func(pid p2p.ID) {
 		st, ok := stats[pid]
@@ -981,12 +981,8 @@ func download(ctx context.Context, sw *p2p.Switch, ssR *statesync.Reactor,
 
 			if now.Sub(lastProgress) >= progressEvery {
 				rate := float64(doneCount) / now.Sub(startTime).Seconds()
-				logger.Info("phase 3 progress",
-					"done", doneCount, "of", N,
-					"bytes", bytesTotal.Load(),
-					"chunks_per_s", fmt.Sprintf("%.1f", rate),
-					"alive", alive, "connected", connected,
-					"inflight", len(inflight))
+				fmt.Printf("[snapfetch] %d/%d chunks (%dMB) %.1f c/s peers=%d/%d inflight=%d\n",
+					doneCount, N, bytesTotal.Load()>>20, rate, connected, alive, len(inflight))
 				lastProgress = now
 			}
 
