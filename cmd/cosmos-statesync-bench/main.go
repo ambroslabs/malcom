@@ -752,8 +752,20 @@ func main() {
 	}
 
 	// 8. config.toml [p2p]
+	//
+	// max_packet_msg_payload_size: cometbft defaults to 1024, which
+	// is far too small for cosmoshub peers — many of them ship PEX
+	// address responses or other internal messages in 10-100 KB
+	// chunks. The default makes us drop the connection with
+	// "message exceeds max size (10124 > 1034)" as soon as a real
+	// peer interaction happens, then reconnect, then drop again,
+	// then... that loop is exactly what we observed: 80 persistent
+	// peers configured but only 2 connections holding. Our own
+	// snapshot-fetch tool sets the same value (256 KB) for the same
+	// reason; matching it here.
 	p2p := map[string]string{
-		"max_num_outbound_peers": strconv.Itoa(*maxOutbound),
+		"max_num_outbound_peers":      strconv.Itoa(*maxOutbound),
+		"max_packet_msg_payload_size": "262144",
 	}
 	if peersList != "" {
 		p2p["persistent_peers"] = strconv.Quote(peersList)
