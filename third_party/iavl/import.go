@@ -17,6 +17,44 @@ const maxBatchSize = 10000
 // ErrNoImport is returned when calling methods on a closed importer
 var ErrNoImport = errors.New("no import in progress")
 
+// FORK: nodePool recycles *Node structs. With ~9M leaves + inner nodes
+// for a cosmoshub bank tree, allocating fresh on every Add was the
+// largest single source of GC pressure in the wave-parallel import.
+// Nodes are returned to the pool from a parent's eventDone (events==2),
+// at the same point we nil leftNode/rightNode — the children are no
+// longer referenced by anything in the importer at that moment, so
+// recycling is race-free.
+//
+// We deliberately do NOT pool the value byte slices produced by
+// hashAndSerialize. The downstream batch backends (memDB, possibly
+// pebble depending on configuration) store the value slice by
+// reference in their internal index even after Write, so returning the
+// slice to a pool risks data corruption when the slice is reused.
+var nodePool = sync.Pool{
+	New: func() any { return &Node{} },
+}
+
+// resetNode clears every field on n so a recycled *Node from nodePool
+// behaves exactly like a fresh allocation.
+func resetNode(n *Node) {
+	n.key = nil
+	n.value = nil
+	n.hash = nil
+	n.nodeKey = nil
+	n.leftNodeKey = nil
+	n.rightNodeKey = nil
+	n.size = 0
+	n.leftNode = nil
+	n.rightNode = nil
+	n.subtreeHeight = 0
+	n.isLegacy = false
+	n.importPending.Store(0)
+	n.importEvents.Store(0)
+	n.importBuilt.Store(false)
+	n.importSubmitted.Store(false)
+	n.importParent = nil
+}
+
 // Importer imports data into an empty MutableTree. It is created by MutableTree.Import(). Users
 // must call Close() when done.
 //
@@ -319,8 +357,24 @@ func (i *Importer) eventDone(node *Node) {
 		node.leftNodeKey = nil
 		node.rightNodeKey = nil
 		if node.subtreeHeight > 0 {
-			node.leftNode = nil
-			node.rightNode = nil
+			// Inner: at events==2 we've been hashed (so we read
+			// leftNode.hash / rightNode.hash already) AND our parent
+			// has been set (so no future Add will read this node's
+			// children either). The child *Nodes are no longer
+			// referenced anywhere after we nil our pointers — recycle
+			// them via nodePool. Nil the field BEFORE Put so that if
+			// another goroutine pulls the node from the pool, this
+			// importer can't observe the stale pointer.
+			if l := node.leftNode; l != nil {
+				node.leftNode = nil
+				resetNode(l)
+				nodePool.Put(l)
+			}
+			if r := node.rightNode; r != nil {
+				node.rightNode = nil
+				resetNode(r)
+				nodePool.Put(r)
+			}
 		}
 	}
 }
@@ -371,11 +425,11 @@ func (i *Importer) Add(exportNode *ExportNode) error {
 		return *e
 	}
 
-	node := &Node{
-		key:           exportNode.Key,
-		value:         exportNode.Value,
-		subtreeHeight: exportNode.Height,
-	}
+	node := nodePool.Get().(*Node)
+	resetNode(node)
+	node.key = exportNode.Key
+	node.value = exportNode.Value
+	node.subtreeHeight = exportNode.Height
 
 	// We build the tree from the bottom-left up. The stack is used to store unresolved left
 	// children while constructing right children. When all children are built, the parent can

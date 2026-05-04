@@ -32,6 +32,38 @@ type ChunkBytes struct {
 	Data  []byte
 }
 
+// chunkBufPool recycles the per-chunk byte buffers used by the reorder
+// buffer's defensive copy. Cosmos-hub chunks are ~10 MiB; allocating
+// 297 of them per run was a noticeable GC cost. Buffers larger than
+// 32 MiB are dropped on Put so we don't pin oversized allocations.
+var chunkBufPool = sync.Pool{
+	New: func() any {
+		s := make([]byte, 0, 10<<20)
+		return &s
+	},
+}
+
+func getChunkBuf(n int) *[]byte {
+	bp := chunkBufPool.Get().(*[]byte)
+	if cap(*bp) < n {
+		*bp = make([]byte, n)
+	} else {
+		*bp = (*bp)[:n]
+	}
+	return bp
+}
+
+func putChunkBuf(bp *[]byte) {
+	if bp == nil {
+		return
+	}
+	if cap(*bp) > 32<<20 {
+		return
+	}
+	*bp = (*bp)[:0]
+	chunkBufPool.Put(bp)
+}
+
 // ImportStream is the streaming counterpart to Import. Instead of
 // reading chunk_*.bin files from snapshotDir, it consumes ChunkBytes
 // from `chunks` until either all `totalChunks` chunks are seen or the
@@ -308,11 +340,12 @@ type reorderReader struct {
 	maxAhead uint32 // max chunks the buffer can hold ahead of nextIdx
 	nextIdx  uint32 // next chunk index the reader expects to consume
 
-	mu     sync.Mutex
-	cond   *sync.Cond
-	buffer map[uint32][]byte // buffered out-of-order chunks
-	closed bool              // producer has closed `chunks`
-	curBuf []byte            // bytes pending consumption from buffer[nextIdx]
+	mu        sync.Mutex
+	cond      *sync.Cond
+	buffer    map[uint32]*[]byte // buffered out-of-order chunks (pooled)
+	closed    bool               // producer has closed `chunks`
+	curBuf    []byte             // bytes pending consumption from current chunk
+	curBufPtr *[]byte            // pool handle for curBuf; returned when fully consumed
 }
 
 // defaultMaxAhead is the default "chunks ahead of consumer" cap.
@@ -327,7 +360,7 @@ func newReorderReader(ctx context.Context, chunks <-chan ChunkBytes, total uint3
 		chunks:   chunks,
 		total:    total,
 		maxAhead: defaultMaxAhead,
-		buffer:   make(map[uint32][]byte),
+		buffer:   make(map[uint32]*[]byte),
 	}
 	r.cond = sync.NewCond(&r.mu)
 	go r.pump()
@@ -390,6 +423,7 @@ func (r *reorderReader) pump() {
 		r.cond.Broadcast()
 		r.mu.Unlock()
 	}()
+outer:
 	for {
 		select {
 		case <-r.ctx.Done():
@@ -414,14 +448,15 @@ func (r *reorderReader) pump() {
 				if ch.Index < r.nextIdx {
 					// Late duplicate — drop silently.
 					r.mu.Unlock()
-					goto next
+					continue outer
 				}
 				r.cond.Wait()
 			}
-			r.buffer[ch.Index] = append([]byte(nil), ch.Data...)
+			bp := getChunkBuf(len(ch.Data))
+			copy(*bp, ch.Data)
+			r.buffer[ch.Index] = bp
 			r.cond.Broadcast()
 			r.mu.Unlock()
-		next:
 		}
 	}
 }
@@ -439,11 +474,18 @@ func (r *reorderReader) Read(p []byte) (int, error) {
 			r.curBuf = r.curBuf[n:]
 			return n, nil
 		}
+		// Current chunk fully drained — return its buffer to the pool
+		// before promoting the next one.
+		if r.curBufPtr != nil {
+			putChunkBuf(r.curBufPtr)
+			r.curBufPtr = nil
+		}
 		// If the next chunk in order is buffered, promote it.
-		if buf, ok := r.buffer[r.nextIdx]; ok {
+		if bp, ok := r.buffer[r.nextIdx]; ok {
 			delete(r.buffer, r.nextIdx)
 			r.nextIdx++
-			r.curBuf = buf
+			r.curBuf = *bp
+			r.curBufPtr = bp
 			// Wake pump in case it was blocked because the new
 			// chunk would have been past the maxAhead horizon.
 			r.cond.Broadcast()
