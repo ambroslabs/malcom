@@ -4,7 +4,9 @@ import (
 	"bytes"
 	"errors"
 	"fmt"
+	"runtime"
 	"sync"
+	"sync/atomic"
 
 	"cosmossdk.io/core/store"
 )
@@ -23,42 +25,73 @@ var ErrNoImport = errors.New("no import in progress")
 // Importer is not concurrency-safe, it is the caller's responsibility to ensure the tree is not
 // modified while performing an import.
 //
-// FORK: a single hashing worker runs alongside the caller goroutine.
-// In Add(), when a sibling pair is built, the left child's hash +
-// serialise is dispatched to the worker while the caller hashes the
-// right child inline. Sibling nodes share no mutable state, so this
-// is safe (each _hash reads only its own already-populated subtree
-// hashes). batch.Set remains serial — pebble.Batch is not thread-safe.
+// FORK: wave-parallel import.
+//
+// The upstream importer hashed nodes synchronously in Add as soon as
+// a sibling pair was popped from the stack. We defer that hashing to
+// a worker pool and a single batch-writer goroutine. The dependency
+// graph implied by the post-order stream is processed bottom-up:
+// leaves are immediately ready (no children); inner nodes become
+// ready when both children's hashes complete and the inner has been
+// "confirmed non-root" by being popped from the stack.
+//
+// Concurrency primitives live on each Node (importPending, importEvents,
+// importBuilt, importSubmitted, importParent — all atomic, all
+// zero-valued outside import). The events counter takes one increment
+// from the worker (after hashing) and one from the main goroutine
+// (after parent linkage); the second event triggers the parent's
+// pending decrement. submitToReady uses CAS so a node is enqueued at
+// most once even if both sides race to submit it.
+//
+// The root never has importBuilt set (it's never popped) so workers
+// never submit it. Commit drains the pool, then synchronously hashes
+// + writes the root with nonce=1 (cosmos-sdk root key convention).
 type Importer struct {
-	tree      *MutableTree
-	version   int64
-	batch     store.Batch
-	batchSize uint32
-	stack     []*Node
-	nonces    []uint32
+	tree    *MutableTree
+	version int64
+	stack   []*Node
+	nonces  []uint32
 
-	// inflightCommit tracks a batch commit, if any.
+	// FORK: parallel pipeline.
+	workers      int
+	ready        chan *Node    // dispatcher → workers (bounded)
+	writeQ       chan writeEnt // hashed-node-bytes to commit to batch
+	workerWG     sync.WaitGroup
+	writerWG     sync.WaitGroup
+	dispatcherWG sync.WaitGroup
+
+	// pending is the unbounded slice queue feeding the dispatcher.
+	// Workers and the main goroutine both append here (non-blocking),
+	// avoiding the producer/consumer cycle that deadlocks if workers
+	// directly send to a bounded ready channel — when ready fills,
+	// every worker would block on its own submit while no other
+	// goroutine is left to drain ready.
+	pendingMu     sync.Mutex
+	pendingCond   *sync.Cond
+	pending       []*Node
+	pendingClosed bool
+
+	// hashWG counts non-root nodes whose hash is in flight. Add(1) on
+	// submitToReady, Done() in worker after hashing. Commit waits for
+	// it to drain.
+	hashWG sync.WaitGroup
+
+	// firstErr captures the first error from any goroutine. Commit
+	// returns it. Subsequent errors are dropped.
+	firstErr atomic.Pointer[error]
+
+	// Batch state. Owned by the writer goroutine; the main goroutine
+	// touches it only at Commit (after writer has exited) for the
+	// final root + WriteSync.
+	batch          store.Batch
+	batchSize      uint32
 	inflightCommit <-chan error
-
-	// FORK: persistent hashing worker. hashJobs receives left-child
-	// nodes for parallel hash + serialise; results return on the
-	// per-call out channel. workerWG closes when the worker exits
-	// after Close() drains the channel.
-	hashJobs chan hashJob
-	workerWG sync.WaitGroup
 }
 
-// hashJob is a hash + serialise unit submitted to the persistent worker.
-type hashJob struct {
-	node *Node
-	out  chan<- hashResult
-}
-
-// hashResult carries the hash + serialised batch entry produced by
-// hashAndSerialize. err is non-nil iff hashing or serialisation failed.
-type hashResult struct {
-	key, bytes []byte
-	err        error
+// writeEnt is a hashed node ready to be added to the batch.
+type writeEnt struct {
+	key   []byte
+	bytes []byte
 }
 
 // newImporter creates a new Importer for an empty MutableTree.
@@ -76,24 +109,129 @@ func newImporter(tree *MutableTree, version int64) (*Importer, error) {
 		return nil, errors.New("tree must be empty")
 	}
 
-	imp := &Importer{
-		tree:     tree,
-		version:  version,
-		batch:    tree.ndb.db.NewBatch(),
-		stack:    make([]*Node, 0, 8),
-		nonces:   make([]uint32, version+1),
-		hashJobs: make(chan hashJob, 1),
+	workers := runtime.NumCPU()
+	if workers > 8 {
+		workers = 8
 	}
-	imp.workerWG.Add(1)
-	go imp.hashWorker()
+	if workers < 1 {
+		workers = 1
+	}
+
+	imp := &Importer{
+		tree:    tree,
+		version: version,
+		stack:   make([]*Node, 0, 8),
+		nonces:  make([]uint32, version+1),
+		batch:   tree.ndb.db.NewBatch(),
+		workers: workers,
+		ready:   make(chan *Node, 1024),
+		writeQ:  make(chan writeEnt, 4096),
+	}
+	imp.pendingCond = sync.NewCond(&imp.pendingMu)
+
+	imp.dispatcherWG.Add(1)
+	go imp.dispatcher()
+
+	imp.workerWG.Add(workers)
+	for k := 0; k < workers; k++ {
+		go imp.hashWorker()
+	}
+	imp.writerWG.Add(1)
+	go imp.writerLoop()
+
 	return imp, nil
 }
 
-// hashAndSerialize computes the node's hash and serialises it to bytes.
-// Concurrency-safe with another hashAndSerialize on a different node:
-// the only shared state is the global bufPool and each node's own
-// fields. Sibling nodes don't share children, so reads of child .hash
-// fields don't race with each other.
+// dispatcher drains the unbounded pending slice into the bounded
+// ready channel. Single goroutine — only producer to ready, breaking
+// the worker-as-producer-and-consumer deadlock cycle. Exits when
+// pendingClosed is set and the slice is fully drained.
+func (i *Importer) dispatcher() {
+	defer i.dispatcherWG.Done()
+	defer close(i.ready)
+	for {
+		i.pendingMu.Lock()
+		for len(i.pending) == 0 && !i.pendingClosed {
+			i.pendingCond.Wait()
+		}
+		if i.pendingClosed && len(i.pending) == 0 {
+			i.pendingMu.Unlock()
+			return
+		}
+		batch := i.pending
+		i.pending = nil
+		i.pendingMu.Unlock()
+		for _, n := range batch {
+			i.ready <- n
+		}
+	}
+}
+
+// closePending tells the dispatcher no more submissions are coming.
+// Idempotent.
+func (i *Importer) closePending() {
+	i.pendingMu.Lock()
+	if !i.pendingClosed {
+		i.pendingClosed = true
+		i.pendingCond.Broadcast()
+	}
+	i.pendingMu.Unlock()
+}
+
+// setErr records the first error from any goroutine. Subsequent errors
+// are dropped — the first failure is the most informative cause.
+func (i *Importer) setErr(err error) {
+	if err == nil {
+		return
+	}
+	i.firstErr.CompareAndSwap(nil, &err)
+}
+
+// hashWorker hashes nodes pulled from the ready channel, sends the
+// resulting batch entry to the writer, and propagates the "hashed"
+// event up the dependency graph (which may make the parent ready).
+func (i *Importer) hashWorker() {
+	defer i.workerWG.Done()
+	for node := range i.ready {
+		if i.firstErr.Load() != nil {
+			i.hashWG.Done()
+			continue
+		}
+		k, b, err := i.hashAndSerialize(node)
+		if err != nil {
+			i.setErr(err)
+			i.hashWG.Done()
+			continue
+		}
+		// Send to writer. If writer has crashed, hashWG.Done still
+		// runs so Commit can proceed to error handling.
+		i.writeQ <- writeEnt{key: k, bytes: b}
+
+		// FORK: drop bytes that are no longer needed for any
+		// subsequent operation on this node. The parent's _hash
+		// reads node.hash; writeBytes already produced its bytes
+		// from node.key/value/leftNodeKey/rightNodeKey above. Anyone
+		// else who wants the node now reads it from pebble. For a
+		// 9M-leaf cosmoshub store this is several GB of memory
+		// freed before the rest of the import even finishes.
+		node.key = nil
+		node.value = nil
+		node.leftNodeKey = nil
+		node.rightNodeKey = nil
+		if node.subtreeHeight > 0 {
+			node.leftNode = nil
+			node.rightNode = nil
+		}
+
+		i.eventDone(node)
+		i.hashWG.Done()
+	}
+}
+
+// hashAndSerialize computes a node's hash and protobuf-serialises it.
+// Concurrency-safe across distinct nodes: the only shared state is
+// the global bufPool, and each node's _hash reads only its own and
+// its children's already-finalised state.
 func (i *Importer) hashAndSerialize(node *Node) ([]byte, []byte, error) {
 	node._hash(node.nodeKey.version)
 	if err := node.validate(); err != nil {
@@ -112,101 +250,100 @@ func (i *Importer) hashAndSerialize(node *Node) ([]byte, []byte, error) {
 	return i.tree.ndb.nodeKey(node.GetKey()), bytesCopy, nil
 }
 
-// hashWorker drains hashJobs until the channel is closed and dispatches
-// results back through each job's out channel. There is exactly one
-// worker (sibling pair → 1 dispatch + 1 inline = 2-way parallel).
-func (i *Importer) hashWorker() {
-	defer i.workerWG.Done()
-	for job := range i.hashJobs {
-		k, b, err := i.hashAndSerialize(job.node)
-		job.out <- hashResult{key: k, bytes: b, err: err}
+// writerLoop drains writeQ and appends each entry to the in-memory
+// pebble batch. Single goroutine — pebble.Batch is not thread-safe.
+// Triggers an async batch.Write (via inflightCommit) every maxBatchSize
+// entries; the previous in-flight write is awaited before starting
+// the next so we never have more than 2 batches alive at once.
+func (i *Importer) writerLoop() {
+	defer i.writerWG.Done()
+	for ent := range i.writeQ {
+		if err := i.batch.Set(ent.key, ent.bytes); err != nil {
+			i.setErr(err)
+			continue
+		}
+		i.batchSize++
+		if i.batchSize >= maxBatchSize {
+			if err := i.flushBatch(); err != nil {
+				i.setErr(err)
+			}
+		}
 	}
 }
 
-// writeBatched appends a hashed (key, bytes) entry to the in-memory
-// pebble batch and flushes (asynchronously) when batchSize is reached.
-// Caller must own the goroutine — pebble.Batch.Set is not thread-safe,
-// so all calls must funnel through one goroutine (Add()).
-func (i *Importer) writeBatched(key, value []byte) error {
-	if err := i.batch.Set(key, value); err != nil {
-		return err
-	}
-	i.batchSize++
-	if i.batchSize >= maxBatchSize {
-		var err error
-		if i.inflightCommit != nil {
-			err = <-i.inflightCommit
+// flushBatch hands the current batch off to a background commit
+// goroutine and starts a fresh batch. Caller must own the writer
+// goroutine.
+func (i *Importer) flushBatch() error {
+	if i.inflightCommit != nil {
+		if err := <-i.inflightCommit; err != nil {
 			i.inflightCommit = nil
-		}
-		if err != nil {
 			return err
 		}
-		result := make(chan error)
-		i.inflightCommit = result
-		go func(batch store.Batch) {
-			defer batch.Close()
-			result <- batch.Write()
-		}(i.batch)
-		i.batch = i.tree.ndb.db.NewBatch()
-		i.batchSize = 0
+		i.inflightCommit = nil
 	}
+	result := make(chan error, 1)
+	i.inflightCommit = result
+	go func(batch store.Batch) {
+		defer batch.Close()
+		result <- batch.Write()
+	}(i.batch)
+	i.batch = i.tree.ndb.db.NewBatch()
+	i.batchSize = 0
 	return nil
 }
 
-// writeNode hashes, serialises, and queues a single node into the
-// batch. Used by Commit() for the final root.
-func (i *Importer) writeNode(node *Node) error {
-	key, bytes, err := i.hashAndSerialize(node)
-	if err != nil {
-		return err
+// submitToReady enqueues a node for hashing exactly once. Both the
+// main goroutine (when an inner-Add finishes setting up children) and
+// any worker (when its decrement makes a parent ready) may try to
+// submit; the CAS picks one winner. Append is non-blocking under a
+// mutex — the dispatcher goroutine forwards from `pending` to the
+// bounded `ready` channel.
+func (i *Importer) submitToReady(node *Node) {
+	if !node.importSubmitted.CompareAndSwap(false, true) {
+		return
 	}
-	return i.writeBatched(key, bytes)
+	i.hashWG.Add(1)
+	i.pendingMu.Lock()
+	i.pending = append(i.pending, node)
+	i.pendingCond.Signal()
+	i.pendingMu.Unlock()
 }
 
-// writeNodePair hashes leftNode and rightNode in parallel (left on the
-// background hashWorker, right inline) and then writes both to the
-// batch in left-then-right order. Order in the batch doesn't matter
-// for correctness — pebble keys are unique per node — but matching the
-// original sequential order keeps the batch contents byte-identical to
-// the upstream importer for easier diffing.
-func (i *Importer) writeNodePair(leftNode, rightNode *Node) error {
-	out := make(chan hashResult, 1)
-	i.hashJobs <- hashJob{node: leftNode, out: out}
-
-	rk, rb, rerr := i.hashAndSerialize(rightNode)
-	lr := <-out
-
-	if lr.err != nil {
-		return lr.err
+// eventDone increments a node's events counter (worker contributes
+// "hashed", main contributes "parent-set"). When both have fired, the
+// parent's pending count is decremented.
+func (i *Importer) eventDone(node *Node) {
+	if node.importEvents.Add(1) == 2 {
+		i.decrementParent(node)
 	}
-	if rerr != nil {
-		return rerr
-	}
-	if err := i.writeBatched(lr.key, lr.bytes); err != nil {
-		return err
-	}
-	return i.writeBatched(rk, rb)
 }
 
-// Close frees all resources. It is safe to call multiple times. Uncommitted nodes may already have
-// been flushed to the database, but will not be visible.
-func (i *Importer) Close() {
-	// FORK: tear down the hash worker first. After this returns, no
-	// goroutine is sending writes to i.batch concurrently.
-	if i.hashJobs != nil {
-		close(i.hashJobs)
-		i.workerWG.Wait()
-		i.hashJobs = nil
+// decrementParent decrements parent.importPending. When pending hits
+// zero, if the parent has been confirmed non-root (importBuilt set),
+// submit it for hashing. Root never has importBuilt set, so it
+// never enters the pool — Commit handles it.
+func (i *Importer) decrementParent(child *Node) {
+	parent := child.importParent
+	if parent == nil {
+		return
 	}
-	if i.inflightCommit != nil {
-		<-i.inflightCommit
-		i.inflightCommit = nil
+	if parent.importPending.Add(-1) == 0 {
+		if parent.importBuilt.Load() {
+			i.submitToReady(parent)
+		}
 	}
-	if i.batch != nil {
-		i.batch.Close()
+}
+
+// markBuilt marks a node as confirmed non-root (popped from the
+// stack). If pending is already 0 (children were hashed before the
+// parent's Add ran), the worker's decrement may have raced ahead and
+// found importBuilt still false; we re-check here and submit.
+func (i *Importer) markBuilt(node *Node) {
+	node.importBuilt.Store(true)
+	if node.importPending.Load() == 0 {
+		i.submitToReady(node)
 	}
-	i.batch = nil
-	i.tree = nil
 }
 
 // Add adds an ExportNode to the import. ExportNodes must be added in the order returned by
@@ -223,6 +360,10 @@ func (i *Importer) Add(exportNode *ExportNode) error {
 		return fmt.Errorf("node version %v can't be greater than import version %v",
 			exportNode.Version, i.version)
 	}
+	// Surface any worker error early.
+	if e := i.firstErr.Load(); e != nil {
+		return *e
+	}
 
 	node := &Node{
 		key:           exportNode.Key,
@@ -238,29 +379,20 @@ func (i *Importer) Add(exportNode *ExportNode) error {
 	// We don't modify the stack until we've verified the built node, to avoid leaving the
 	// importer in an inconsistent state when we return an error.
 	stackSize := len(i.stack)
+	closesPair := false
+	var leftNode, rightNode *Node
 	if node.subtreeHeight == 0 {
 		node.size = 1
 	} else if stackSize >= 2 && i.stack[stackSize-1].subtreeHeight < node.subtreeHeight && i.stack[stackSize-2].subtreeHeight < node.subtreeHeight {
-		leftNode := i.stack[stackSize-2]
-		rightNode := i.stack[stackSize-1]
+		closesPair = true
+		leftNode = i.stack[stackSize-2]
+		rightNode = i.stack[stackSize-1]
 
 		node.leftNode = leftNode
 		node.rightNode = rightNode
 		node.leftNodeKey = leftNode.GetKey()
 		node.rightNodeKey = rightNode.GetKey()
 		node.size = leftNode.size + rightNode.size
-
-		// Update the stack now.
-		if err := i.writeNodePair(leftNode, rightNode); err != nil {
-			return err
-		}
-		i.stack = i.stack[:stackSize-2]
-
-		// remove the recursive references to avoid memory leak
-		leftNode.leftNode = nil
-		leftNode.rightNode = nil
-		rightNode.leftNode = nil
-		rightNode.rightNode = nil
 	}
 	i.nonces[exportNode.Version]++
 	node.nodeKey = &NodeKey{
@@ -269,50 +401,185 @@ func (i *Importer) Add(exportNode *ExportNode) error {
 		nonce: i.nonces[exportNode.Version] + 1,
 	}
 
-	i.stack = append(i.stack, node)
+	if node.subtreeHeight == 0 {
+		// Leaves: pending=0 (no children to wait for). Mark built and
+		// submit immediately. The worker hashes; later, when the
+		// parent's inner-Add runs, eventDone fires the second event
+		// and decrements parent's pending.
+		node.importBuilt.Store(true)
+		i.submitToReady(node)
+	} else if closesPair {
+		// Inner closing a sibling pair. Initialise pending=2 BEFORE
+		// linking children so a worker that races ahead doesn't see
+		// pending=0 prematurely.
+		node.importPending.Store(2)
 
+		// Both children are now off the stack — confirmed non-root.
+		// Mark them built. If their own pending is already 0, this
+		// also submits them (in case workers had already drained
+		// their grandchildren ahead of this Add).
+		i.markBuilt(leftNode)
+		i.markBuilt(rightNode)
+
+		// Link parent and fire the "parent-set" event for each child.
+		// If the child has already been hashed, this triggers the
+		// pending decrement immediately.
+		leftNode.importParent = node
+		i.eventDone(leftNode)
+		rightNode.importParent = node
+		i.eventDone(rightNode)
+
+		// Pop children from stack.
+		i.stack = i.stack[:stackSize-2]
+
+		// FORK: do NOT nil out leftNode.leftNode / rightNode here.
+		// Upstream nils these to drop references to grandchildren
+		// that are no longer needed, but it does so AFTER calling
+		// writeNode (which hashes them). In our model the children
+		// are hashed asynchronously by workers. Nilling now would
+		// race the worker's _hash, which reads child.leftNode.hash
+		// for inner children. Workers nil these themselves after
+		// hashing — see hashWorker.
+	}
+	// Inner that doesn't close a pair (rare; only happens at the very
+	// start of malformed streams): pending stays 0 but built stays
+	// false until popped. Will be marked built when its parent's
+	// inner-Add runs and pops it.
+
+	i.stack = append(i.stack, node)
 	return nil
 }
 
-// Commit finalizes the import by flushing any outstanding nodes to the database, making the
-// version visible, and updating the tree metadata. It can only be called once, and calls Close()
-// internally.
+// Commit finalises the import by waiting for all in-flight hash work
+// to drain, hashing the root (with nonce=1), flushing remaining
+// batches, and marking the version visible. It can only be called
+// once, and calls Close() internally.
 func (i *Importer) Commit() error {
 	if i.tree == nil {
 		return ErrNoImport
 	}
 
+	// 1. Wait for all submitted nodes to finish hashing. Workers
+	// continue draining ready until we close it via the dispatcher,
+	// and may submit more parents along the way as decrement chains
+	// fire.
+	i.hashWG.Wait()
+
+	// 2. No more submissions can come from main (Adds done) or from
+	// workers (no pending nodes left to ready). Tell the dispatcher
+	// to drain and close ready; that propagates: workers exit on
+	// closed ready → close writeQ → writer exits.
+	i.closePending()
+	i.dispatcherWG.Wait()
+	i.workerWG.Wait()
+	close(i.writeQ)
+	i.writerWG.Wait()
+
+	// 3. If anything went wrong, surface it before touching the
+	// final root.
+	if e := i.firstErr.Load(); e != nil {
+		i.Close()
+		return *e
+	}
+
+	// 4. Handle the root. Stack must hold exactly one element by now
+	// (or none, for the empty-tree case).
 	switch len(i.stack) {
 	case 0:
 		if err := i.batch.Set(i.tree.ndb.nodeKey(GetRootKey(i.version)), []byte{}); err != nil {
+			i.Close()
 			return err
 		}
 	case 1:
-		i.stack[0].nodeKey.nonce = 1
-		if err := i.writeNode(i.stack[0]); err != nil {
+		root := i.stack[0]
+		// Override the provisional nonce with the canonical root nonce=1.
+		// Hash and write *after* this so the cached root.hash and the
+		// stored bytes use the final nonce. (Hash actually doesn't
+		// depend on nonce — see writeHashBytes — but writeBytes does
+		// for the leftNodeKey / rightNodeKey of the root's parent,
+		// which is moot here because root has no parent.)
+		root.nodeKey.nonce = 1
+		k, b, err := i.hashAndSerialize(root)
+		if err != nil {
+			i.Close()
 			return err
 		}
-		if i.stack[0].nodeKey.version < i.version { // it means there is no update in the given version
-			if err := i.batch.Set(i.tree.ndb.nodeKey(GetRootKey(i.version)), i.tree.ndb.nodeKey(i.stack[0].nodeKey.GetKey())); err != nil {
+		if err := i.batch.Set(k, b); err != nil {
+			i.Close()
+			return err
+		}
+		if root.nodeKey.version < i.version { // there is no update in this version
+			if err := i.batch.Set(i.tree.ndb.nodeKey(GetRootKey(i.version)), i.tree.ndb.nodeKey(root.nodeKey.GetKey())); err != nil {
+				i.Close()
 				return err
 			}
 		}
 	default:
+		i.Close()
 		return fmt.Errorf("invalid node structure, found stack size %v when committing",
 			len(i.stack))
 	}
 
-	err := i.batch.WriteSync()
-	if err != nil {
+	// 5. Drain the inflight commit (if any), then write the final
+	// batch synchronously so the version is durable.
+	if i.inflightCommit != nil {
+		if err := <-i.inflightCommit; err != nil {
+			i.Close()
+			return err
+		}
+		i.inflightCommit = nil
+	}
+	if err := i.batch.WriteSync(); err != nil {
+		i.Close()
 		return err
 	}
 	i.tree.ndb.resetLatestVersion(i.version)
 
-	_, err = i.tree.LoadVersion(i.version)
-	if err != nil {
+	if _, err := i.tree.LoadVersion(i.version); err != nil {
+		i.Close()
 		return err
 	}
 
 	i.Close()
 	return nil
+}
+
+// Close frees all resources. Safe to call multiple times. If Commit
+// has not been called, in-flight goroutines are torn down and any
+// uncommitted work is discarded.
+func (i *Importer) Close() {
+	// Commit may have already drained the goroutines (idempotent
+	// here: dispatcher/worker/writer have exited and ready/writeQ
+	// have been closed). If Commit was NOT called, drive the
+	// shutdown sequence manually.
+	if i.pendingCond != nil {
+		i.closePending()        // idempotent
+		i.dispatcherWG.Wait()   // dispatcher exits, closes ready
+		i.workerWG.Wait()       // workers exit on closed ready
+		// writeQ: close once. Use safeClose since Commit may have
+		// already closed it.
+		if i.writeQ != nil {
+			safeClose(i.writeQ)
+			i.writerWG.Wait()
+			i.writeQ = nil
+		}
+		i.pendingCond = nil
+	}
+	if i.inflightCommit != nil {
+		<-i.inflightCommit
+		i.inflightCommit = nil
+	}
+	if i.batch != nil {
+		i.batch.Close()
+		i.batch = nil
+	}
+	i.tree = nil
+}
+
+// safeClose closes a channel idempotently, swallowing the panic from
+// closing an already-closed channel. Used in Close so that double-
+// close (Commit closes, then defer Close also closes) is harmless.
+func safeClose[T any](ch chan T) {
+	defer func() { _ = recover() }()
+	close(ch)
 }

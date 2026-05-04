@@ -43,10 +43,75 @@ Output is byte-identical to upstream:
   the end of `cosmos-snapshot-to-appdb` (or the cometbft handshake
   in gaiad) will catch it loudly.
 
-## Why only 2-way parallelism
+## Wave-parallel rewrite (current)
 
-The current change unlocks at most 2 cores per store. A sibling pair
-is the only set of nodes the upstream algorithm hashes "together" in
-a single Add call. To go beyond, we'd need to defer all hashing to
-Commit and walk the tree bottom-up in waves, with up to wave-width
-parallelism. That's a larger rewrite and a separate change.
+Add no longer hashes anything. It only builds the tree shape on the
+stack, sets per-node atomic state, and forwards work to a pool of
+hash workers and a single batch-writer goroutine.
+
+`node.go` got five fields (all zero-valued outside import use):
+
+  - `importPending` (atomic.Int32): children whose hash is pending.
+    2 for inner, 0 for leaves. Decremented as children's
+    "both events fired" (hashed + parent-set) propagates upward.
+  - `importEvents` (atomic.Int32): counts the two events that must
+    fire on a node before its parent's pending can be decremented.
+    The worker contributes "hashed"; the main goroutine contributes
+    "parent-set" inside the inner-Add for the grandparent.
+  - `importBuilt` (atomic.Bool): true once the node has been popped
+    from the stack (= confirmed non-root). Workers only submit a
+    parent to ready when both pending==0 AND built==true.
+  - `importSubmitted` (atomic.Bool): CAS-guarded "have we already
+    pushed this node into the ready channel?" — both main and worker
+    can race to submit; CAS picks one.
+  - `importParent` (*Node): set when the node is popped during its
+    parent's inner-Add.
+
+`import.go` rewritten:
+
+  - `newImporter` starts N hash workers (default min(NumCPU, 8)) and
+    1 writer goroutine. The writer owns the pebble batch.
+  - Add submits leaves to the ready channel immediately, marks them
+    built. For inner nodes that close a sibling pair, it sets
+    pending=2, marks both children built (which may submit them if
+    they were already pending=0 from grandchildren completion),
+    links each child's parent pointer, and fires the parent-set
+    event for each.
+  - Workers drain ready, hash + serialise, push to writeQ, then call
+    `eventDone` on the hashed node. eventDone may decrement the
+    parent's pending count and submit the parent to ready when the
+    parent is also built.
+  - The writer drains writeQ, calls batch.Set, and triggers async
+    flushes at maxBatchSize. Single goroutine — pebble.Batch is not
+    thread-safe.
+  - Commit waits on `hashWG` (counts submitted-but-not-hashed),
+    closes ready (workers exit), closes writeQ (writer exits), then
+    handles the root: it's the only stack entry, was never marked
+    built, never went through the pool. Commit overrides its nonce
+    to 1 and synchronously writes it via the (now writer-free)
+    batch, awaits any inflight commit, and WriteSyncs.
+
+## Consistency
+
+Output is byte-identical to upstream:
+
+- Hash values are determined by node fields and child hashes — both
+  are fully populated before any worker reads them. Order of
+  hash computation cannot affect the result.
+- Per-store batch entries arrive in different orders compared to
+  upstream (workers drain in completion order, not insertion order),
+  but each iavl node-key is unique so the on-disk pebble manifest is
+  identical after batch flush.
+- Root nonce override matches upstream Commit exactly.
+- Verified on cosmoshub-4 height 30,950,000: AppHash
+  `0F22F949B584C1C0ABBDB1A045C5B02B46151675FD64C4ACD4A208B937C9DDB5`
+  matches consensus.
+
+## Memory
+
+Live frontier during import is bounded by tree depth × peak wave
+width. For cosmoshub-4 bank (9M leaves, depth ≈ 23), the worst-case
+in-flight working set is a few thousand nodes × node size — under
+a GB even when the value bytes are still attached to leaves
+awaiting hashing. After a node's parent is hashed, the GC can
+reclaim it.

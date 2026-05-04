@@ -11,6 +11,7 @@ import (
 	"fmt"
 	"io"
 	"math"
+	"sync/atomic"
 
 	"github.com/cosmos/iavl/cache"
 
@@ -72,6 +73,17 @@ type Node struct {
 	rightNode     *Node
 	subtreeHeight int8
 	isLegacy      bool
+
+	// FORK: wave-parallel import state. Zero-value outside Importer
+	// use, so non-import paths (LoadVersion, Iterator, etc.) are
+	// unaffected. Set/read by Importer.Add (main goroutine) and the
+	// hash worker pool concurrently — all accesses use the atomic
+	// methods or are write-once-before-publish.
+	importPending   atomic.Int32 // children whose hash is pending; 2 for inner, 0 for leaves
+	importEvents    atomic.Int32 // 0/1/2 — counts "hashed" and "parent set" events
+	importBuilt     atomic.Bool  // true once node is confirmed non-root (popped from stack)
+	importSubmitted atomic.Bool  // true once submitted to ready channel (idempotent CAS)
+	importParent    *Node        // set when popped during parent's inner-Add
 }
 
 var _ cache.Node = (*Node)(nil)
