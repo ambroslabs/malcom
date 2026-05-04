@@ -310,15 +310,43 @@ func (b *Bench) parseLine(line string, seenDisc map[int64]bool, rejected *int) {
 				b.emit("fetching chunk %d/%d", c, t)
 			}
 		case strings.Contains(line, "Applied snapshot chunk"):
+			// IMPORTANT: cometbft logs "Applied snapshot chunk" after
+			// app.ApplySnapshotChunk() returns ACCEPT, but cosmos-sdk's
+			// Manager.RestoreChunk just enqueues the chunk ID onto a
+			// 1024-buffered channel and returns ACCEPT for chunks
+			// 0..total-2. A background goroutine drains the queue and
+			// does the real IAVL writes. Only the LAST chunk
+			// (total-1) blocks until the restorer goroutine fully
+			// drains, so its "Applied" log truly means "IAVL writes
+			// complete". For the rest we emit "queued chunk" to
+			// avoid the misleading "applied" wording.
 			c := extractInt(chunkRE, line)
 			t := extractInt(totalRE, line)
 			if c == 0 || c%25 == 0 || c >= t-3 {
-				b.emit("applied chunk %d/%d", c, t)
+				if c == t-1 {
+					b.emit("queued chunk %d/%d (final — IAVL writer fully drained)", c, t)
+				} else {
+					b.emit("queued chunk %d/%d (handed to restorer goroutine)", c, t)
+				}
 			}
+		case strings.Contains(line, "Verified ABCI app"):
+			// Fires after the LAST RestoreChunk returned + appHash
+			// matched the trusted hash from the light client. This
+			// is the unambiguous "snapshot is in the app, IAVL is
+			// built, hashes match consensus" point.
+			b.emit("Verified ABCI app — IAVL fully restored, appHash matches consensus")
+			b.phaseHit(phaseDownloaded, 0, "")
+			b.phaseHit(phaseAppDB, 0, "")
+		case strings.Contains(line, "Snapshot restored"):
+			// cometbft's "Done! 🎉" line, fires after Verified ABCI
+			// app. Fall through to phase if we missed the verify
+			// line (older versions don't always emit it).
+			b.emit("Snapshot restored — state-sync done")
+			b.phaseHit(phaseDownloaded, 0, "")
+			b.phaseHit(phaseAppDB, 0, "")
 		case strings.Contains(line, "State sync completed"),
-			strings.Contains(line, "Snapshot restored"),
 			strings.Contains(line, "Applied snapshot to state machine"):
-			b.emit("state sync chunks applied")
+			b.emit("state sync downloaded")
 			b.phaseHit(phaseDownloaded, 0, "")
 			b.phaseHit(phaseAppDB, 0, "")
 		}
