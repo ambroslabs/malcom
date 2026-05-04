@@ -66,6 +66,7 @@ var (
 	rpcPort      = flag.Int("rpc-port", 26657, "local cometbft RPC port to poll")
 	freshFlag    = flag.Bool("fresh", false, "wipe data/ and clear CSV history")
 	pollInterval = flag.Duration("poll-interval", 15*time.Second, "RPC poll interval")
+	appDBBackend = flag.String("app-db-backend", "", "if non-empty, set app.toml's app-db-backend (e.g. \"pebbledb\")")
 )
 
 // ─── helpers ──────────────────────────────────────────────────────────
@@ -306,9 +307,7 @@ func (b *Bench) parseLine(line string, seenDisc map[int64]bool, rejected *int) {
 		case strings.Contains(line, "Fetching snapshot chunk"):
 			c := extractInt(chunkRE, line)
 			t := extractInt(totalRE, line)
-			if c == 0 || c == t-1 || c%25 == 0 {
-				b.emit("fetching chunk %d/%d", c, t)
-			}
+			b.emit("fetching chunk %d/%d", c, t)
 		case strings.Contains(line, "Applied snapshot chunk"):
 			// IMPORTANT: cometbft logs "Applied snapshot chunk" after
 			// app.ApplySnapshotChunk() returns ACCEPT, but cosmos-sdk's
@@ -322,12 +321,10 @@ func (b *Bench) parseLine(line string, seenDisc map[int64]bool, rejected *int) {
 			// avoid the misleading "applied" wording.
 			c := extractInt(chunkRE, line)
 			t := extractInt(totalRE, line)
-			if c == 0 || c%25 == 0 || c >= t-3 {
-				if c == t-1 {
-					b.emit("queued chunk %d/%d (final — IAVL writer fully drained)", c, t)
-				} else {
-					b.emit("queued chunk %d/%d (handed to restorer goroutine)", c, t)
-				}
+			if c == t-1 {
+				b.emit("queued chunk %d/%d (final — IAVL writer fully drained)", c, t)
+			} else {
+				b.emit("queued chunk %d/%d (handed to restorer goroutine)", c, t)
 			}
 		case strings.Contains(line, "Restored snapshot chunk"):
 			// Emitted by our forked cosmossdk.io/store: fires when the
@@ -338,9 +335,7 @@ func (b *Bench) parseLine(line string, seenDisc map[int64]bool, rejected *int) {
 			// been restored" without instrumenting the IAVL writer.
 			c := extractInt(chunkRE, line)
 			t := extractInt(totalRE, line)
-			if c == 0 || c%25 == 0 || c >= t-3 {
-				b.emit("restored chunk %d/%d (drained from chunk channel)", c, t)
-			}
+			b.emit("restored chunk %d/%d (drained from chunk channel)", c, t)
 		case strings.Contains(line, "Verified ABCI app"):
 			// Fires after the LAST RestoreChunk returned + appHash
 			// matched the trusted hash from the light client. This
@@ -422,7 +417,6 @@ func (b *Bench) pollRPC(ctx context.Context, port int) {
 		prevHeightTs time.Time
 		prevCatching string
 		prevPeers    int = -1
-		pollCount    int
 	)
 	t := time.NewTicker(*pollInterval)
 	defer t.Stop()
@@ -433,7 +427,6 @@ func (b *Bench) pollRPC(ctx context.Context, port int) {
 			return
 		case <-t.C:
 		}
-		pollCount++
 
 		var st statusResp
 		if err := fetchJSON(base+"/status", &st); err != nil {
@@ -471,8 +464,6 @@ func (b *Bench) pollRPC(ctx context.Context, port int) {
 				prevCatching, catching, height, nPeers)
 		case nPeers != -1 && nPeers != prevPeers:
 			b.emit("peers: %d → %d connected", prevPeers, nPeers)
-		case pollCount%4 == 0 && nPeers != -1:
-			b.heartbeat("peers: %d connected (height=%d)", nPeers, height)
 		}
 		prevCatching = catching
 		prevPeers = nPeers
@@ -753,10 +744,16 @@ func main() {
 	}
 	fmt.Printf("[bench] trust_height=%d trust_hash=%s\n", tHeight, tHash)
 
-	// 4. app.toml min-gas-prices
+	// 4. app.toml: minimum-gas-prices and (optionally) app-db-backend.
+	appTomlKV := map[string]string{"minimum-gas-prices": `"0.0025uatom"`}
+	if *appDBBackend != "" {
+		// Override the storage backend gaiad opens application.db with.
+		// Empty defaults to cometbft's [db_backend] which is goleveldb.
+		appTomlKV["app-db-backend"] = strconv.Quote(*appDBBackend)
+	}
 	if err := setInSection(filepath.Join(*homeDir, "config", "app.toml"),
-		"", map[string]string{"minimum-gas-prices": `"0.0025uatom"`}); err != nil {
-		// app.toml min-gas-prices is at top-level (no [section]).
+		"", appTomlKV); err != nil {
+		// app.toml top-level keys (no [section]).
 		fmt.Fprintf(os.Stderr, "set app.toml: %v\n", err)
 		os.Exit(1)
 	}
