@@ -112,6 +112,25 @@ func main() {
 	if fi, err := dirSize(finalDB); err == nil {
 		fmt.Printf("  application.db:     %s  (%s)\n", finalDB, snapshotappdb.HumanBytes(uint64(fi)))
 	}
+
+	// Pebble's in-process Compact during Import queues obsolete L0
+	// files for deletion via the cleanup manager, but those deletions
+	// don't always drain before our Close. The result is ~8-10 GB of
+	// orphaned SSTs left on disk for cosmoshub-4. Reopening with
+	// default options forces pebble's recovery + cleanup path to run,
+	// reclaiming the slack. Skip for goleveldb (the slack issue is
+	// pebble-specific).
+	if snapshotappdb.Backend(*backendStr) == snapshotappdb.BackendPebble {
+		fmt.Printf("\n[appdb] cleanup compaction pass...\n")
+		t := time.Now()
+		if err := snapshotappdb.PebbleCleanupCompact(finalDB); err != nil {
+			log.Fatalf("cleanup compact: %v", err)
+		}
+		fmt.Printf("[appdb] cleanup pass done in %s\n", time.Since(t).Truncate(time.Second))
+		if fi, err := dirSize(finalDB); err == nil {
+			fmt.Printf("  application.db (post-cleanup): %s  (%s)\n", finalDB, snapshotappdb.HumanBytes(uint64(fi)))
+		}
+	}
 }
 
 func readMeta(path string) (metaJSON, error) {

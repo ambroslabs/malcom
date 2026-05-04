@@ -4,6 +4,8 @@ import (
 	"errors"
 	"fmt"
 	"math"
+	"strings"
+	"time"
 
 	corestore "cosmossdk.io/core/store"
 	"github.com/cockroachdb/pebble"
@@ -59,17 +61,93 @@ func openPebbleDB(dir string) (*pebbleDB, error) {
 // FinalCompact flushes the memtable and runs a full-keyspace compaction.
 // Call after bulk writes are complete and before Close. parallelize=true
 // uses all available cores. Skips silently if the DB has no data.
+//
+// Polls db.Metrics() on a 15s ticker so the caller sees per-level file
+// counts/sizes shrink in real time — pebble's Compact() is otherwise a
+// silent multi-minute call.
 func (p *pebbleDB) FinalCompact() error {
-	if err := p.db.Flush(); err != nil {
+	return runPebbleCompactWithMetrics(p.db, "compact")
+}
+
+// PebbleCleanupCompact opens a pebble DB at dir with default options,
+// flushes, runs a full-keyspace compaction, and closes. Use as a second
+// pass after Import to reclaim slack — the in-process Compact during
+// Import queues obsolete files for deletion but doesn't always finish
+// the cleanup before Close, leaving 8-10 GB of orphaned SSTs on a
+// cosmoshub appdb that disappear on the next Open. This function makes
+// that reopen explicit.
+func PebbleCleanupCompact(dir string) error {
+	db, err := pebble.Open(dir, &pebble.Options{
+		MaxConcurrentCompactions: func() int { return 8 },
+	})
+	if err != nil {
+		return fmt.Errorf("open: %w", err)
+	}
+	if err := runPebbleCompactWithMetrics(db, "cleanup"); err != nil {
+		_ = db.Close()
+		return err
+	}
+	return db.Close()
+}
+
+// runPebbleCompactWithMetrics flushes the memtable and runs a
+// full-keyspace compaction on db. While Compact is running, a
+// background goroutine polls db.Metrics() every 15s and prints
+// per-level file counts/sizes plus in-progress compaction state.
+func runPebbleCompactWithMetrics(db *pebble.DB, label string) error {
+	if err := db.Flush(); err != nil {
 		return fmt.Errorf("pebble flush: %w", err)
 	}
+
+	stopCh := make(chan struct{})
+	pollerDone := make(chan struct{})
+	go func() {
+		defer close(pollerDone)
+		printPebbleLSM(label+"-start", db.Metrics())
+		t := time.NewTicker(15 * time.Second)
+		defer t.Stop()
+		for {
+			select {
+			case <-stopCh:
+				return
+			case <-t.C:
+				printPebbleLSM(label, db.Metrics())
+			}
+		}
+	}()
+
 	// Pebble's Compact is exclusive on end. Use the full byte range.
 	start := []byte{0x00}
 	end := []byte{0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff}
-	if err := p.db.Compact(start, end, true); err != nil {
+	err := db.Compact(start, end, true)
+	close(stopCh)
+	<-pollerDone
+
+	if err != nil {
 		return fmt.Errorf("pebble compact: %w", err)
 	}
+	printPebbleLSM(label+"-done", db.Metrics())
 	return nil
+}
+
+// printPebbleLSM emits a single line summarising per-level file counts
+// and sizes, total size across all levels, and any in-progress
+// compaction work. Intended for ~15s tick output during long compactions.
+func printPebbleLSM(label string, m *pebble.Metrics) {
+	var totalFiles int64
+	var totalSize int64
+	var parts []string
+	for i, l := range m.Levels {
+		if l.NumFiles > 0 || l.Size > 0 {
+			parts = append(parts, fmt.Sprintf("L%d=%d/%s", i, l.NumFiles, HumanBytes(uint64(l.Size))))
+			totalFiles += l.NumFiles
+			totalSize += l.Size
+		}
+	}
+	fmt.Printf("[appdb-%s] %s | total=%d/%s in_progress=%d (%s)\n",
+		label, strings.Join(parts, " "),
+		totalFiles, HumanBytes(uint64(totalSize)),
+		m.Compact.NumInProgress, HumanBytes(uint64(m.Compact.InProgressBytes)))
 }
 
 func (p *pebbleDB) Get(key []byte) ([]byte, error) {
