@@ -6,7 +6,7 @@
 // What it writes:
 //
 //	<out>/config/genesis.json     copy of the supplied genesis
-//	<out>/data/application.db/    hardlink/copy from <appdb>/application.db
+//	<out>/data/application.db/    independent copy of <appdb>/application.db
 //	<out>/data/state.db/          fresh, populated via cometbft's offline state-sync
 //	<out>/data/blockstore.db/     fresh, holds the seen commit at H
 //	<out>/data/wasm-payloads/     copy of extensions/, for follow-up placement
@@ -169,7 +169,9 @@ func main() {
 	}
 	fmt.Printf("[bootstrap] cometbft bootstrap done in %s\n", time.Since(t0).Truncate(time.Second))
 
-	// 5. Place application.db (hardlink-tree if same fs, copy otherwise).
+	// 5. Copy application.db into the gaia data dir as an independent
+	// tree so the source stays untouched across reruns. See cloneTree
+	// for why we don't hardlink.
 	srcApp := filepath.Join(*appdb, "application.db")
 	dstApp := filepath.Join(dataDir, "application.db")
 	fmt.Printf("[bootstrap] application.db %s -> %s\n", srcApp, dstApp)
@@ -602,9 +604,25 @@ broadcast-mode = "sync"
 `
 }
 
-// cloneTree mirrors srcDir to dstDir, hardlinking files when the source and
-// destination share a filesystem (instant + zero extra disk), and falling
-// back to a real copy across filesystem boundaries.
+// cloneTree mirrors srcDir to dstDir as an independent on-disk copy.
+//
+// We don't hardlink, even on the same filesystem. Hardlinking is faster
+// (instant) and would otherwise be the obvious choice for a write-once
+// store like pebble, but it has two real downsides:
+//
+//   - flock aliases. Pebble's LOCK file would be a single inode shared
+//     between src and dst, so gaiad's flock at runtime blocks any
+//     tooling running against the source dir (and vice versa).
+//
+//   - lifetime entanglement. gaiad's pebble obsoletes files via
+//     unlink, which only decrements link count; the source dir's
+//     hardlinked names keep them alive. So src stays valid in
+//     practice, but its files are owned by the dst's runtime — if dst
+//     ever unlinks the last surviving name, src loses data. Awkward
+//     for a "pristine reference copy" intended to be reused.
+//
+// Cost on local-attached storage is ~1.5 min for a 14 GB pebble dir,
+// which is small relative to the rest of the snapshot→gaiad pipeline.
 func cloneTree(srcDir, dstDir string) error {
 	if err := os.MkdirAll(dstDir, 0o755); err != nil {
 		return err
@@ -621,11 +639,6 @@ func cloneTree(srcDir, dstDir string) error {
 		if info.IsDir() {
 			return os.MkdirAll(dst, info.Mode())
 		}
-		// Try hardlink first.
-		if err := os.Link(path, dst); err == nil {
-			return nil
-		}
-		// Fall back to copy.
 		return copyFile(path, dst)
 	})
 }
