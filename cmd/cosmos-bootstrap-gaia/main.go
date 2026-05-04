@@ -72,6 +72,7 @@ func main() {
 	appDBBackend := flag.String("app-db-backend", "pebbledb", "db_backend value for app.toml (must match application.db format)")
 	cmtDBBackend := flag.String("cmt-db-backend", "goleveldb", "db_backend value for config.toml (cometbft state.db/blockstore.db)")
 	placeWasm := flag.Bool("place-wasm", true, "extract wasm payloads to <out>/wasm/state/wasm/ (cosmwasm) and <out>/data/08-light-client/state/wasm/ (08-wasm)")
+	skipAppCopy := flag.Bool("skip-app-copy", false, "skip cloning <appdb>/application.db into <out>/data/application.db. Use when you've already written application.db directly to the destination (e.g. cosmos-rapid-bootstrap)")
 	flag.Parse()
 
 	if *appdb == "" || *genesis == "" || *rpcStr == "" || *height == 0 || *out == "" {
@@ -172,14 +173,25 @@ func main() {
 	// 5. Copy application.db into the gaia data dir as an independent
 	// tree so the source stays untouched across reruns. See cloneTree
 	// for why we don't hardlink.
+	//
+	// -skip-app-copy bypasses this — used when the caller has already
+	// written application.db directly to <out>/data/application.db
+	// (e.g. by passing -out=<out>/data to cosmos-snapshot-to-appdb).
 	srcApp := filepath.Join(*appdb, "application.db")
 	dstApp := filepath.Join(dataDir, "application.db")
-	fmt.Printf("[bootstrap] application.db %s -> %s\n", srcApp, dstApp)
-	t0 = time.Now()
-	if err := cloneTree(srcApp, dstApp); err != nil {
-		log.Fatalf("place application.db: %v", err)
+	if *skipAppCopy {
+		fmt.Printf("[bootstrap] application.db: -skip-app-copy set; expecting it at %s\n", dstApp)
+		if _, err := os.Stat(dstApp); err != nil {
+			log.Fatalf("skip-app-copy: %s missing: %v", dstApp, err)
+		}
+	} else {
+		fmt.Printf("[bootstrap] application.db %s -> %s\n", srcApp, dstApp)
+		t0 = time.Now()
+		if err := cloneTree(srcApp, dstApp); err != nil {
+			log.Fatalf("place application.db: %v", err)
+		}
+		fmt.Printf("[bootstrap] application.db placed in %s\n", time.Since(t0).Truncate(time.Millisecond))
 	}
-	fmt.Printf("[bootstrap] application.db placed in %s\n", time.Since(t0).Truncate(time.Millisecond))
 
 	// 6. Place wasm extension payloads.
 	srcExt := filepath.Join(*appdb, "extensions")

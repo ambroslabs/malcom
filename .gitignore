@@ -4,6 +4,7 @@
 /cosmos-blockcache
 /cosmos-archive
 /cosmos-snapshot-fetch
+/cosmos-rapid-bootstrap
 /cosmos-snapshot-inspect
 /cosmos-snapshot-diff
 /cosmos-snapshot-apply
