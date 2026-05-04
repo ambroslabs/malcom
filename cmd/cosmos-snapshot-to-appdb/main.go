@@ -43,6 +43,7 @@ func main() {
 	backendStr := flag.String("backend", "goleveldb", "application.db backend: goleveldb")
 	noExt := flag.Bool("no-extensions", false, "skip writing extension payloads")
 	minFreeGB := flag.Int64("min-free-gb", 30, "abort if -out's filesystem has less than this many GB free")
+	concurrency := flag.Int("concurrency", 0, "max stores with work in flight at once (commit pipelined behind reader); 0=auto (min(NumCPU,8)), 1=serial")
 	flag.Parse()
 
 	if *snapshot == "" || *out == "" {
@@ -68,12 +69,13 @@ func main() {
 		extDir = filepath.Join(*out, "extensions")
 	}
 
-	fmt.Printf("[appdb] snapshot %s\n", *snapshot)
-	fmt.Printf("[appdb] out      %s\n", *out)
-	fmt.Printf("[appdb] height   %d\n", *height)
-	fmt.Printf("[appdb] backend  %s\n", *backendStr)
+	fmt.Printf("[appdb] snapshot    %s\n", *snapshot)
+	fmt.Printf("[appdb] out         %s\n", *out)
+	fmt.Printf("[appdb] height      %d\n", *height)
+	fmt.Printf("[appdb] backend     %s\n", *backendStr)
+	fmt.Printf("[appdb] concurrency %d (0=auto)\n", *concurrency)
 	if extDir != "" {
-		fmt.Printf("[appdb] ext dir  %s\n", extDir)
+		fmt.Printf("[appdb] ext dir     %s\n", extDir)
 	}
 	fmt.Println()
 
@@ -84,6 +86,7 @@ func main() {
 		*height,
 		snapshotappdb.Backend(*backendStr),
 		extDir,
+		*concurrency,
 	)
 	if err != nil {
 		log.Fatalf("import: %v", err)

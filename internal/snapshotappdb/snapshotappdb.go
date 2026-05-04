@@ -22,14 +22,17 @@ import (
 	"bufio"
 	"bytes"
 	"compress/zlib"
+	"context"
 	"encoding/binary"
 	"fmt"
 	"io"
 	"os"
 	"path/filepath"
+	"runtime"
 	"sort"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	corestore "cosmossdk.io/core/store"
@@ -64,8 +67,23 @@ const (
 // outDir using the chosen backend, tagged at version=height. extDir (if
 // non-empty) is the directory where extension payloads (e.g. wasm
 // bytecode) will be written; pass "" to skip them.
-func Import(snapshotDir, outDir string, height int64, backend Backend, extDir string) (Stats, error) {
+//
+// concurrency caps the number of stores allowed to have work in flight at
+// once. The snapshot stream is itself serial (all of store A's items
+// arrive before store B's), so reads are single-threaded; the parallel
+// gain comes from pipelining store A's commit + final fast-batch flush
+// behind store B's iavl.Importer.Add work. concurrency=0 picks
+// min(NumCPU, 8); concurrency=1 effectively serializes (next store can't
+// start until prev fully commits).
+func Import(snapshotDir, outDir string, height int64, backend Backend, extDir string, concurrency int) (Stats, error) {
 	var stats Stats
+
+	if concurrency <= 0 {
+		concurrency = runtime.NumCPU()
+		if concurrency > 8 {
+			concurrency = 8
+		}
+	}
 
 	if err := os.MkdirAll(outDir, 0o755); err != nil {
 		return stats, err
@@ -83,159 +101,71 @@ func Import(snapshotDir, outDir string, height int64, backend Backend, extDir st
 	}
 	defer r.Close()
 
-	var storeInfos []storeInfo
+	startTime := time.Now()
 
-	var (
-		curStore     string
-		curTree      *iavl.MutableTree
-		curImp       *iavl.Importer
-		curPrefixed  idb.DB        // prefixed view of rootDB at "s/k:<name>/"
-		curFastBatch corestore.Batch // batch buffering fast-storage entries for the current store
-	)
+	// Workers, semaphore, and a context that workers cancel on error so
+	// the reader can stop sending items into a dead worker's channel.
+	var workers []*storeWorker
+	var current *storeWorker
+	sem := make(chan struct{}, concurrency)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
 
-	// Per-store names whose hashes we'll resolve at the end (after the
-	// final compaction makes reads fast). Order = import order.
-	var storeNamesForHash []string
+	// totalItems is shared across workers so per-worker progress lines
+	// can include a global total alongside the local store_items count.
+	var totalItems uint64
 
-	const fastBatchFlushBytes = 16 << 20 // 16 MiB
-
-	flushFastBatch := func() error {
-		if curFastBatch == nil {
-			return nil
+	closeCurrent := func() {
+		if current == nil {
+			return
 		}
-		if err := curFastBatch.Write(); err != nil {
-			return fmt.Errorf("flush fast batch %q: %w", curStore, err)
-		}
-		if err := curFastBatch.Close(); err != nil {
-			return fmt.Errorf("close fast batch %q: %w", curStore, err)
-		}
-		curFastBatch = curPrefixed.NewBatch()
-		return nil
+		close(current.items)
+		current = nil
 	}
 
-	commitCurrent := func() error {
-		if curImp == nil {
-			return nil
+	// spawnWorker waits for an in-flight slot, opens a fresh
+	// iavl.Importer for store name, and starts the worker goroutine.
+	// The goroutine releases its sem slot when done. If the worker
+	// errors, it cancels the context so the reader stops producing.
+	spawnWorker := func(name string) error {
+		select {
+		case sem <- struct{}{}:
+		case <-ctx.Done():
+			return firstWorkerError(workers)
 		}
-		commitStart := time.Now()
-		if err := curImp.Commit(); err != nil {
-			return fmt.Errorf("commit store %q: %w", curStore, err)
-		}
-		curImp.Close()
-		// Mark fast-storage as built for this store: write the metadata
-		// key 'm'+"storage_version" = "1.1.0-<height>". iavl's
-		// shouldForceFastStorageUpgrade compares versions[1] against
-		// the latest version on the tree (== height for snapshot
-		// import), and IsUpgradeable also checks
-		// hasUpgradedToFastStorage which returns true for versions
-		// >= "1.1.0". With this metadata in place, gaiad's
-		// LoadVersion sees fast-storage as already-built and skips
-		// the upgrade.
-		metaKey := append([]byte{'m'}, []byte("storage_version")...)
-		metaVal := []byte(fmt.Sprintf("1.1.0-%d", height))
-		if err := curFastBatch.Set(metaKey, metaVal); err != nil {
-			return fmt.Errorf("set metadata for store %q: %w", curStore, err)
-		}
-		// Flush remaining fast-storage writes for this store.
-		if err := curFastBatch.Write(); err != nil {
-			return fmt.Errorf("flush fast batch %q: %w", curStore, err)
-		}
-		if err := curFastBatch.Close(); err != nil {
-			return fmt.Errorf("close fast batch %q: %w", curStore, err)
-		}
-		curFastBatch = nil
-		curPrefixed = nil
-		// IMPORTANT: do not call LoadVersion + Hash here. With pebble in
-		// bulk-load mode, the LSM has hundreds of L0 SSTs and point
-		// lookups during LoadVersion are pathologically slow. We defer
-		// per-store hash resolution to after FinalCompact, where L1+
-		// has few large files and reads are fast.
-		storeNamesForHash = append(storeNamesForHash, curStore)
-		stats.Stores++
-		fmt.Printf("[appdb] commit store=%-22s in %s (hash deferred, fast-storage written)\n",
-			curStore, time.Since(commitStart).Truncate(time.Millisecond))
-		curTree.Close()
-		curTree = nil
-		curImp = nil
-		return nil
-	}
-
-	openStore := func(name string) error {
-		if err := commitCurrent(); err != nil {
-			return err
-		}
-		curStore = name
-		prefixed := idb.NewPrefixDB(rootDB, storePrefix(name))
-		curPrefixed = prefixed
-		curFastBatch = prefixed.NewBatch()
-		curTree = iavl.NewMutableTree(prefixed, 0, true, iavl.NewNopLogger())
-		imp, err := curTree.Import(height)
+		w, err := newStoreWorker(rootDB, name, height, startTime, &totalItems)
 		if err != nil {
-			return fmt.Errorf("Import(%d) on store %q: %w", height, name, err)
+			<-sem
+			return err
 		}
-		curImp = imp
+		workers = append(workers, w)
+		current = w
+		go func(w *storeWorker) {
+			defer func() { <-sem }()
+			w.run()
+			if w.err != nil {
+				cancel()
+			}
+		}(w)
 		return nil
 	}
 
-	// writeFastNode appends the fast-storage entry for a leaf to the
-	// per-store batch. iavl's nodedb encoding:
-	//
-	//   key   = 'f' || leaf.Key
-	//   value = varint(version) || varint(len(value)) || value
-	writeFastNode := func(node *iavl.ExportNode) error {
-		fkey := make([]byte, 0, 1+len(node.Key))
-		fkey = append(fkey, 'f')
-		fkey = append(fkey, node.Key...)
-
-		var fval bytes.Buffer
-		var vbuf [binary.MaxVarintLen64]byte
-		n := binary.PutUvarint(vbuf[:], uint64(node.Version))
-		fval.Write(vbuf[:n])
-		n = binary.PutUvarint(vbuf[:], uint64(len(node.Value)))
-		fval.Write(vbuf[:n])
-		fval.Write(node.Value)
-
-		if err := curFastBatch.Set(fkey, fval.Bytes()); err != nil {
-			return err
+	sendNode := func(node *iavl.ExportNode) error {
+		select {
+		case current.items <- node:
+			return nil
+		case <-ctx.Done():
+			return firstWorkerError(workers)
 		}
-		// Periodic flush to bound memory in the batch.
-		if size, err := curFastBatch.GetByteSize(); err == nil && size > fastBatchFlushBytes {
-			return flushFastBatch()
-		}
-		return nil
 	}
 
 	var (
 		curExt       string
 		curExtFormat uint32
 		curExtIndex  int
-
-		// Periodic progress logging — important since the import is
-		// long-running and bounded only by output prints at end.
-		startTime         = time.Now()
-		lastReport        = time.Now()
-		reportInterval    = 5 * time.Second
-		lastItemsAtReport uint64
-		curStoreItems     uint64
 	)
 
-	logProgress := func(force bool) {
-		if !force && time.Since(lastReport) < reportInterval {
-			return
-		}
-		now := time.Now()
-		elapsed := now.Sub(startTime).Truncate(time.Second)
-		windowSec := now.Sub(lastReport).Seconds()
-		if windowSec < 0.1 {
-			windowSec = 0.1
-		}
-		rate := float64(stats.Items-lastItemsAtReport) / windowSec
-		fmt.Printf("[appdb] %s store=%-22s store_items=%-12d total=%-12d %.0f items/s\n",
-			elapsed, curStore, curStoreItems, stats.Items, rate)
-		lastReport = now
-		lastItemsAtReport = stats.Items
-	}
-
+readLoop:
 	for {
 		tag, body, eof, err := r.peekItem()
 		if err != nil {
@@ -249,38 +179,23 @@ func Import(snapshotDir, outDir string, height int64, backend Backend, extDir st
 
 		switch tag {
 		case 1: // SnapshotStoreItem
-			logProgress(true)
+			closeCurrent()
 			name := string(parseStringField(body, 1))
 			fmt.Printf("[appdb] %s open store=%q\n",
 				time.Since(startTime).Truncate(time.Second), name)
-			if err := openStore(name); err != nil {
+			if err := spawnWorker(name); err != nil {
 				return stats, err
 			}
-			curStoreItems = 0
 		case 2: // SnapshotIAVLItem
-			if curImp == nil {
+			if current == nil {
 				return stats, fmt.Errorf("IAVL item before any StoreItem")
 			}
 			node := parseIAVLExportNode(body)
-			if err := curImp.Add(node); err != nil {
-				return stats, fmt.Errorf("import node into %q: %w", curStore, err)
-			}
-			// Path A: also write the fast-storage entry for leaves.
-			// Inner nodes (height > 0) are not in fast-storage —
-			// fast-storage is the flat-map of (leaf_key → leaf_value).
-			if node.Height == 0 {
-				if err := writeFastNode(node); err != nil {
-					return stats, fmt.Errorf("write fast-node into %q: %w", curStore, err)
-				}
-			}
-			stats.Items++
-			curStoreItems++
-			logProgress(false)
-		case 3: // SnapshotExtensionMeta
-			logProgress(true)
-			if err := commitCurrent(); err != nil {
+			if err := sendNode(node); err != nil {
 				return stats, err
 			}
+		case 3: // SnapshotExtensionMeta
+			closeCurrent()
 			curExt = string(parseStringField(body, 1))
 			curExtFormat = uint32(parseVarintField(body, 2))
 			curExtIndex = 0
@@ -306,10 +221,25 @@ func Import(snapshotDir, outDir string, height int64, backend Backend, extDir st
 		default:
 			// unknown — skip
 		}
+		if ctx.Err() != nil {
+			break readLoop
+		}
 	}
 
-	if err := commitCurrent(); err != nil {
-		return stats, err
+	closeCurrent()
+
+	// Wait for every worker to finish committing. Order = spawn order =
+	// stream order; storeNamesForHash uses that order, but writeCommitInfo
+	// re-sorts alphabetically anyway.
+	var storeNamesForHash []string
+	for _, w := range workers {
+		<-w.done
+		if w.err != nil {
+			return stats, w.err
+		}
+		stats.Stores++
+		stats.Items += atomic.LoadUint64(&w.itemsAdded)
+		storeNamesForHash = append(storeNamesForHash, w.name)
 	}
 
 	// Final compaction first — collapses hundreds of L0 SSTs from the
@@ -331,6 +261,7 @@ func Import(snapshotDir, outDir string, height int64, backend Backend, extDir st
 	fmt.Printf("[appdb] %s resolving per-store hashes...\n",
 		time.Since(startTime).Truncate(time.Second))
 	hashStart := time.Now()
+	var storeInfos []storeInfo
 	for _, name := range storeNamesForHash {
 		t := iavl.NewMutableTree(idb.NewPrefixDB(rootDB, storePrefix(name)), 0, true, iavl.NewNopLogger())
 		ver, err := t.LoadVersion(height)
@@ -362,6 +293,183 @@ func Import(snapshotDir, outDir string, height int64, backend Backend, extDir st
 	}
 
 	return stats, nil
+}
+
+// firstWorkerError returns the first non-nil err on any worker that has
+// finished. Used by the reader to surface a worker-side failure when
+// the context is cancelled.
+func firstWorkerError(workers []*storeWorker) error {
+	for _, w := range workers {
+		select {
+		case <-w.done:
+			if w.err != nil {
+				return w.err
+			}
+		default:
+		}
+	}
+	return fmt.Errorf("import cancelled (worker error)")
+}
+
+// storeWorker owns one store's iavl.Importer + fast-storage batch and
+// drains items off its channel. Workers are independent: each writes
+// only under its own "s/k:<name>/" prefix in the shared rootDB, with
+// its own iavl.Importer state. Pebble tolerates concurrent writers via
+// internal locking, so multiple workers can commit in parallel.
+type storeWorker struct {
+	name        string
+	height      int64
+	pref        idb.DB
+	tree        *iavl.MutableTree
+	imp         *iavl.Importer
+	importStart time.Time
+	totalItems  *uint64 // shared across workers, atomic
+
+	items chan *iavl.ExportNode
+	done  chan struct{}
+	err   error
+
+	itemsAdded uint64 // atomic
+}
+
+const storeWorkerQueueSize = 1024
+
+func newStoreWorker(rootDB rootStore, name string, height int64, importStart time.Time, totalItems *uint64) (*storeWorker, error) {
+	pref := idb.NewPrefixDB(rootDB, storePrefix(name))
+	tree := iavl.NewMutableTree(pref, 0, true, iavl.NewNopLogger())
+	imp, err := tree.Import(height)
+	if err != nil {
+		return nil, fmt.Errorf("Import(%d) on store %q: %w", height, name, err)
+	}
+	return &storeWorker{
+		name:        name,
+		height:      height,
+		pref:        pref,
+		tree:        tree,
+		imp:         imp,
+		importStart: importStart,
+		totalItems:  totalItems,
+		items:       make(chan *iavl.ExportNode, storeWorkerQueueSize),
+		done:        make(chan struct{}),
+	}, nil
+}
+
+// run drains items from w.items, then commits the store. Errors set
+// w.err and exit early; the caller cancels the parent context after
+// observing w.err.
+func (w *storeWorker) run() {
+	defer close(w.done)
+	const fastBatchFlushBytes = 16 << 20 // 16 MiB
+	const reportInterval = 5 * time.Second
+	fbatch := w.pref.NewBatch()
+
+	flushFast := func() error {
+		if err := fbatch.Write(); err != nil {
+			return fmt.Errorf("flush fast batch %q: %w", w.name, err)
+		}
+		if err := fbatch.Close(); err != nil {
+			return fmt.Errorf("close fast batch %q: %w", w.name, err)
+		}
+		fbatch = w.pref.NewBatch()
+		return nil
+	}
+
+	var (
+		lastReport        = time.Now()
+		lastItemsAtReport uint64
+	)
+	for node := range w.items {
+		if err := w.imp.Add(node); err != nil {
+			w.err = fmt.Errorf("import node into %q: %w", w.name, err)
+			return
+		}
+		// Path A: write fast-storage entry for leaves only. Inner
+		// nodes (Height>0) aren't in fast-storage — fast-storage is
+		// the flat-map of (leaf_key → leaf_value).
+		if node.Height == 0 {
+			if err := writeFastNode(fbatch, node); err != nil {
+				w.err = fmt.Errorf("write fast-node into %q: %w", w.name, err)
+				return
+			}
+			if size, err := fbatch.GetByteSize(); err == nil && size > fastBatchFlushBytes {
+				if err := flushFast(); err != nil {
+					w.err = err
+					return
+				}
+			}
+		}
+		nLocal := atomic.AddUint64(&w.itemsAdded, 1)
+		nTotal := atomic.AddUint64(w.totalItems, 1)
+
+		if time.Since(lastReport) >= reportInterval {
+			now := time.Now()
+			elapsed := now.Sub(w.importStart).Truncate(time.Second)
+			window := now.Sub(lastReport).Seconds()
+			if window < 0.1 {
+				window = 0.1
+			}
+			rate := float64(nLocal-lastItemsAtReport) / window
+			fmt.Printf("[appdb] %s store=%-22s store_items=%-12d total=%-12d %.0f items/s\n",
+				elapsed, w.name, nLocal, nTotal, rate)
+			lastReport = now
+			lastItemsAtReport = nLocal
+		}
+	}
+
+	// Commit phase. iavl.Importer.Commit + the storage_version
+	// metadata key + final fast-batch flush. We deliberately don't
+	// resolve hash here — that's done in bulk after FinalCompact.
+	commitStart := time.Now()
+	if err := w.imp.Commit(); err != nil {
+		w.err = fmt.Errorf("commit store %q: %w", w.name, err)
+		return
+	}
+	w.imp.Close()
+	// Mark fast-storage as built for this store: 'm'+"storage_version"
+	// = "1.1.0-<height>". iavl's shouldForceFastStorageUpgrade compares
+	// versions[1] against the latest version on the tree (== height
+	// for snapshot import), and IsUpgradeable also checks
+	// hasUpgradedToFastStorage which returns true for versions
+	// >= "1.1.0". With this metadata in place, gaiad's LoadVersion
+	// sees fast-storage as already-built and skips the upgrade.
+	metaKey := append([]byte{'m'}, []byte("storage_version")...)
+	metaVal := []byte(fmt.Sprintf("1.1.0-%d", w.height))
+	if err := fbatch.Set(metaKey, metaVal); err != nil {
+		w.err = fmt.Errorf("set metadata for store %q: %w", w.name, err)
+		return
+	}
+	if err := fbatch.Write(); err != nil {
+		w.err = fmt.Errorf("flush fast batch %q: %w", w.name, err)
+		return
+	}
+	if err := fbatch.Close(); err != nil {
+		w.err = fmt.Errorf("close fast batch %q: %w", w.name, err)
+		return
+	}
+	w.tree.Close()
+	fmt.Printf("[appdb] commit store=%-22s in %s (hash deferred, fast-storage written)\n",
+		w.name, time.Since(commitStart).Truncate(time.Millisecond))
+}
+
+// writeFastNode appends an iavl fast-storage entry for a leaf to batch.
+// Encoding (matches iavl/nodedb):
+//
+//	key   = 'f' || leaf.Key
+//	value = varint(version) || varint(len(value)) || value
+func writeFastNode(batch corestore.Batch, node *iavl.ExportNode) error {
+	fkey := make([]byte, 0, 1+len(node.Key))
+	fkey = append(fkey, 'f')
+	fkey = append(fkey, node.Key...)
+
+	var fval bytes.Buffer
+	var vbuf [binary.MaxVarintLen64]byte
+	n := binary.PutUvarint(vbuf[:], uint64(node.Version))
+	fval.Write(vbuf[:n])
+	n = binary.PutUvarint(vbuf[:], uint64(len(node.Value)))
+	fval.Write(vbuf[:n])
+	fval.Write(node.Value)
+
+	return batch.Set(fkey, fval.Bytes())
 }
 
 // rootStore is the union of methods we need from the application.db
