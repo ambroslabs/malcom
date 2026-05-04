@@ -334,11 +334,10 @@ readLoop:
 // the buffer. Both signal via cond on the same mutex. ctx cancellation
 // wakes any blocked party.
 type reorderReader struct {
-	ctx      context.Context
-	chunks   <-chan ChunkBytes
-	total    uint32
-	maxAhead uint32 // max chunks the buffer can hold ahead of nextIdx
-	nextIdx  uint32 // next chunk index the reader expects to consume
+	ctx     context.Context
+	chunks  <-chan ChunkBytes
+	total   uint32
+	nextIdx uint32 // next chunk index the reader expects to consume
 
 	mu        sync.Mutex
 	cond      *sync.Cond
@@ -348,19 +347,12 @@ type reorderReader struct {
 	curBufPtr *[]byte            // pool handle for curBuf; returned when fully consumed
 }
 
-// defaultMaxAhead is the default "chunks ahead of consumer" cap.
-// 4 chunks × ~10 MiB = ~40 MiB peak buffer — small enough that on a
-// 16 GiB host the iavl frontier and pebble compaction get the lion's
-// share of RAM.
-const defaultMaxAhead uint32 = 4
-
 func newReorderReader(ctx context.Context, chunks <-chan ChunkBytes, total uint32) *reorderReader {
 	r := &reorderReader{
-		ctx:      ctx,
-		chunks:   chunks,
-		total:    total,
-		maxAhead: defaultMaxAhead,
-		buffer:   make(map[uint32]*[]byte),
+		ctx:    ctx,
+		chunks: chunks,
+		total:  total,
+		buffer: make(map[uint32]*[]byte),
 	}
 	r.cond = sync.NewCond(&r.mu)
 	go r.pump()
@@ -401,8 +393,8 @@ func (r *reorderReader) reportLoop() {
 		} else if closed {
 			state = "closed-draining"
 		}
-		fmt.Printf("[chunks] consumed=%d/%d buffered=%d (max-ahead=%d) state=%s delta=%d/15s\n",
-			next, r.total, bufN, r.maxAhead, state, next-prevNext)
+		fmt.Printf("[chunks] consumed=%d/%d buffered=%d state=%s delta=%d/15s\n",
+			next, r.total, bufN, state, next-prevNext)
 		prevNext = next
 		if closed && bufN == 0 {
 			return
@@ -411,11 +403,15 @@ func (r *reorderReader) reportLoop() {
 }
 
 // pump drains the chunks channel into the reorder buffer and broadcasts
-// to any reader blocked in Read. Blocks insertion if a chunk's index is
-// more than maxAhead beyond the reader's current nextIdx, which back-
-// pressures snapfetch when the importer falls behind. Exits when the
-// channel closes (or ctx cancels), then marks closed so Read can return
-// io.EOF after draining.
+// to any reader blocked in Read. Always accepts in-bound chunks — the
+// natural memory cap is the chunks channel size (set by the caller) plus
+// snapfetch's per-peer-inflight × peer-count, since OnChunk on the
+// snapfetch side blocks once the chunks channel fills. We deliberately
+// do NOT gate insertion on a per-chunk index window here: with N peers
+// each delivering up to perPeer concurrent chunks, gaps larger than any
+// fixed window are routine, and a window-wait would deadlock by holding
+// pump on one out-of-window chunk while the consumer's chunk[nextIdx]
+// sits unserved in the channel.
 func (r *reorderReader) pump() {
 	defer func() {
 		r.mu.Lock()
@@ -423,7 +419,6 @@ func (r *reorderReader) pump() {
 		r.cond.Broadcast()
 		r.mu.Unlock()
 	}()
-outer:
 	for {
 		select {
 		case <-r.ctx.Done():
@@ -432,25 +427,11 @@ outer:
 			if !ok {
 				return
 			}
-			// Wait until ch.Index is within the read horizon.
 			r.mu.Lock()
-			for {
-				if r.ctx.Err() != nil {
-					r.mu.Unlock()
-					return
-				}
-				// Allow chunks at indices nextIdx .. nextIdx+maxAhead-1.
-				// A chunk arriving past that horizon means the consumer
-				// is slow; block and let the consumer drain first.
-				if ch.Index >= r.nextIdx && ch.Index < r.nextIdx+r.maxAhead {
-					break
-				}
-				if ch.Index < r.nextIdx {
-					// Late duplicate — drop silently.
-					r.mu.Unlock()
-					continue outer
-				}
-				r.cond.Wait()
+			if ch.Index < r.nextIdx {
+				// Late duplicate — drop silently.
+				r.mu.Unlock()
+				continue
 			}
 			bp := getChunkBuf(len(ch.Data))
 			copy(*bp, ch.Data)
@@ -486,9 +467,6 @@ func (r *reorderReader) Read(p []byte) (int, error) {
 			r.nextIdx++
 			r.curBuf = *bp
 			r.curBufPtr = bp
-			// Wake pump in case it was blocked because the new
-			// chunk would have been past the maxAhead horizon.
-			r.cond.Broadcast()
 			continue
 		}
 		// Done condition: we've delivered every chunk the producer
