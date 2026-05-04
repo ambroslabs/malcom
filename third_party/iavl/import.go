@@ -207,22 +207,10 @@ func (i *Importer) hashWorker() {
 		// runs so Commit can proceed to error handling.
 		i.writeQ <- writeEnt{key: k, bytes: b}
 
-		// FORK: drop bytes that are no longer needed for any
-		// subsequent operation on this node. The parent's _hash
-		// reads node.hash; writeBytes already produced its bytes
-		// from node.key/value/leftNodeKey/rightNodeKey above. Anyone
-		// else who wants the node now reads it from pebble. For a
-		// 9M-leaf cosmoshub store this is several GB of memory
-		// freed before the rest of the import even finishes.
-		node.key = nil
-		node.value = nil
-		node.leftNodeKey = nil
-		node.rightNodeKey = nil
-		if node.subtreeHeight > 0 {
-			node.leftNode = nil
-			node.rightNode = nil
-		}
-
+		// eventDone fires the "hashed" event. If main has already
+		// fired "parent set" (events would go to 2), the drop in
+		// eventDone runs now. Otherwise main's inner-Add will fire
+		// the second event later and drop then.
 		i.eventDone(node)
 		i.hashWG.Done()
 	}
@@ -312,10 +300,28 @@ func (i *Importer) submitToReady(node *Node) {
 
 // eventDone increments a node's events counter (worker contributes
 // "hashed", main contributes "parent-set"). When both have fired, the
-// parent's pending count is decremented.
+// parent's pending count is decremented AND the node's bytes are
+// dropped — at this point the node has been hashed (so writeBytes ran
+// using key/value/etc.) AND it's been popped from the stack
+// (confirmed non-root, so Commit won't re-serialise it). The root
+// never has its events hit 2 (no parent → no parent-set event), so
+// its bytes survive for Commit's nonce=1 re-serialisation.
 func (i *Importer) eventDone(node *Node) {
 	if node.importEvents.Add(1) == 2 {
 		i.decrementParent(node)
+		// Both events fired. Drop fields used during hash + serialise.
+		// Frees ~80% of leaf memory — for cosmoshub bank with 9M
+		// leaves this is GBs reclaimed mid-import. Inner nodes also
+		// free their child pointers (not needed once their own hash
+		// is in node.hash).
+		node.key = nil
+		node.value = nil
+		node.leftNodeKey = nil
+		node.rightNodeKey = nil
+		if node.subtreeHeight > 0 {
+			node.leftNode = nil
+			node.rightNode = nil
+		}
 	}
 }
 
