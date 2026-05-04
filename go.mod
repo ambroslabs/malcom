@@ -78,3 +78,7 @@ require (
 	google.golang.org/protobuf v1.36.6 // indirect
 	gopkg.in/yaml.v3 v3.0.1 // indirect
 )
+
+// Local fork of iavl. Modifications live in third_party/iavl/. See
+// third_party/iavl/FORK_NOTES.md for what's changed and why.
+replace github.com/cosmos/iavl => ./third_party/iavl
