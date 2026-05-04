@@ -1,0 +1,1027 @@
+[bench] previous gaiad.log preserved at /root/statesync-test/bench/runs/gaiad.log.000
+[bench] --fresh: wiping data/ + clearing CSV history
+[bench] run #1
+[bench] fetching trust hash from https://rpc.lavenderfive.com:443/cosmoshub ...
+[bench] trust_height=30956833 trust_hash=E62E719D4AD7AC1A9D6C5004AD8E184BFBAD8A7DF62748C31664C9A0AB0B4983
+[bench] using cached addrbook (3h47m04s old): /root/statesync-test/bench/cache/addrbook.json
+[bench] loaded 25 peers from /root/peers-cumulative.json (limit 25)
+[bench] watcher initial stage=0
+
+[bench] launching gaiad — log=/root/statesync-test/bench/gaiad.log
+[bench] gaiad pid=95445
+[10:29:12 +0s] polling http://127.0.0.1:26657/status every 15s until caught up
+[10:29:21 +8s] snapshot discovered height=22577000
+[10:29:21 +9s] snapshot discovered height=29848000
+[10:29:21 +9s] snapshot discovered height=22072000
+[10:29:21 +9s] snapshot discovered height=24976000
+[10:29:21 +9s] snapshot discovered height=30934000
+[10:29:21 +9s] snapshot discovered height=30957000
+[10:29:21 +9s] snapshot discovered height=24256000
+[10:29:21 +9s] snapshot discovered height=22111000
+[10:29:21 +9s] snapshot discovered height=22566000
+[10:29:21 +9s] snapshot discovered height=22553000
+[10:29:21 +9s] snapshot discovered height=22541000
+[10:29:21 +9s] snapshot discovered height=29846000
+[10:29:21 +9s] snapshot discovered height=29844000
+[10:29:21 +9s] snapshot discovered height=29842000
+[10:29:21 +9s] snapshot discovered height=30933000
+[10:29:21 +9s] snapshot discovered height=30932000
+[10:29:21 +9s] snapshot discovered height=22061000
+[10:29:21 +9s] snapshot discovered height=22050000
+[10:29:21 +9s] snapshot discovered height=22032000
+[10:29:21 +9s] snapshot discovered height=22530000
+[10:29:21 +9s] snapshot discovered height=22518000
+[10:29:21 +9s] snapshot discovered height=22495000
+[10:29:21 +9s] snapshot discovered height=22478000
+[10:29:21 +9s] snapshot discovered height=22467000
+[10:29:21 +9s] snapshot discovered height=22456000
+[10:29:21 +9s] snapshot discovered height=29840000
+[10:29:21 +9s] snapshot discovered height=29838000
+[10:29:21 +9s] snapshot discovered height=29834000
+[10:29:21 +9s] snapshot discovered height=29832000
+[10:29:21 +9s] snapshot discovered height=29830000
+[10:29:21 +9s] snapshot discovered height=30931000
+[10:29:21 +9s] snapshot discovered height=30930000
+[10:29:21 +9s] snapshot discovered height=30929000
+[10:29:21 +9s] snapshot discovered height=30928000
+[10:29:21 +9s] snapshot discovered height=30927000
+[10:29:21 +9s] snapshot discovered height=30926000
+[10:29:21 +9s] snapshot discovered height=30951000
+[10:29:21 +9s] snapshot discovered height=22021000
+[10:29:21 +9s] snapshot discovered height=22010000
+[10:29:21 +9s] snapshot discovered height=21987000
+[10:29:21 +9s] snapshot discovered height=21967000
+[10:29:21 +9s] snapshot discovered height=21955000
+[10:29:21 +9s] snapshot discovered height=29828000
+[10:29:21 +9s] snapshot discovered height=30925000
+[10:29:21 +9s] snapshot discovered height=30949000
+[10:29:21 +9s] snapshot discovered height=30947000
+[10:29:21 +9s] snapshot discovered height=30945000
+[10:29:21 +9s] snapshot discovered height=21942000
+[10:29:22 +9s] snapshot discovered height=30943000
+[10:29:22 +9s] snapshot discovered height=30941000
+[10:29:22 +9s] snapshot discovered height=30939000
+[10:29:22 +9s] snapshot discovered height=30937000
+[10:29:22 +9s] snapshot discovered height=30935000
+[10:29:41 +29s] >>> PHASE: State sync located height=30957000
+[10:29:41 +29s] fetching chunk 1/297
+[10:29:41 +29s] fetching chunk 2/297
+[10:29:41 +29s] fetching chunk 3/297
+[10:29:41 +29s] fetching chunk 0/297
+[10:29:44 +31s] fetching chunk 4/297
+[10:29:46 +33s] fetching chunk 5/297
+[10:29:48 +35s] fetching chunk 6/297
+[10:29:50 +37s] fetching chunk 7/297
+[10:29:50 +37s] queued chunk 0/297 (handed to restorer goroutine)
+[10:29:50 +37s] queued chunk 1/297 (handed to restorer goroutine)
+[10:29:50 +37s] queued chunk 2/297 (handed to restorer goroutine)
+[10:29:50 +37s] queued chunk 3/297 (handed to restorer goroutine)
+[10:29:50 +38s] restored chunk 0/297 (drained from chunk channel)
+[10:29:50 +38s] restored chunk 1/297 (drained from chunk channel)
+[10:29:51 +39s] restored chunk 2/297 (drained from chunk channel)
+[10:29:51 +39s] fetching chunk 8/297
+[10:29:52 +39s] queued chunk 4/297 (handed to restorer goroutine)
+[10:29:52 +40s] restored chunk 3/297 (drained from chunk channel)
+[10:29:53 +40s] restored chunk 4/297 (drained from chunk channel)
+[10:29:53 +41s] fetching chunk 9/297
+[10:29:54 +41s] queued chunk 5/297 (handed to restorer goroutine)
+[10:29:54 +42s] restored chunk 5/297 (drained from chunk channel)
+[10:29:55 +43s] fetching chunk 10/297
+[10:29:55 +43s] queued chunk 6/297 (handed to restorer goroutine)
+[10:29:56 +44s] restored chunk 6/297 (drained from chunk channel)
+[10:29:57 +45s] fetching chunk 11/297
+[10:29:57 +45s] queued chunk 7/297 (handed to restorer goroutine)
+[10:29:58 +46s] restored chunk 7/297 (drained from chunk channel)
+[10:29:59 +47s] fetching chunk 12/297
+[10:29:59 +47s] queued chunk 8/297 (handed to restorer goroutine)
+[10:30:00 +48s] restored chunk 8/297 (drained from chunk channel)
+[10:30:01 +49s] fetching chunk 13/297
+[10:30:01 +49s] queued chunk 9/297 (handed to restorer goroutine)
+[10:30:02 +50s] restored chunk 9/297 (drained from chunk channel)
+[10:30:03 +51s] fetching chunk 14/297
+[10:30:03 +51s] queued chunk 10/297 (handed to restorer goroutine)
+[10:30:04 +52s] restored chunk 10/297 (drained from chunk channel)
+[10:30:05 +53s] fetching chunk 15/297
+[10:30:05 +53s] queued chunk 11/297 (handed to restorer goroutine)
+[10:30:06 +53s] restored chunk 11/297 (drained from chunk channel)
+[10:30:07 +55s] fetching chunk 16/297
+[10:30:07 +55s] queued chunk 12/297 (handed to restorer goroutine)
+[10:30:08 +55s] restored chunk 12/297 (drained from chunk channel)
+[10:30:09 +57s] fetching chunk 17/297
+[10:30:09 +57s] queued chunk 13/297 (handed to restorer goroutine)
+[10:30:10 +57s] restored chunk 13/297 (drained from chunk channel)
+[10:30:11 +59s] fetching chunk 18/297
+[10:30:11 +59s] queued chunk 14/297 (handed to restorer goroutine)
+[10:30:12 +59s] restored chunk 14/297 (drained from chunk channel)
+[10:30:13 +1m00s] fetching chunk 19/297
+[10:30:13 +1m01s] queued chunk 15/297 (handed to restorer goroutine)
+[10:30:14 +1m01s] restored chunk 15/297 (drained from chunk channel)
+[10:30:15 +1m02s] fetching chunk 20/297
+[10:30:15 +1m02s] queued chunk 16/297 (handed to restorer goroutine)
+[10:30:16 +1m03s] restored chunk 16/297 (drained from chunk channel)
+[10:30:17 +1m04s] fetching chunk 21/297
+[10:30:17 +1m04s] queued chunk 17/297 (handed to restorer goroutine)
+[10:30:18 +1m05s] restored chunk 17/297 (drained from chunk channel)
+[10:30:19 +1m06s] fetching chunk 22/297
+[10:30:19 +1m06s] queued chunk 18/297 (handed to restorer goroutine)
+[10:30:20 +1m07s] restored chunk 18/297 (drained from chunk channel)
+[10:30:21 +1m08s] fetching chunk 23/297
+[10:30:21 +1m08s] queued chunk 19/297 (handed to restorer goroutine)
+[10:30:21 +1m09s] restored chunk 19/297 (drained from chunk channel)
+[10:30:23 +1m10s] fetching chunk 24/297
+[10:30:23 +1m10s] queued chunk 20/297 (handed to restorer goroutine)
+[10:30:23 +1m11s] snapshot discovered height=20213000
+[10:30:24 +1m11s] restored chunk 20/297 (drained from chunk channel)
+[10:30:25 +1m12s] fetching chunk 25/297
+[10:30:25 +1m12s] queued chunk 21/297 (handed to restorer goroutine)
+[10:30:26 +1m13s] restored chunk 21/297 (drained from chunk channel)
+[10:30:27 +1m14s] fetching chunk 26/297
+[10:30:27 +1m14s] queued chunk 22/297 (handed to restorer goroutine)
+[10:30:27 +1m15s] peers: 16 → 18 connected
+[10:30:27 +1m15s] restored chunk 22/297 (drained from chunk channel)
+[10:30:29 +1m16s] fetching chunk 27/297
+[10:30:29 +1m16s] queued chunk 23/297 (handed to restorer goroutine)
+[10:30:30 +1m17s] restored chunk 23/297 (drained from chunk channel)
+[10:30:31 +1m18s] fetching chunk 28/297
+[10:30:31 +1m18s] queued chunk 24/297 (handed to restorer goroutine)
+[10:30:31 +1m19s] restored chunk 24/297 (drained from chunk channel)
+[10:30:33 +1m20s] fetching chunk 29/297
+[10:30:33 +1m20s] queued chunk 25/297 (handed to restorer goroutine)
+[10:30:34 +1m21s] restored chunk 25/297 (drained from chunk channel)
+[10:30:35 +1m22s] fetching chunk 30/297
+[10:30:35 +1m22s] queued chunk 26/297 (handed to restorer goroutine)
+[10:30:35 +1m23s] restored chunk 26/297 (drained from chunk channel)
+[10:30:37 +1m24s] fetching chunk 31/297
+[10:30:37 +1m24s] queued chunk 27/297 (handed to restorer goroutine)
+[10:30:37 +1m25s] restored chunk 27/297 (drained from chunk channel)
+[10:30:39 +1m26s] fetching chunk 32/297
+[10:30:39 +1m26s] queued chunk 28/297 (handed to restorer goroutine)
+[10:30:39 +1m27s] restored chunk 28/297 (drained from chunk channel)
+[10:30:40 +1m28s] fetching chunk 33/297
+[10:30:41 +1m28s] queued chunk 29/297 (handed to restorer goroutine)
+[10:30:41 +1m28s] restored chunk 29/297 (drained from chunk channel)
+[10:30:42 +1m30s] fetching chunk 34/297
+[10:30:42 +1m30s] queued chunk 30/297 (handed to restorer goroutine)
+[10:30:43 +1m31s] restored chunk 30/297 (drained from chunk channel)
+[10:30:44 +1m32s] fetching chunk 35/297
+[10:30:44 +1m32s] queued chunk 31/297 (handed to restorer goroutine)
+[10:30:45 +1m32s] restored chunk 31/297 (drained from chunk channel)
+[10:30:46 +1m34s] fetching chunk 36/297
+[10:30:46 +1m34s] queued chunk 32/297 (handed to restorer goroutine)
+[10:30:47 +1m34s] restored chunk 32/297 (drained from chunk channel)
+[10:30:48 +1m36s] fetching chunk 37/297
+[10:30:48 +1m36s] queued chunk 33/297 (handed to restorer goroutine)
+[10:30:49 +1m36s] restored chunk 33/297 (drained from chunk channel)
+[10:30:50 +1m38s] fetching chunk 38/297
+[10:30:50 +1m38s] queued chunk 34/297 (handed to restorer goroutine)
+[10:30:51 +1m38s] restored chunk 34/297 (drained from chunk channel)
+[10:30:52 +1m39s] fetching chunk 39/297
+[10:30:52 +1m40s] queued chunk 35/297 (handed to restorer goroutine)
+[10:30:53 +1m40s] restored chunk 35/297 (drained from chunk channel)
+[10:30:54 +1m42s] fetching chunk 40/297
+[10:30:54 +1m42s] queued chunk 36/297 (handed to restorer goroutine)
+[10:30:56 +1m43s] restored chunk 36/297 (drained from chunk channel)
+[10:30:56 +1m43s] fetching chunk 41/297
+[10:30:56 +1m43s] queued chunk 37/297 (handed to restorer goroutine)
+[10:30:58 +1m45s] fetching chunk 42/297
+[10:30:58 +1m45s] queued chunk 38/297 (handed to restorer goroutine)
+[10:30:59 +1m47s] restored chunk 37/297 (drained from chunk channel)
+[10:31:00 +1m48s] fetching chunk 43/297
+[10:31:00 +1m48s] queued chunk 39/297 (handed to restorer goroutine)
+[10:31:02 +1m49s] fetching chunk 44/297
+[10:31:02 +1m49s] queued chunk 40/297 (handed to restorer goroutine)
+[10:31:03 +1m51s] restored chunk 38/297 (drained from chunk channel)
+[10:31:04 +1m51s] fetching chunk 45/297
+[10:31:04 +1m51s] queued chunk 41/297 (handed to restorer goroutine)
+[10:31:04 +1m52s] restored chunk 39/297 (drained from chunk channel)
+[10:31:06 +1m53s] fetching chunk 46/297
+[10:31:06 +1m53s] queued chunk 42/297 (handed to restorer goroutine)
+[10:31:06 +1m54s] restored chunk 40/297 (drained from chunk channel)
+[10:31:08 +1m55s] fetching chunk 47/297
+[10:31:08 +1m55s] queued chunk 43/297 (handed to restorer goroutine)
+[10:31:08 +1m56s] restored chunk 41/297 (drained from chunk channel)
+[10:31:10 +1m57s] fetching chunk 48/297
+[10:31:10 +1m57s] queued chunk 44/297 (handed to restorer goroutine)
+[10:31:12 +1m59s] fetching chunk 49/297
+[10:31:12 +1m59s] queued chunk 45/297 (handed to restorer goroutine)
+[10:31:12 +1m59s] restored chunk 42/297 (drained from chunk channel)
+[10:31:12 +2m00s] peers: 18 → 21 connected
+[10:31:14 +2m01s] fetching chunk 50/297
+[10:31:14 +2m01s] queued chunk 46/297 (handed to restorer goroutine)
+[10:31:15 +2m03s] restored chunk 43/297 (drained from chunk channel)
+[10:31:15 +2m03s] fetching chunk 51/297
+[10:31:15 +2m03s] queued chunk 47/297 (handed to restorer goroutine)
+[10:31:17 +2m05s] fetching chunk 52/297
+[10:31:17 +2m05s] queued chunk 48/297 (handed to restorer goroutine)
+[10:31:19 +2m07s] restored chunk 44/297 (drained from chunk channel)
+[10:31:19 +2m07s] fetching chunk 53/297
+[10:31:19 +2m07s] queued chunk 49/297 (handed to restorer goroutine)
+[10:31:21 +2m09s] fetching chunk 54/297
+[10:31:21 +2m09s] queued chunk 50/297 (handed to restorer goroutine)
+[10:31:23 +2m11s] fetching chunk 55/297
+[10:31:23 +2m11s] queued chunk 51/297 (handed to restorer goroutine)
+[10:31:24 +2m12s] restored chunk 45/297 (drained from chunk channel)
+[10:31:25 +2m13s] fetching chunk 56/297
+[10:31:25 +2m13s] queued chunk 52/297 (handed to restorer goroutine)
+[10:31:27 +2m15s] fetching chunk 57/297
+[10:31:27 +2m15s] queued chunk 53/297 (handed to restorer goroutine)
+[10:31:28 +2m15s] restored chunk 46/297 (drained from chunk channel)
+[10:31:29 +2m17s] fetching chunk 58/297
+[10:31:29 +2m17s] queued chunk 54/297 (handed to restorer goroutine)
+[10:31:31 +2m18s] restored chunk 47/297 (drained from chunk channel)
+[10:31:31 +2m19s] fetching chunk 59/297
+[10:31:31 +2m19s] queued chunk 55/297 (handed to restorer goroutine)
+[10:31:33 +2m21s] fetching chunk 60/297
+[10:31:33 +2m21s] queued chunk 56/297 (handed to restorer goroutine)
+[10:31:35 +2m22s] fetching chunk 61/297
+[10:31:35 +2m23s] queued chunk 57/297 (handed to restorer goroutine)
+[10:31:37 +2m24s] fetching chunk 62/297
+[10:31:37 +2m25s] queued chunk 58/297 (handed to restorer goroutine)
+[10:31:39 +2m26s] fetching chunk 63/297
+[10:31:39 +2m26s] queued chunk 59/297 (handed to restorer goroutine)
+[10:31:41 +2m28s] fetching chunk 64/297
+[10:31:41 +2m28s] queued chunk 60/297 (handed to restorer goroutine)
+[10:31:43 +2m30s] fetching chunk 65/297
+[10:31:43 +2m30s] queued chunk 61/297 (handed to restorer goroutine)
+[10:31:45 +2m32s] fetching chunk 66/297
+[10:31:45 +2m32s] queued chunk 62/297 (handed to restorer goroutine)
+[10:31:47 +2m34s] fetching chunk 67/297
+[10:31:47 +2m34s] queued chunk 63/297 (handed to restorer goroutine)
+[10:31:48 +2m36s] fetching chunk 68/297
+[10:31:48 +2m36s] queued chunk 64/297 (handed to restorer goroutine)
+[10:31:51 +2m38s] fetching chunk 69/297
+[10:31:51 +2m38s] queued chunk 65/297 (handed to restorer goroutine)
+[10:31:53 +2m40s] fetching chunk 70/297
+[10:31:53 +2m40s] queued chunk 66/297 (handed to restorer goroutine)
+[10:31:54 +2m42s] fetching chunk 71/297
+[10:31:55 +2m42s] queued chunk 67/297 (handed to restorer goroutine)
+[10:31:56 +2m44s] fetching chunk 72/297
+[10:31:57 +2m44s] queued chunk 68/297 (handed to restorer goroutine)
+[10:31:58 +2m46s] fetching chunk 73/297
+[10:31:58 +2m46s] queued chunk 69/297 (handed to restorer goroutine)
+[10:32:00 +2m48s] fetching chunk 74/297
+[10:32:00 +2m48s] queued chunk 70/297 (handed to restorer goroutine)
+[10:32:02 +2m50s] fetching chunk 75/297
+[10:32:02 +2m50s] queued chunk 71/297 (handed to restorer goroutine)
+[10:32:04 +2m52s] fetching chunk 76/297
+[10:32:04 +2m52s] queued chunk 72/297 (handed to restorer goroutine)
+[10:32:06 +2m54s] fetching chunk 77/297
+[10:32:06 +2m54s] queued chunk 73/297 (handed to restorer goroutine)
+[10:32:08 +2m56s] fetching chunk 78/297
+[10:32:08 +2m56s] queued chunk 74/297 (handed to restorer goroutine)
+[10:32:10 +2m57s] fetching chunk 79/297
+[10:32:10 +2m57s] queued chunk 75/297 (handed to restorer goroutine)
+[10:32:12 +2m59s] fetching chunk 80/297
+[10:32:12 +2m59s] queued chunk 76/297 (handed to restorer goroutine)
+[10:32:14 +3m01s] fetching chunk 81/297
+[10:32:14 +3m01s] queued chunk 77/297 (handed to restorer goroutine)
+[10:32:16 +3m03s] fetching chunk 82/297
+[10:32:16 +3m03s] queued chunk 78/297 (handed to restorer goroutine)
+[10:32:18 +3m05s] fetching chunk 83/297
+[10:32:18 +3m05s] queued chunk 79/297 (handed to restorer goroutine)
+[10:32:20 +3m07s] fetching chunk 84/297
+[10:32:20 +3m07s] queued chunk 80/297 (handed to restorer goroutine)
+[10:32:22 +3m09s] fetching chunk 85/297
+[10:32:22 +3m09s] queued chunk 81/297 (handed to restorer goroutine)
+[10:32:24 +3m11s] fetching chunk 86/297
+[10:32:24 +3m11s] queued chunk 82/297 (handed to restorer goroutine)
+[10:32:26 +3m13s] fetching chunk 87/297
+[10:32:26 +3m13s] queued chunk 83/297 (handed to restorer goroutine)
+[10:32:28 +3m15s] fetching chunk 88/297
+[10:32:28 +3m15s] queued chunk 84/297 (handed to restorer goroutine)
+[10:32:30 +3m17s] fetching chunk 89/297
+[10:32:30 +3m17s] queued chunk 85/297 (handed to restorer goroutine)
+[10:32:32 +3m19s] fetching chunk 90/297
+[10:32:32 +3m19s] queued chunk 86/297 (handed to restorer goroutine)
+[10:32:33 +3m21s] fetching chunk 91/297
+[10:32:33 +3m21s] queued chunk 87/297 (handed to restorer goroutine)
+[10:32:35 +3m23s] fetching chunk 92/297
+[10:32:35 +3m23s] queued chunk 88/297 (handed to restorer goroutine)
+[10:32:37 +3m25s] fetching chunk 93/297
+[10:32:37 +3m25s] queued chunk 89/297 (handed to restorer goroutine)
+[10:32:39 +3m27s] fetching chunk 94/297
+[10:32:39 +3m27s] queued chunk 90/297 (handed to restorer goroutine)
+[10:32:41 +3m29s] fetching chunk 95/297
+[10:32:41 +3m29s] queued chunk 91/297 (handed to restorer goroutine)
+[10:32:43 +3m31s] fetching chunk 96/297
+[10:32:43 +3m31s] queued chunk 92/297 (handed to restorer goroutine)
+[10:32:45 +3m33s] fetching chunk 97/297
+[10:32:45 +3m33s] queued chunk 93/297 (handed to restorer goroutine)
+[10:32:47 +3m34s] fetching chunk 98/297
+[10:32:47 +3m34s] queued chunk 94/297 (handed to restorer goroutine)
+[10:32:49 +3m36s] fetching chunk 99/297
+[10:32:49 +3m36s] queued chunk 95/297 (handed to restorer goroutine)
+[10:32:51 +3m38s] fetching chunk 100/297
+[10:32:51 +3m38s] queued chunk 96/297 (handed to restorer goroutine)
+[10:32:53 +3m40s] fetching chunk 101/297
+[10:32:53 +3m40s] queued chunk 97/297 (handed to restorer goroutine)
+[10:32:55 +3m42s] fetching chunk 102/297
+[10:32:55 +3m42s] queued chunk 98/297 (handed to restorer goroutine)
+[10:32:57 +3m44s] fetching chunk 103/297
+[10:32:57 +3m44s] queued chunk 99/297 (handed to restorer goroutine)
+[10:32:59 +3m46s] fetching chunk 104/297
+[10:32:59 +3m46s] queued chunk 100/297 (handed to restorer goroutine)
+[10:33:01 +3m48s] fetching chunk 105/297
+[10:33:01 +3m48s] queued chunk 101/297 (handed to restorer goroutine)
+[10:33:03 +3m50s] fetching chunk 106/297
+[10:33:03 +3m50s] queued chunk 102/297 (handed to restorer goroutine)
+[10:33:05 +3m52s] fetching chunk 107/297
+[10:33:05 +3m52s] queued chunk 103/297 (handed to restorer goroutine)
+[10:33:07 +3m54s] fetching chunk 108/297
+[10:33:07 +3m54s] queued chunk 104/297 (handed to restorer goroutine)
+[10:33:08 +3m56s] fetching chunk 109/297
+[10:33:08 +3m56s] queued chunk 105/297 (handed to restorer goroutine)
+[10:33:10 +3m58s] fetching chunk 110/297
+[10:33:10 +3m58s] queued chunk 106/297 (handed to restorer goroutine)
+[10:33:12 +4m00s] fetching chunk 111/297
+[10:33:12 +4m00s] queued chunk 107/297 (handed to restorer goroutine)
+[10:33:14 +4m02s] fetching chunk 112/297
+[10:33:14 +4m02s] queued chunk 108/297 (handed to restorer goroutine)
+[10:33:16 +4m04s] fetching chunk 113/297
+[10:33:16 +4m04s] queued chunk 109/297 (handed to restorer goroutine)
+[10:33:18 +4m06s] fetching chunk 114/297
+[10:33:18 +4m06s] queued chunk 110/297 (handed to restorer goroutine)
+[10:33:20 +4m08s] fetching chunk 115/297
+[10:33:20 +4m08s] queued chunk 111/297 (handed to restorer goroutine)
+[10:33:22 +4m10s] fetching chunk 116/297
+[10:33:22 +4m10s] queued chunk 112/297 (handed to restorer goroutine)
+[10:33:24 +4m12s] fetching chunk 117/297
+[10:33:24 +4m12s] queued chunk 113/297 (handed to restorer goroutine)
+[10:33:26 +4m14s] fetching chunk 118/297
+[10:33:26 +4m14s] queued chunk 114/297 (handed to restorer goroutine)
+[10:33:28 +4m16s] fetching chunk 119/297
+[10:33:28 +4m16s] queued chunk 115/297 (handed to restorer goroutine)
+[10:33:30 +4m18s] fetching chunk 120/297
+[10:33:30 +4m18s] queued chunk 116/297 (handed to restorer goroutine)
+[10:33:32 +4m19s] fetching chunk 121/297
+[10:33:32 +4m19s] queued chunk 117/297 (handed to restorer goroutine)
+[10:33:34 +4m21s] fetching chunk 122/297
+[10:33:34 +4m21s] queued chunk 118/297 (handed to restorer goroutine)
+[10:33:36 +4m23s] fetching chunk 123/297
+[10:33:36 +4m23s] queued chunk 119/297 (handed to restorer goroutine)
+[10:33:38 +4m25s] fetching chunk 124/297
+[10:33:38 +4m25s] queued chunk 120/297 (handed to restorer goroutine)
+[10:33:40 +4m27s] fetching chunk 125/297
+[10:33:40 +4m27s] queued chunk 121/297 (handed to restorer goroutine)
+[10:33:42 +4m29s] fetching chunk 126/297
+[10:33:42 +4m29s] queued chunk 122/297 (handed to restorer goroutine)
+[10:33:44 +4m31s] fetching chunk 127/297
+[10:33:44 +4m31s] queued chunk 123/297 (handed to restorer goroutine)
+[10:33:45 +4m33s] fetching chunk 128/297
+[10:33:45 +4m33s] queued chunk 124/297 (handed to restorer goroutine)
+[10:33:47 +4m35s] fetching chunk 129/297
+[10:33:47 +4m35s] queued chunk 125/297 (handed to restorer goroutine)
+[10:33:49 +4m37s] fetching chunk 130/297
+[10:33:49 +4m37s] queued chunk 126/297 (handed to restorer goroutine)
+[10:33:51 +4m39s] fetching chunk 131/297
+[10:33:51 +4m39s] queued chunk 127/297 (handed to restorer goroutine)
+[10:33:53 +4m41s] fetching chunk 132/297
+[10:33:53 +4m41s] queued chunk 128/297 (handed to restorer goroutine)
+[10:33:55 +4m43s] fetching chunk 133/297
+[10:33:55 +4m43s] queued chunk 129/297 (handed to restorer goroutine)
+[10:33:57 +4m45s] fetching chunk 134/297
+[10:33:57 +4m45s] queued chunk 130/297 (handed to restorer goroutine)
+[10:33:59 +4m47s] fetching chunk 135/297
+[10:33:59 +4m47s] queued chunk 131/297 (handed to restorer goroutine)
+[10:34:01 +4m49s] fetching chunk 136/297
+[10:34:01 +4m49s] queued chunk 132/297 (handed to restorer goroutine)
+[10:34:03 +4m51s] fetching chunk 137/297
+[10:34:03 +4m51s] queued chunk 133/297 (handed to restorer goroutine)
+[10:34:05 +4m53s] fetching chunk 138/297
+[10:34:05 +4m53s] queued chunk 134/297 (handed to restorer goroutine)
+[10:34:07 +4m54s] fetching chunk 139/297
+[10:34:07 +4m55s] queued chunk 135/297 (handed to restorer goroutine)
+[10:34:09 +4m56s] fetching chunk 140/297
+[10:34:09 +4m56s] queued chunk 136/297 (handed to restorer goroutine)
+[10:34:11 +4m58s] fetching chunk 141/297
+[10:34:11 +4m58s] queued chunk 137/297 (handed to restorer goroutine)
+[10:34:13 +5m00s] fetching chunk 142/297
+[10:34:13 +5m00s] queued chunk 138/297 (handed to restorer goroutine)
+[10:34:15 +5m02s] fetching chunk 143/297
+[10:34:15 +5m02s] queued chunk 139/297 (handed to restorer goroutine)
+[10:34:17 +5m04s] fetching chunk 144/297
+[10:34:17 +5m04s] queued chunk 140/297 (handed to restorer goroutine)
+[10:34:19 +5m06s] snapshot discovered height=24386000
+[10:34:19 +5m06s] snapshot discovered height=24384000
+[10:34:19 +5m06s] snapshot discovered height=24382000
+[10:34:19 +5m06s] snapshot discovered height=24380000
+[10:34:19 +5m06s] fetching chunk 145/297
+[10:34:19 +5m06s] queued chunk 141/297 (handed to restorer goroutine)
+[10:34:19 +5m06s] snapshot discovered height=24378000
+[10:34:21 +5m08s] fetching chunk 146/297
+[10:34:21 +5m08s] queued chunk 142/297 (handed to restorer goroutine)
+[10:34:23 +5m10s] fetching chunk 147/297
+[10:34:23 +5m10s] queued chunk 143/297 (handed to restorer goroutine)
+[10:34:25 +5m12s] fetching chunk 148/297
+[10:34:25 +5m12s] queued chunk 144/297 (handed to restorer goroutine)
+[10:34:27 +5m14s] fetching chunk 149/297
+[10:34:27 +5m14s] queued chunk 145/297 (handed to restorer goroutine)
+[10:34:27 +5m15s] peers: 21 → 22 connected
+[10:34:29 +5m16s] fetching chunk 150/297
+[10:34:29 +5m16s] queued chunk 146/297 (handed to restorer goroutine)
+[10:34:30 +5m18s] fetching chunk 151/297
+[10:34:30 +5m18s] queued chunk 147/297 (handed to restorer goroutine)
+[10:34:32 +5m20s] fetching chunk 152/297
+[10:34:32 +5m20s] queued chunk 148/297 (handed to restorer goroutine)
+[10:34:34 +5m22s] fetching chunk 153/297
+[10:34:34 +5m22s] queued chunk 149/297 (handed to restorer goroutine)
+[10:34:36 +5m24s] fetching chunk 154/297
+[10:34:36 +5m24s] queued chunk 150/297 (handed to restorer goroutine)
+[10:34:38 +5m26s] fetching chunk 155/297
+[10:34:38 +5m26s] queued chunk 151/297 (handed to restorer goroutine)
+[10:34:40 +5m28s] fetching chunk 156/297
+[10:34:40 +5m28s] queued chunk 152/297 (handed to restorer goroutine)
+[10:34:42 +5m30s] fetching chunk 157/297
+[10:34:42 +5m30s] queued chunk 153/297 (handed to restorer goroutine)
+[10:34:44 +5m31s] fetching chunk 158/297
+[10:34:44 +5m31s] queued chunk 154/297 (handed to restorer goroutine)
+[10:34:46 +5m33s] fetching chunk 159/297
+[10:34:46 +5m33s] queued chunk 155/297 (handed to restorer goroutine)
+[10:34:48 +5m35s] fetching chunk 160/297
+[10:34:48 +5m35s] queued chunk 156/297 (handed to restorer goroutine)
+[10:34:50 +5m37s] fetching chunk 161/297
+[10:34:50 +5m37s] queued chunk 157/297 (handed to restorer goroutine)
+[10:34:52 +5m39s] fetching chunk 162/297
+[10:34:52 +5m39s] queued chunk 158/297 (handed to restorer goroutine)
+[10:34:54 +5m41s] fetching chunk 163/297
+[10:34:54 +5m41s] queued chunk 159/297 (handed to restorer goroutine)
+[10:34:56 +5m43s] fetching chunk 164/297
+[10:34:56 +5m43s] queued chunk 160/297 (handed to restorer goroutine)
+[10:34:58 +5m45s] fetching chunk 165/297
+[10:34:58 +5m45s] queued chunk 161/297 (handed to restorer goroutine)
+[10:35:00 +5m47s] fetching chunk 166/297
+[10:35:00 +5m47s] queued chunk 162/297 (handed to restorer goroutine)
+[10:35:02 +5m49s] fetching chunk 167/297
+[10:35:02 +5m49s] queued chunk 163/297 (handed to restorer goroutine)
+[10:35:03 +5m51s] fetching chunk 168/297
+[10:35:03 +5m51s] queued chunk 164/297 (handed to restorer goroutine)
+[10:35:05 +5m53s] fetching chunk 169/297
+[10:35:05 +5m53s] queued chunk 165/297 (handed to restorer goroutine)
+[10:35:07 +5m55s] fetching chunk 170/297
+[10:35:07 +5m55s] queued chunk 166/297 (handed to restorer goroutine)
+[10:35:09 +5m57s] fetching chunk 171/297
+[10:35:09 +5m57s] queued chunk 167/297 (handed to restorer goroutine)
+[10:35:11 +5m59s] fetching chunk 172/297
+[10:35:11 +5m59s] queued chunk 168/297 (handed to restorer goroutine)
+[10:35:13 +6m01s] fetching chunk 173/297
+[10:35:13 +6m01s] queued chunk 169/297 (handed to restorer goroutine)
+[10:35:15 +6m03s] fetching chunk 174/297
+[10:35:15 +6m03s] queued chunk 170/297 (handed to restorer goroutine)
+[10:35:17 +6m05s] fetching chunk 175/297
+[10:35:17 +6m05s] queued chunk 171/297 (handed to restorer goroutine)
+[10:35:19 +6m07s] fetching chunk 176/297
+[10:35:19 +6m07s] queued chunk 172/297 (handed to restorer goroutine)
+[10:35:21 +6m09s] fetching chunk 177/297
+[10:35:21 +6m09s] queued chunk 173/297 (handed to restorer goroutine)
+[10:35:23 +6m11s] fetching chunk 178/297
+[10:35:23 +6m11s] queued chunk 174/297 (handed to restorer goroutine)
+[10:35:25 +6m12s] fetching chunk 179/297
+[10:35:25 +6m12s] queued chunk 175/297 (handed to restorer goroutine)
+[10:35:27 +6m14s] fetching chunk 180/297
+[10:35:27 +6m14s] queued chunk 176/297 (handed to restorer goroutine)
+[10:35:29 +6m16s] fetching chunk 181/297
+[10:35:29 +6m16s] queued chunk 177/297 (handed to restorer goroutine)
+[10:35:31 +6m18s] fetching chunk 182/297
+[10:35:31 +6m18s] queued chunk 178/297 (handed to restorer goroutine)
+[10:35:33 +6m20s] fetching chunk 183/297
+[10:35:33 +6m20s] queued chunk 179/297 (handed to restorer goroutine)
+[10:35:35 +6m22s] fetching chunk 184/297
+[10:35:35 +6m22s] queued chunk 180/297 (handed to restorer goroutine)
+[10:35:37 +6m24s] fetching chunk 185/297
+[10:35:37 +6m24s] queued chunk 181/297 (handed to restorer goroutine)
+[10:35:38 +6m26s] fetching chunk 186/297
+[10:35:39 +6m26s] queued chunk 182/297 (handed to restorer goroutine)
+[10:35:40 +6m28s] fetching chunk 187/297
+[10:35:41 +6m28s] queued chunk 183/297 (handed to restorer goroutine)
+[10:35:42 +6m30s] fetching chunk 188/297
+[10:35:42 +6m30s] queued chunk 184/297 (handed to restorer goroutine)
+[10:35:44 +6m32s] fetching chunk 189/297
+[10:35:44 +6m32s] queued chunk 185/297 (handed to restorer goroutine)
+[10:35:46 +6m34s] fetching chunk 190/297
+[10:35:46 +6m34s] queued chunk 186/297 (handed to restorer goroutine)
+[10:35:48 +6m36s] fetching chunk 191/297
+[10:35:48 +6m36s] queued chunk 187/297 (handed to restorer goroutine)
+[10:35:50 +6m38s] fetching chunk 192/297
+[10:35:50 +6m38s] queued chunk 188/297 (handed to restorer goroutine)
+[10:35:52 +6m40s] fetching chunk 193/297
+[10:35:52 +6m40s] queued chunk 189/297 (handed to restorer goroutine)
+[10:35:54 +6m42s] fetching chunk 194/297
+[10:35:54 +6m42s] queued chunk 190/297 (handed to restorer goroutine)
+[10:35:56 +6m44s] fetching chunk 195/297
+[10:35:56 +6m44s] queued chunk 191/297 (handed to restorer goroutine)
+[10:35:58 +6m46s] fetching chunk 196/297
+[10:35:58 +6m46s] queued chunk 192/297 (handed to restorer goroutine)
+[10:36:00 +6m48s] fetching chunk 197/297
+[10:36:00 +6m48s] queued chunk 193/297 (handed to restorer goroutine)
+[10:36:02 +6m49s] fetching chunk 198/297
+[10:36:02 +6m49s] queued chunk 194/297 (handed to restorer goroutine)
+[10:36:04 +6m51s] fetching chunk 199/297
+[10:36:04 +6m51s] queued chunk 195/297 (handed to restorer goroutine)
+[10:36:06 +6m53s] fetching chunk 200/297
+[10:36:06 +6m53s] queued chunk 196/297 (handed to restorer goroutine)
+[10:36:08 +6m55s] fetching chunk 201/297
+[10:36:08 +6m55s] queued chunk 197/297 (handed to restorer goroutine)
+[10:36:10 +6m57s] fetching chunk 202/297
+[10:36:10 +6m57s] queued chunk 198/297 (handed to restorer goroutine)
+[10:36:12 +6m59s] fetching chunk 203/297
+[10:36:12 +6m59s] queued chunk 199/297 (handed to restorer goroutine)
+[10:36:14 +7m01s] fetching chunk 204/297
+[10:36:14 +7m01s] queued chunk 200/297 (handed to restorer goroutine)
+[10:36:16 +7m03s] fetching chunk 205/297
+[10:36:16 +7m03s] queued chunk 201/297 (handed to restorer goroutine)
+[10:36:18 +7m05s] fetching chunk 206/297
+[10:36:18 +7m05s] queued chunk 202/297 (handed to restorer goroutine)
+[10:36:20 +7m07s] fetching chunk 207/297
+[10:36:20 +7m07s] queued chunk 203/297 (handed to restorer goroutine)
+[10:36:21 +7m09s] fetching chunk 208/297
+[10:36:21 +7m09s] queued chunk 204/297 (handed to restorer goroutine)
+[10:36:23 +7m11s] fetching chunk 209/297
+[10:36:23 +7m11s] queued chunk 205/297 (handed to restorer goroutine)
+[10:36:25 +7m13s] fetching chunk 210/297
+[10:36:25 +7m13s] queued chunk 206/297 (handed to restorer goroutine)
+[10:36:27 +7m15s] fetching chunk 211/297
+[10:36:27 +7m15s] queued chunk 207/297 (handed to restorer goroutine)
+[10:36:29 +7m17s] fetching chunk 212/297
+[10:36:29 +7m17s] queued chunk 208/297 (handed to restorer goroutine)
+[10:36:31 +7m19s] fetching chunk 213/297
+[10:36:31 +7m19s] queued chunk 209/297 (handed to restorer goroutine)
+[10:36:33 +7m20s] fetching chunk 214/297
+[10:36:33 +7m21s] queued chunk 210/297 (handed to restorer goroutine)
+[10:36:35 +7m23s] fetching chunk 215/297
+[10:36:35 +7m23s] queued chunk 211/297 (handed to restorer goroutine)
+[10:36:37 +7m24s] fetching chunk 216/297
+[10:36:37 +7m24s] queued chunk 212/297 (handed to restorer goroutine)
+[10:36:39 +7m26s] fetching chunk 217/297
+[10:36:39 +7m26s] queued chunk 213/297 (handed to restorer goroutine)
+[10:36:41 +7m28s] fetching chunk 218/297
+[10:36:41 +7m28s] queued chunk 214/297 (handed to restorer goroutine)
+[10:36:43 +7m30s] fetching chunk 219/297
+[10:36:43 +7m30s] queued chunk 215/297 (handed to restorer goroutine)
+[10:36:45 +7m32s] fetching chunk 220/297
+[10:36:45 +7m32s] queued chunk 216/297 (handed to restorer goroutine)
+[10:36:47 +7m34s] fetching chunk 221/297
+[10:36:47 +7m34s] queued chunk 217/297 (handed to restorer goroutine)
+[10:36:49 +7m36s] fetching chunk 222/297
+[10:36:49 +7m36s] queued chunk 218/297 (handed to restorer goroutine)
+[10:36:51 +7m38s] fetching chunk 223/297
+[10:36:51 +7m38s] queued chunk 219/297 (handed to restorer goroutine)
+[10:36:53 +7m40s] fetching chunk 224/297
+[10:36:53 +7m40s] queued chunk 220/297 (handed to restorer goroutine)
+[10:36:55 +7m42s] fetching chunk 225/297
+[10:36:55 +7m42s] queued chunk 221/297 (handed to restorer goroutine)
+[10:36:56 +7m44s] fetching chunk 226/297
+[10:36:56 +7m44s] queued chunk 222/297 (handed to restorer goroutine)
+[10:36:57 +7m45s] peers: 22 → 23 connected
+[10:36:58 +7m46s] fetching chunk 227/297
+[10:36:58 +7m46s] queued chunk 223/297 (handed to restorer goroutine)
+[10:37:00 +7m48s] fetching chunk 228/297
+[10:37:00 +7m48s] queued chunk 224/297 (handed to restorer goroutine)
+[10:37:02 +7m50s] fetching chunk 229/297
+[10:37:02 +7m50s] queued chunk 225/297 (handed to restorer goroutine)
+[10:37:04 +7m52s] fetching chunk 230/297
+[10:37:04 +7m52s] queued chunk 226/297 (handed to restorer goroutine)
+[10:37:06 +7m54s] fetching chunk 231/297
+[10:37:06 +7m54s] queued chunk 227/297 (handed to restorer goroutine)
+[10:37:08 +7m56s] fetching chunk 232/297
+[10:37:08 +7m56s] queued chunk 228/297 (handed to restorer goroutine)
+[10:37:10 +7m58s] fetching chunk 233/297
+[10:37:10 +7m58s] queued chunk 229/297 (handed to restorer goroutine)
+[10:37:12 +8m00s] fetching chunk 234/297
+[10:37:12 +8m00s] queued chunk 230/297 (handed to restorer goroutine)
+[10:37:14 +8m02s] fetching chunk 235/297
+[10:37:14 +8m02s] queued chunk 231/297 (handed to restorer goroutine)
+[10:37:16 +8m04s] fetching chunk 236/297
+[10:37:16 +8m04s] queued chunk 232/297 (handed to restorer goroutine)
+[10:37:18 +8m06s] fetching chunk 237/297
+[10:37:18 +8m06s] queued chunk 233/297 (handed to restorer goroutine)
+[10:37:20 +8m08s] fetching chunk 238/297
+[10:37:20 +8m08s] queued chunk 234/297 (handed to restorer goroutine)
+[10:37:22 +8m09s] fetching chunk 239/297
+[10:37:22 +8m09s] queued chunk 235/297 (handed to restorer goroutine)
+[10:37:24 +8m11s] fetching chunk 240/297
+[10:37:24 +8m11s] queued chunk 236/297 (handed to restorer goroutine)
+[10:37:26 +8m13s] fetching chunk 241/297
+[10:37:26 +8m13s] queued chunk 237/297 (handed to restorer goroutine)
+[10:37:28 +8m15s] fetching chunk 242/297
+[10:37:28 +8m15s] queued chunk 238/297 (handed to restorer goroutine)
+[10:37:30 +8m17s] fetching chunk 243/297
+[10:37:30 +8m17s] queued chunk 239/297 (handed to restorer goroutine)
+[10:37:32 +8m19s] fetching chunk 244/297
+[10:37:32 +8m19s] queued chunk 240/297 (handed to restorer goroutine)
+[10:37:34 +8m21s] fetching chunk 245/297
+[10:37:34 +8m21s] queued chunk 241/297 (handed to restorer goroutine)
+[10:37:35 +8m23s] fetching chunk 246/297
+[10:37:35 +8m23s] queued chunk 242/297 (handed to restorer goroutine)
+[10:37:37 +8m25s] fetching chunk 247/297
+[10:37:38 +8m25s] queued chunk 243/297 (handed to restorer goroutine)
+[10:37:39 +8m27s] fetching chunk 248/297
+[10:37:39 +8m27s] queued chunk 244/297 (handed to restorer goroutine)
+[10:37:41 +8m29s] fetching chunk 249/297
+[10:37:41 +8m29s] queued chunk 245/297 (handed to restorer goroutine)
+[10:37:43 +8m31s] fetching chunk 250/297
+[10:37:43 +8m31s] queued chunk 246/297 (handed to restorer goroutine)
+[10:37:45 +8m33s] fetching chunk 251/297
+[10:37:45 +8m33s] queued chunk 247/297 (handed to restorer goroutine)
+[10:37:47 +8m35s] fetching chunk 252/297
+[10:37:47 +8m35s] queued chunk 248/297 (handed to restorer goroutine)
+[10:37:49 +8m37s] fetching chunk 253/297
+[10:37:49 +8m37s] queued chunk 249/297 (handed to restorer goroutine)
+[10:37:51 +8m39s] fetching chunk 254/297
+[10:37:51 +8m39s] queued chunk 250/297 (handed to restorer goroutine)
+[10:37:53 +8m41s] fetching chunk 255/297
+[10:37:53 +8m41s] queued chunk 251/297 (handed to restorer goroutine)
+[10:37:55 +8m43s] fetching chunk 256/297
+[10:37:55 +8m43s] queued chunk 252/297 (handed to restorer goroutine)
+[10:37:57 +8m44s] fetching chunk 257/297
+[10:37:57 +8m45s] queued chunk 253/297 (handed to restorer goroutine)
+[10:37:59 +8m46s] fetching chunk 258/297
+[10:37:59 +8m46s] queued chunk 254/297 (handed to restorer goroutine)
+[10:38:01 +8m48s] fetching chunk 259/297
+[10:38:01 +8m48s] queued chunk 255/297 (handed to restorer goroutine)
+[10:38:03 +8m50s] fetching chunk 260/297
+[10:38:03 +8m50s] queued chunk 256/297 (handed to restorer goroutine)
+[10:38:05 +8m52s] fetching chunk 261/297
+[10:38:05 +8m52s] queued chunk 257/297 (handed to restorer goroutine)
+[10:38:07 +8m54s] fetching chunk 262/297
+[10:38:07 +8m54s] queued chunk 258/297 (handed to restorer goroutine)
+[10:38:09 +8m56s] fetching chunk 263/297
+[10:38:09 +8m56s] queued chunk 259/297 (handed to restorer goroutine)
+[10:38:11 +8m58s] fetching chunk 264/297
+[10:38:11 +8m58s] queued chunk 260/297 (handed to restorer goroutine)
+[10:38:13 +9m00s] fetching chunk 265/297
+[10:38:13 +9m00s] queued chunk 261/297 (handed to restorer goroutine)
+[10:38:15 +9m02s] fetching chunk 266/297
+[10:38:15 +9m02s] queued chunk 262/297 (handed to restorer goroutine)
+[10:38:17 +9m04s] fetching chunk 267/297
+[10:38:17 +9m04s] queued chunk 263/297 (handed to restorer goroutine)
+[10:38:18 +9m06s] fetching chunk 268/297
+[10:38:18 +9m06s] queued chunk 264/297 (handed to restorer goroutine)
+[10:38:20 +9m08s] fetching chunk 269/297
+[10:38:20 +9m08s] queued chunk 265/297 (handed to restorer goroutine)
+[10:38:22 +9m09s] restored chunk 48/297 (drained from chunk channel)
+[10:38:22 +9m10s] fetching chunk 270/297
+[10:38:23 +9m10s] queued chunk 266/297 (handed to restorer goroutine)
+[10:38:24 +9m12s] fetching chunk 271/297
+[10:38:24 +9m12s] queued chunk 267/297 (handed to restorer goroutine)
+[10:38:25 +9m12s] restored chunk 49/297 (drained from chunk channel)
+[10:38:26 +9m14s] fetching chunk 272/297
+[10:38:26 +9m14s] queued chunk 268/297 (handed to restorer goroutine)
+[10:38:28 +9m16s] fetching chunk 273/297
+[10:38:28 +9m16s] queued chunk 269/297 (handed to restorer goroutine)
+[10:38:29 +9m16s] restored chunk 50/297 (drained from chunk channel)
+[10:38:30 +9m18s] fetching chunk 274/297
+[10:38:30 +9m18s] queued chunk 270/297 (handed to restorer goroutine)
+[10:38:32 +9m20s] fetching chunk 275/297
+[10:38:32 +9m20s] queued chunk 271/297 (handed to restorer goroutine)
+[10:38:33 +9m20s] restored chunk 51/297 (drained from chunk channel)
+[10:38:34 +9m21s] fetching chunk 276/297
+[10:38:34 +9m21s] queued chunk 272/297 (handed to restorer goroutine)
+[10:38:36 +9m23s] fetching chunk 277/297
+[10:38:36 +9m23s] queued chunk 273/297 (handed to restorer goroutine)
+[10:38:38 +9m25s] restored chunk 52/297 (drained from chunk channel)
+[10:38:38 +9m25s] fetching chunk 278/297
+[10:38:38 +9m25s] queued chunk 274/297 (handed to restorer goroutine)
+[10:38:40 +9m27s] fetching chunk 279/297
+[10:38:40 +9m27s] queued chunk 275/297 (handed to restorer goroutine)
+[10:38:42 +9m29s] fetching chunk 280/297
+[10:38:42 +9m29s] queued chunk 276/297 (handed to restorer goroutine)
+[10:38:43 +9m30s] restored chunk 53/297 (drained from chunk channel)
+[10:38:44 +9m31s] fetching chunk 281/297
+[10:38:44 +9m31s] queued chunk 277/297 (handed to restorer goroutine)
+[10:38:46 +9m33s] fetching chunk 282/297
+[10:38:46 +9m33s] queued chunk 278/297 (handed to restorer goroutine)
+[10:38:47 +9m35s] restored chunk 54/297 (drained from chunk channel)
+[10:38:48 +9m35s] fetching chunk 283/297
+[10:38:48 +9m35s] queued chunk 279/297 (handed to restorer goroutine)
+[10:38:50 +9m37s] fetching chunk 284/297
+[10:38:50 +9m37s] queued chunk 280/297 (handed to restorer goroutine)
+[10:38:52 +9m39s] fetching chunk 285/297
+[10:38:52 +9m39s] queued chunk 281/297 (handed to restorer goroutine)
+[10:38:54 +9m41s] fetching chunk 286/297
+[10:38:54 +9m41s] queued chunk 282/297 (handed to restorer goroutine)
+[10:38:54 +9m42s] restored chunk 55/297 (drained from chunk channel)
+[10:38:55 +9m43s] fetching chunk 287/297
+[10:38:55 +9m43s] queued chunk 283/297 (handed to restorer goroutine)
+[10:38:57 +9m45s] fetching chunk 288/297
+[10:38:57 +9m45s] queued chunk 284/297 (handed to restorer goroutine)
+[10:38:59 +9m47s] fetching chunk 289/297
+[10:38:59 +9m47s] queued chunk 285/297 (handed to restorer goroutine)
+[10:39:01 +9m49s] fetching chunk 290/297
+[10:39:01 +9m49s] queued chunk 286/297 (handed to restorer goroutine)
+[10:39:02 +9m49s] restored chunk 56/297 (drained from chunk channel)
+[10:39:03 +9m51s] fetching chunk 291/297
+[10:39:03 +9m51s] queued chunk 287/297 (handed to restorer goroutine)
+[10:39:05 +9m53s] fetching chunk 292/297
+[10:39:05 +9m53s] queued chunk 288/297 (handed to restorer goroutine)
+[10:39:07 +9m54s] restored chunk 57/297 (drained from chunk channel)
+[10:39:07 +9m55s] fetching chunk 293/297
+[10:39:07 +9m55s] queued chunk 289/297 (handed to restorer goroutine)
+[10:39:09 +9m57s] fetching chunk 294/297
+[10:39:09 +9m57s] queued chunk 290/297 (handed to restorer goroutine)
+[10:39:11 +9m59s] fetching chunk 295/297
+[10:39:11 +9m59s] queued chunk 291/297 (handed to restorer goroutine)
+[10:39:13 +10m01s] fetching chunk 296/297
+[10:39:13 +10m01s] queued chunk 292/297 (handed to restorer goroutine)
+[10:39:13 +10m01s] restored chunk 58/297 (drained from chunk channel)
+[10:39:15 +10m02s] queued chunk 293/297 (handed to restorer goroutine)
+[10:39:17 +10m04s] queued chunk 294/297 (handed to restorer goroutine)
+[10:39:19 +10m06s] queued chunk 295/297 (handed to restorer goroutine)
+[10:39:19 +10m07s] restored chunk 59/297 (drained from chunk channel)
+[10:39:25 +10m13s] restored chunk 60/297 (drained from chunk channel)
+[10:39:32 +10m20s] restored chunk 61/297 (drained from chunk channel)
+[10:39:40 +10m27s] restored chunk 62/297 (drained from chunk channel)
+[10:39:47 +10m34s] restored chunk 63/297 (drained from chunk channel)
+[10:39:53 +10m41s] restored chunk 64/297 (drained from chunk channel)
+[10:40:00 +10m47s] restored chunk 65/297 (drained from chunk channel)
+[10:40:05 +10m52s] restored chunk 66/297 (drained from chunk channel)
+[10:40:12 +10m59s] restored chunk 67/297 (drained from chunk channel)
+[10:40:12 +11m00s] peers: 23 → 22 connected
+[10:40:16 +11m04s] restored chunk 68/297 (drained from chunk channel)
+[10:40:23 +11m10s] restored chunk 69/297 (drained from chunk channel)
+[10:40:27 +11m15s] peers: 22 → 23 connected
+[10:40:29 +11m16s] restored chunk 70/297 (drained from chunk channel)
+[10:40:34 +11m21s] restored chunk 71/297 (drained from chunk channel)
+[10:40:40 +11m27s] restored chunk 72/297 (drained from chunk channel)
+[10:40:45 +11m33s] restored chunk 73/297 (drained from chunk channel)
+[10:40:52 +11m39s] restored chunk 74/297 (drained from chunk channel)
+[10:40:58 +11m46s] restored chunk 75/297 (drained from chunk channel)
+[10:41:05 +11m52s] restored chunk 76/297 (drained from chunk channel)
+[10:41:11 +11m58s] restored chunk 77/297 (drained from chunk channel)
+[10:41:16 +12m03s] restored chunk 78/297 (drained from chunk channel)
+[10:41:22 +12m10s] restored chunk 79/297 (drained from chunk channel)
+[10:41:27 +12m15s] restored chunk 80/297 (drained from chunk channel)
+[10:41:33 +12m20s] restored chunk 81/297 (drained from chunk channel)
+[10:41:39 +12m27s] restored chunk 82/297 (drained from chunk channel)
+[10:41:44 +12m31s] restored chunk 83/297 (drained from chunk channel)
+[10:41:47 +12m35s] restored chunk 84/297 (drained from chunk channel)
+[10:41:51 +12m39s] restored chunk 85/297 (drained from chunk channel)
+[10:41:55 +12m43s] restored chunk 86/297 (drained from chunk channel)
+[10:42:00 +12m48s] restored chunk 87/297 (drained from chunk channel)
+[10:42:04 +12m52s] restored chunk 88/297 (drained from chunk channel)
+[10:42:09 +12m56s] restored chunk 89/297 (drained from chunk channel)
+[10:42:13 +13m01s] restored chunk 90/297 (drained from chunk channel)
+[10:42:17 +13m05s] restored chunk 91/297 (drained from chunk channel)
+[10:42:21 +13m09s] restored chunk 92/297 (drained from chunk channel)
+[10:42:25 +13m12s] restored chunk 93/297 (drained from chunk channel)
+[10:42:28 +13m16s] restored chunk 94/297 (drained from chunk channel)
+[10:42:32 +13m19s] restored chunk 95/297 (drained from chunk channel)
+[10:42:37 +13m24s] restored chunk 96/297 (drained from chunk channel)
+[10:42:41 +13m28s] restored chunk 97/297 (drained from chunk channel)
+[10:42:46 +13m33s] restored chunk 98/297 (drained from chunk channel)
+[10:42:50 +13m37s] restored chunk 99/297 (drained from chunk channel)
+[10:42:54 +13m41s] restored chunk 100/297 (drained from chunk channel)
+[10:42:58 +13m46s] restored chunk 101/297 (drained from chunk channel)
+[10:43:03 +13m50s] restored chunk 102/297 (drained from chunk channel)
+[10:43:07 +13m55s] restored chunk 103/297 (drained from chunk channel)
+[10:43:11 +13m59s] restored chunk 104/297 (drained from chunk channel)
+[10:43:15 +14m03s] restored chunk 105/297 (drained from chunk channel)
+[10:43:18 +14m06s] restored chunk 106/297 (drained from chunk channel)
+[10:43:22 +14m09s] restored chunk 107/297 (drained from chunk channel)
+[10:43:27 +14m14s] restored chunk 108/297 (drained from chunk channel)
+[10:43:30 +14m17s] restored chunk 109/297 (drained from chunk channel)
+[10:43:33 +14m21s] restored chunk 110/297 (drained from chunk channel)
+[10:43:37 +14m25s] restored chunk 111/297 (drained from chunk channel)
+[10:43:43 +14m31s] restored chunk 112/297 (drained from chunk channel)
+[10:43:48 +14m36s] restored chunk 113/297 (drained from chunk channel)
+[10:43:53 +14m40s] restored chunk 114/297 (drained from chunk channel)
+[10:43:57 +14m44s] restored chunk 115/297 (drained from chunk channel)
+[10:44:02 +14m49s] restored chunk 116/297 (drained from chunk channel)
+[10:44:04 +14m52s] restored chunk 117/297 (drained from chunk channel)
+[10:44:07 +14m54s] restored chunk 118/297 (drained from chunk channel)
+[10:44:11 +14m58s] restored chunk 119/297 (drained from chunk channel)
+[10:44:14 +15m01s] restored chunk 120/297 (drained from chunk channel)
+[10:44:17 +15m04s] restored chunk 121/297 (drained from chunk channel)
+[10:44:20 +15m07s] restored chunk 122/297 (drained from chunk channel)
+[10:44:24 +15m11s] restored chunk 123/297 (drained from chunk channel)
+[10:50:12 +21m00s] peers: 23 → 22 connected
+[10:50:27 +21m15s] peers: 22 → 23 connected
+[10:51:12 +22m00s] peers: 23 → 24 connected
+[11:00:12 +31m00s] peers: 24 → 23 connected
+[11:00:27 +31m15s] peers: 23 → 24 connected
+[11:03:27 +34m15s] peers: 24 → 23 connected
+[11:04:57 +35m45s] peers: 23 → 24 connected
+[11:06:27 +37m15s] peers: 24 → 23 connected
+[11:10:12 +41m00s] peers: 23 → 22 connected
+[11:10:27 +41m15s] peers: 22 → 23 connected
+[11:11:18 +42m06s] snapshot discovered height=30944000
+[11:11:27 +42m15s] peers: 23 → 24 connected
+[11:16:27 +47m15s] peers: 24 → 25 connected
+[11:17:27 +48m15s] peers: 25 → 24 connected
+[11:20:12 +51m00s] peers: 24 → 23 connected
+[11:20:27 +51m15s] peers: 23 → 24 connected
+[11:20:30 +51m18s] restored chunk 124/297 (drained from chunk channel)
+[11:20:31 +51m19s] restored chunk 125/297 (drained from chunk channel)
+[11:20:33 +51m21s] restored chunk 126/297 (drained from chunk channel)
+[11:20:36 +51m23s] restored chunk 127/297 (drained from chunk channel)
+[11:20:39 +51m26s] restored chunk 128/297 (drained from chunk channel)
+[11:20:41 +51m29s] restored chunk 129/297 (drained from chunk channel)
+[11:20:44 +51m31s] restored chunk 130/297 (drained from chunk channel)
+[11:20:46 +51m34s] restored chunk 131/297 (drained from chunk channel)
+[11:20:48 +51m35s] restored chunk 132/297 (drained from chunk channel)
+[11:20:50 +51m37s] restored chunk 133/297 (drained from chunk channel)
+[11:20:52 +51m40s] restored chunk 134/297 (drained from chunk channel)
+[11:20:55 +51m42s] restored chunk 135/297 (drained from chunk channel)
+[11:20:56 +51m44s] restored chunk 136/297 (drained from chunk channel)
+[11:20:58 +51m45s] restored chunk 137/297 (drained from chunk channel)
+[11:20:59 +51m47s] restored chunk 138/297 (drained from chunk channel)
+[11:21:00 +51m48s] restored chunk 139/297 (drained from chunk channel)
+[11:21:02 +51m49s] restored chunk 140/297 (drained from chunk channel)
+[11:21:03 +51m50s] restored chunk 141/297 (drained from chunk channel)
+[11:21:04 +51m52s] restored chunk 142/297 (drained from chunk channel)
+[11:21:06 +51m54s] restored chunk 143/297 (drained from chunk channel)
+[11:21:07 +51m55s] restored chunk 144/297 (drained from chunk channel)
+[11:24:56 +55m43s] restored chunk 145/297 (drained from chunk channel)
+[11:24:59 +55m46s] restored chunk 146/297 (drained from chunk channel)
+[11:25:03 +55m50s] restored chunk 147/297 (drained from chunk channel)
+[11:25:06 +55m54s] restored chunk 148/297 (drained from chunk channel)
+[11:25:10 +55m58s] restored chunk 149/297 (drained from chunk channel)
+[11:25:14 +56m01s] restored chunk 150/297 (drained from chunk channel)
+[11:25:18 +56m06s] restored chunk 151/297 (drained from chunk channel)
+[11:25:21 +56m09s] restored chunk 152/297 (drained from chunk channel)
+[11:25:24 +56m11s] restored chunk 153/297 (drained from chunk channel)
+[11:25:27 +56m14s] restored chunk 154/297 (drained from chunk channel)
+[11:25:31 +56m18s] restored chunk 155/297 (drained from chunk channel)
+[11:25:38 +56m26s] restored chunk 156/297 (drained from chunk channel)
+[11:25:44 +56m31s] restored chunk 157/297 (drained from chunk channel)
+[11:25:47 +56m34s] restored chunk 158/297 (drained from chunk channel)
+[11:25:48 +56m35s] restored chunk 159/297 (drained from chunk channel)
+[11:25:50 +56m38s] restored chunk 160/297 (drained from chunk channel)
+[11:25:52 +56m40s] restored chunk 161/297 (drained from chunk channel)
+[11:25:53 +56m41s] restored chunk 162/297 (drained from chunk channel)
+[11:25:54 +56m42s] restored chunk 163/297 (drained from chunk channel)
+[11:25:56 +56m43s] restored chunk 164/297 (drained from chunk channel)
+[11:26:00 +56m47s] restored chunk 165/297 (drained from chunk channel)
+[11:26:04 +56m51s] restored chunk 166/297 (drained from chunk channel)
+[11:26:06 +56m54s] restored chunk 167/297 (drained from chunk channel)
+[11:26:09 +56m56s] restored chunk 168/297 (drained from chunk channel)
+[11:26:11 +56m59s] restored chunk 169/297 (drained from chunk channel)
+[11:26:16 +57m03s] restored chunk 170/297 (drained from chunk channel)
+[11:26:23 +57m10s] restored chunk 171/297 (drained from chunk channel)
+[11:26:29 +57m17s] restored chunk 172/297 (drained from chunk channel)
+[11:27:34 +58m21s] snapshot discovered height=24945000
+[11:27:34 +58m21s] snapshot discovered height=24928000
+[11:27:34 +58m21s] snapshot discovered height=24907000
+[11:27:34 +58m21s] snapshot discovered height=24868000
+[11:27:34 +58m21s] snapshot discovered height=24836000
+[11:27:34 +58m21s] snapshot discovered height=24827000
+[11:27:34 +58m21s] snapshot discovered height=24819000
+[11:27:34 +58m21s] snapshot discovered height=24811000
+[11:27:34 +58m21s] snapshot discovered height=24803000
+[11:27:34 +58m21s] snapshot discovered height=24784000
+[11:27:42 +58m30s] peers: 24 → 25 connected
+[11:27:57 +58m45s] peers: 25 → 26 connected
+[11:29:12 +1h00m00s] peers: 26 → 25 connected
+[11:29:27 +1h00m15s] peers: 25 → 26 connected
+[11:30:12 +1h01m00s] peers: 26 → 25 connected
+[11:30:27 +1h01m15s] peers: 25 → 26 connected
+[11:40:12 +1h11m00s] peers: 26 → 25 connected
+[11:40:27 +1h11m15s] peers: 25 → 26 connected
+[11:49:29 +1h20m17s] restored chunk 173/297 (drained from chunk channel)
+[11:49:30 +1h20m17s] restored chunk 174/297 (drained from chunk channel)
+[11:49:30 +1h20m18s] restored chunk 175/297 (drained from chunk channel)
+[11:49:30 +1h20m18s] restored chunk 176/297 (drained from chunk channel)
+[11:49:31 +1h20m18s] restored chunk 177/297 (drained from chunk channel)
+[11:49:31 +1h20m18s] restored chunk 178/297 (drained from chunk channel)
+[11:49:31 +1h20m19s] restored chunk 179/297 (drained from chunk channel)
+[11:49:31 +1h20m19s] restored chunk 180/297 (drained from chunk channel)
+[11:49:32 +1h20m19s] restored chunk 181/297 (drained from chunk channel)
+[11:49:32 +1h20m19s] restored chunk 182/297 (drained from chunk channel)
+[11:49:32 +1h20m20s] restored chunk 183/297 (drained from chunk channel)
+[11:49:32 +1h20m20s] restored chunk 184/297 (drained from chunk channel)
+[11:49:33 +1h20m20s] restored chunk 185/297 (drained from chunk channel)
+[11:49:33 +1h20m20s] restored chunk 186/297 (drained from chunk channel)
+[11:49:33 +1h20m21s] restored chunk 187/297 (drained from chunk channel)
+[11:49:33 +1h20m21s] restored chunk 188/297 (drained from chunk channel)
+[11:49:34 +1h20m21s] restored chunk 189/297 (drained from chunk channel)
+[11:49:34 +1h20m21s] restored chunk 190/297 (drained from chunk channel)
+[11:49:34 +1h20m22s] restored chunk 191/297 (drained from chunk channel)
+[11:49:35 +1h20m22s] restored chunk 192/297 (drained from chunk channel)
+[11:49:35 +1h20m22s] restored chunk 193/297 (drained from chunk channel)
+[11:49:35 +1h20m23s] restored chunk 194/297 (drained from chunk channel)
+[11:49:35 +1h20m23s] restored chunk 195/297 (drained from chunk channel)
+[11:49:35 +1h20m23s] restored chunk 196/297 (drained from chunk channel)
+[11:49:36 +1h20m23s] restored chunk 197/297 (drained from chunk channel)
+[11:49:36 +1h20m24s] restored chunk 198/297 (drained from chunk channel)
+[11:49:36 +1h20m24s] restored chunk 199/297 (drained from chunk channel)
+[11:49:36 +1h20m24s] restored chunk 200/297 (drained from chunk channel)
+[11:49:37 +1h20m24s] restored chunk 201/297 (drained from chunk channel)
+[11:49:37 +1h20m24s] restored chunk 202/297 (drained from chunk channel)
+[11:49:37 +1h20m25s] restored chunk 203/297 (drained from chunk channel)
+[11:49:38 +1h20m25s] restored chunk 204/297 (drained from chunk channel)
+[11:49:38 +1h20m25s] restored chunk 205/297 (drained from chunk channel)
+[11:49:46 +1h20m34s] restored chunk 206/297 (drained from chunk channel)
+[11:49:48 +1h20m36s] restored chunk 207/297 (drained from chunk channel)
+[11:49:50 +1h20m38s] restored chunk 208/297 (drained from chunk channel)
+[11:49:52 +1h20m40s] restored chunk 209/297 (drained from chunk channel)
+[11:49:55 +1h20m42s] restored chunk 210/297 (drained from chunk channel)
+[11:49:57 +1h20m45s] restored chunk 211/297 (drained from chunk channel)
+[11:49:59 +1h20m47s] restored chunk 212/297 (drained from chunk channel)
+[11:50:12 +1h21m00s] peers: 26 → 25 connected
+[11:50:27 +1h21m15s] peers: 25 → 26 connected
+[11:53:54 +1h24m41s] restored chunk 213/297 (drained from chunk channel)
+[11:53:54 +1h24m42s] restored chunk 214/297 (drained from chunk channel)
+[11:53:55 +1h24m43s] restored chunk 215/297 (drained from chunk channel)
+[11:53:56 +1h24m44s] restored chunk 216/297 (drained from chunk channel)
+[11:53:58 +1h24m46s] restored chunk 217/297 (drained from chunk channel)
+[11:54:00 +1h24m47s] restored chunk 218/297 (drained from chunk channel)
+[11:54:01 +1h24m48s] restored chunk 219/297 (drained from chunk channel)
+[11:54:04 +1h24m51s] restored chunk 220/297 (drained from chunk channel)
+[11:54:04 +1h24m52s] restored chunk 221/297 (drained from chunk channel)
+[11:54:05 +1h24m53s] restored chunk 222/297 (drained from chunk channel)
+[11:54:07 +1h24m54s] restored chunk 223/297 (drained from chunk channel)
+[11:54:08 +1h24m56s] restored chunk 224/297 (drained from chunk channel)
+[11:54:10 +1h24m57s] restored chunk 225/297 (drained from chunk channel)
+[11:54:12 +1h24m59s] restored chunk 226/297 (drained from chunk channel)
+[11:54:13 +1h25m01s] restored chunk 227/297 (drained from chunk channel)
+[11:54:13 +1h25m01s] restored chunk 228/297 (drained from chunk channel)
+[11:54:14 +1h25m01s] restored chunk 229/297 (drained from chunk channel)
+[11:54:14 +1h25m01s] restored chunk 230/297 (drained from chunk channel)
+[11:54:14 +1h25m02s] restored chunk 231/297 (drained from chunk channel)
+[11:54:14 +1h25m02s] restored chunk 232/297 (drained from chunk channel)
+[11:54:14 +1h25m02s] restored chunk 233/297 (drained from chunk channel)
+[11:54:15 +1h25m02s] restored chunk 234/297 (drained from chunk channel)
+[11:54:15 +1h25m02s] restored chunk 235/297 (drained from chunk channel)
+[11:54:15 +1h25m03s] restored chunk 236/297 (drained from chunk channel)
+[11:54:15 +1h25m03s] restored chunk 237/297 (drained from chunk channel)
+[11:54:15 +1h25m03s] restored chunk 238/297 (drained from chunk channel)
+[11:54:16 +1h25m03s] restored chunk 239/297 (drained from chunk channel)
+[11:54:16 +1h25m03s] restored chunk 240/297 (drained from chunk channel)
+[11:54:16 +1h25m04s] restored chunk 241/297 (drained from chunk channel)
+[11:54:16 +1h25m04s] restored chunk 242/297 (drained from chunk channel)
+[11:54:17 +1h25m04s] restored chunk 243/297 (drained from chunk channel)
+[11:54:17 +1h25m04s] restored chunk 244/297 (drained from chunk channel)
+[11:54:17 +1h25m05s] restored chunk 245/297 (drained from chunk channel)
+[11:54:17 +1h25m05s] restored chunk 246/297 (drained from chunk channel)
+[11:54:17 +1h25m05s] restored chunk 247/297 (drained from chunk channel)
+[11:54:18 +1h25m05s] restored chunk 248/297 (drained from chunk channel)
+[11:54:18 +1h25m05s] restored chunk 249/297 (drained from chunk channel)
+[11:54:18 +1h25m06s] restored chunk 250/297 (drained from chunk channel)
+[11:54:18 +1h25m06s] restored chunk 251/297 (drained from chunk channel)
+[11:54:18 +1h25m06s] restored chunk 252/297 (drained from chunk channel)
+[11:54:19 +1h25m06s] restored chunk 253/297 (drained from chunk channel)
+[11:54:19 +1h25m06s] restored chunk 254/297 (drained from chunk channel)
+[11:54:19 +1h25m07s] restored chunk 255/297 (drained from chunk channel)
+[11:54:19 +1h25m07s] restored chunk 256/297 (drained from chunk channel)
+[11:54:20 +1h25m07s] restored chunk 257/297 (drained from chunk channel)
+[11:54:20 +1h25m07s] restored chunk 258/297 (drained from chunk channel)
+[11:54:20 +1h25m07s] restored chunk 259/297 (drained from chunk channel)
+[11:54:20 +1h25m08s] restored chunk 260/297 (drained from chunk channel)
+[11:54:20 +1h25m08s] restored chunk 261/297 (drained from chunk channel)
+[11:54:21 +1h25m08s] restored chunk 262/297 (drained from chunk channel)
+[11:54:21 +1h25m08s] restored chunk 263/297 (drained from chunk channel)
+[11:54:21 +1h25m08s] restored chunk 264/297 (drained from chunk channel)
+[11:54:21 +1h25m09s] restored chunk 265/297 (drained from chunk channel)
+[11:54:21 +1h25m09s] restored chunk 266/297 (drained from chunk channel)
+[11:54:22 +1h25m09s] restored chunk 267/297 (drained from chunk channel)
+[11:54:22 +1h25m09s] restored chunk 268/297 (drained from chunk channel)
+[11:54:22 +1h25m09s] restored chunk 269/297 (drained from chunk channel)
+[11:54:22 +1h25m10s] restored chunk 270/297 (drained from chunk channel)
+[11:54:22 +1h25m10s] restored chunk 271/297 (drained from chunk channel)
+[11:54:24 +1h25m11s] restored chunk 272/297 (drained from chunk channel)
+[11:54:27 +1h25m14s] restored chunk 273/297 (drained from chunk channel)
+[11:54:29 +1h25m17s] restored chunk 274/297 (drained from chunk channel)
+[11:54:33 +1h25m20s] restored chunk 275/297 (drained from chunk channel)
+[11:54:37 +1h25m24s] restored chunk 276/297 (drained from chunk channel)
+[12:00:12 +1h31m00s] peers: 26 → 24 connected
+[12:00:27 +1h31m15s] peers: 24 → 25 connected
+[12:01:12 +1h31m59s] restored chunk 277/297 (drained from chunk channel)
+[12:01:13 +1h32m01s] restored chunk 278/297 (drained from chunk channel)
+[12:01:16 +1h32m04s] restored chunk 279/297 (drained from chunk channel)
+[12:01:20 +1h32m07s] restored chunk 280/297 (drained from chunk channel)
+[12:01:24 +1h32m11s] restored chunk 281/297 (drained from chunk channel)
+[12:01:27 +1h32m15s] peers: 25 → 26 connected
+[12:01:28 +1h32m15s] restored chunk 282/297 (drained from chunk channel)
+[12:01:32 +1h32m19s] restored chunk 283/297 (drained from chunk channel)
+[12:01:36 +1h32m23s] restored chunk 284/297 (drained from chunk channel)
+[12:01:40 +1h32m27s] restored chunk 285/297 (drained from chunk channel)
+[12:01:44 +1h32m31s] restored chunk 286/297 (drained from chunk channel)
+[12:06:29 +1h37m16s] restored chunk 287/297 (drained from chunk channel)
+[12:06:33 +1h37m21s] restored chunk 288/297 (drained from chunk channel)
+[12:06:39 +1h37m26s] restored chunk 289/297 (drained from chunk channel)
+[12:06:42 +1h37m30s] peers: 26 → 25 connected
+[12:06:43 +1h37m30s] restored chunk 290/297 (drained from chunk channel)
+[12:06:48 +1h37m35s] restored chunk 291/297 (drained from chunk channel)
+[12:06:52 +1h37m39s] restored chunk 292/297 (drained from chunk channel)
+[12:06:56 +1h37m43s] restored chunk 293/297 (drained from chunk channel)
+[12:06:57 +1h37m45s] peers: 25 → 26 connected
+[12:06:59 +1h37m47s] restored chunk 294/297 (drained from chunk channel)
+[12:07:03 +1h37m50s] restored chunk 295/297 (drained from chunk channel)
+[12:07:03 +1h37m50s] restored chunk 296/297 (drained from chunk channel)
+[12:07:03 +1h37m50s] queued chunk 296/297 (final — IAVL writer fully drained)
+[12:07:03 +1h37m50s] Verified ABCI app — IAVL fully restored, appHash matches consensus
+[12:07:03 +1h37m50s] >>> PHASE: State sync downloaded height=0
+[12:07:03 +1h37m50s] >>> PHASE: Application DB constructed height=0
+[12:07:12 +1h38m00s] rpc: height 0 → 30957047 (Δ30957047 in 5865s = 5278.3 blk/s) catching=true peers=26
+[12:07:27 +1h38m15s] rpc: height 30957047 → 30957230 (Δ183 in 15s = 12.2 blk/s) catching=true peers=26
+[12:07:42 +1h38m30s] rpc: height 30957230 → 30957434 (Δ204 in 15s = 13.6 blk/s) catching=true peers=26
+[12:07:57 +1h38m45s] rpc: height 30957434 → 30957617 (Δ183 in 15s = 12.2 blk/s) catching=true peers=26
+[12:08:12 +1h39m00s] rpc: height 30957617 → 30957809 (Δ192 in 15s = 12.8 blk/s) catching=true peers=26
+[12:08:27 +1h39m15s] rpc: height 30957809 → 30958006 (Δ197 in 15s = 13.1 blk/s) catching=true peers=26
+[12:08:42 +1h39m30s] rpc: height 30958006 → 30958181 (Δ175 in 15s = 11.7 blk/s) catching=true peers=26
+[12:08:57 +1h39m45s] rpc: height 30958181 → 30958344 (Δ163 in 15s = 10.9 blk/s) catching=true peers=25
+[12:09:12 +1h40m00s] rpc: height 30958344 → 30958502 (Δ158 in 15s = 10.5 blk/s) catching=true peers=26
+[12:09:27 +1h40m15s] rpc: height 30958502 → 30958674 (Δ172 in 15s = 11.5 blk/s) catching=true peers=25
+[12:09:42 +1h40m30s] rpc: height 30958674 → 30958814 (Δ140 in 15s = 9.3 blk/s) catching=true peers=25
+[12:09:57 +1h40m45s] rpc: height 30958814 → 30958885 (Δ71 in 15s = 4.7 blk/s) catching=false peers=22
+[12:09:57 +1h40m45s] >>> PHASE: Node caught up height=30958885
+[12:09:57 +1h40m45s] gaiad still running pid=95445 — kill with: kill 95445
