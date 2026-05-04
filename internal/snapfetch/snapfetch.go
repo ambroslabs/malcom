@@ -20,6 +20,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"math/rand"
 	"os"
 	"path/filepath"
 	"sort"
@@ -59,9 +60,25 @@ type Config struct {
 	PerPeerLimit      int           // default 2
 	ChunkTimeout      time.Duration // default 45s
 	MaxFetchTime      time.Duration // default 30m
-	PeerFailLimit     int           // default 3
-	PeerRedialMax     int           // default 3
-	PeerRedialBackoff time.Duration // default 5s
+	PeerFailLimit     int           // default 3 (hash-mismatch / missing-chunk strikes before ban)
+	PeerRedialMax     int           // deprecated; retained for back-compat (no longer caps redials)
+	PeerRedialBackoff time.Duration // default 5s — base backoff between redial attempts; doubles on each retry up to MaxRedialBackoff
+
+	// MaxRedialBackoff caps the exponential backoff between redial
+	// attempts to a connected peer. We never permanently ban peers for
+	// being temporarily disconnected; only hash-mismatch / missing-chunk
+	// strikes (PeerFailLimit) ban a peer.
+	MaxRedialBackoff time.Duration // default 5m
+
+	// WarmPeerTarget is the connected-peer count below which the
+	// background refresher keeps dialing seeds during phase 3. Without
+	// this, peer attrition during a long bank-store import can starve
+	// snapfetch even though plenty of seeds are still reachable.
+	WarmPeerTarget int // default 16
+
+	// WarmRefreshInterval is how often the background refresher checks
+	// the connected count and dials more seeds if needed.
+	WarmRefreshInterval time.Duration // default 5s
 
 	TargetHeight      uint64
 	PreferFresh       bool
@@ -114,6 +131,15 @@ func (c *Config) applyDefaults() {
 	}
 	if c.PeerRedialBackoff == 0 {
 		c.PeerRedialBackoff = 5 * time.Second
+	}
+	if c.MaxRedialBackoff == 0 {
+		c.MaxRedialBackoff = 5 * time.Minute
+	}
+	if c.WarmPeerTarget == 0 {
+		c.WarmPeerTarget = 16
+	}
+	if c.WarmRefreshInterval == 0 {
+		c.WarmRefreshInterval = 5 * time.Second
 	}
 	if c.MaxRescans == 0 {
 		c.MaxRescans = 3
@@ -355,8 +381,10 @@ func RunFetch(ctx context.Context, cfg Config, sink Sink) (*Result, error) {
 		// ─── Phase 3: download all chunks ─────────────────────────────
 		fetchCtx, fetchCancel := context.WithTimeout(ctx, cfg.MaxFetchTime)
 		bt, derr := download(fetchCtx, sw, ssR, mux.subscribe(),
-			chosen, chunkHashes, goodPeers, addrByNodeID, sink,
-			cfg.PerPeerLimit, cfg.ChunkTimeout, cfg.PeerFailLimit, cfg.PeerRedialMax, cfg.PeerRedialBackoff, flog)
+			chosen, chunkHashes, goodPeers, addrByNodeID, sink, seeds,
+			cfg.PerPeerLimit, cfg.ChunkTimeout, cfg.PeerFailLimit,
+			cfg.PeerRedialBackoff, cfg.MaxRedialBackoff,
+			cfg.WarmPeerTarget, cfg.WarmRefreshInterval, flog)
 		fetchCancel()
 		if derr != nil {
 			flog.Error("download failed; will rescan",
@@ -800,22 +828,38 @@ pick:
 // ─── Phase 3: chunk download scheduler ──────────────────────────────────
 
 type peerStat struct {
-	inflight    int
-	failures    int  // missing=true or hash-mismatch responses (real misbehaviour)
-	disconnects int  // socket-level drops (transient)
-	banned      bool // permanently bench (real failures or out of redials)
-	lastDialAt  time.Time
+	inflight      int
+	failures      int  // missing=true or hash-mismatch responses (real misbehaviour)
+	disconnects   int  // socket-level drops (transient) — never used to ban directly
+	banned        bool // permanently benched (only set on PeerFailLimit failures)
+	provisional   bool // true until peer responds with first verified chunk; provisional peers get one in-flight slot and a single-strike ban budget
+	lastDialAt    time.Time
+	nextDialAfter time.Time // earliest time a redial may be attempted; computed via exponential backoff over disconnects
 }
 
 // download is the phase-3 chunk scheduler. It dispatches chunks across
 // good peers, verifies SHA256 against the metadata hashes, and emits
 // each verified chunk through sink.OnChunk. Returns total bytes
 // transferred (sum of verified chunk lengths).
+//
+// Resilience features:
+//   - Exponential-backoff redial (no ban-on-disconnect). Only
+//     hash-mismatch / missing-chunk strikes ban a peer; transient socket
+//     drops just defer the next dial attempt.
+//   - Background peer-pool refresher. While the connected peer count is
+//     below WarmPeerTarget, dials seeds in the background so newly-broken
+//     good peers can be replaced.
+//   - Provisional peer promotion. Connected non-good peers are added to
+//     stats with provisional=true and given one in-flight slot. The first
+//     verified chunk promotes them to a full-budget good peer; a hash
+//     mismatch single-strikes them out.
 func download(ctx context.Context, sw *p2p.Switch, ssR *statesync.Reactor,
 	evs chan statesync.Event, target *snapshotOffer, chunkHashes [][]byte,
-	good []p2p.ID, addrByNodeID map[string]string, sink Sink,
+	good []p2p.ID, addrByNodeID map[string]string, sink Sink, seeds []peerSeed,
 	perPeer int, chunkTimeout time.Duration, peerFailLimit int,
-	peerRedialMax int, redialBackoff time.Duration, logger cmtlog.Logger) (uint64, error) {
+	redialBackoff, maxRedialBackoff time.Duration,
+	warmTarget int, warmRefreshInterval time.Duration,
+	logger cmtlog.Logger) (uint64, error) {
 
 	N := target.Chunks
 	pending := make([]bool, N)
@@ -840,6 +884,25 @@ func download(ctx context.Context, sw *p2p.Switch, ssR *statesync.Reactor,
 	lastProgress := time.Now()
 	progressEvery := 15 * time.Second
 
+	// computeRedialDelay returns redialBackoff * 2^(disconnects-1), capped
+	// at maxRedialBackoff. With redialBackoff=5s and cap=5m, sequence is
+	// 5s, 10s, 20s, 40s, 80s, 160s, 300s, 300s, 300s, ... — keeps trying
+	// indefinitely so a peer that comes back online eventually rejoins.
+	computeRedialDelay := func(disconnects int) time.Duration {
+		if disconnects <= 1 {
+			return redialBackoff
+		}
+		shift := disconnects - 1
+		if shift > 10 {
+			shift = 10
+		}
+		d := redialBackoff << uint(shift)
+		if d <= 0 || d > maxRedialBackoff {
+			return maxRedialBackoff
+		}
+		return d
+	}
+
 	tryRedial := func(pid p2p.ID) {
 		st, ok := stats[pid]
 		if !ok || st.banned {
@@ -848,18 +911,15 @@ func download(ctx context.Context, sw *p2p.Switch, ssR *statesync.Reactor,
 		if peer := sw.Peers().Get(pid); peer != nil {
 			return
 		}
-		if st.disconnects >= peerRedialMax {
-			st.banned = true
-			logger.Info("benching peer (redial budget exhausted)",
-				"peer", string(pid), "disconnects", st.disconnects)
-			return
-		}
-		if time.Since(st.lastDialAt) < redialBackoff {
+		if !st.nextDialAfter.IsZero() && time.Now().Before(st.nextDialAfter) {
 			return
 		}
 		addr, ok := addrByNodeID[string(pid)]
 		if !ok {
-			st.banned = true
+			// Unknown address — only happens for peers that joined via
+			// PEX rather than the seed list. Drop from stats so a future
+			// scanForNewPeers can re-add them if they reconnect.
+			delete(stats, pid)
 			return
 		}
 		na, err := p2p.NewNetAddressString(addr)
@@ -869,31 +929,61 @@ func download(ctx context.Context, sw *p2p.Switch, ssR *statesync.Reactor,
 		}
 		st.disconnects++
 		st.lastDialAt = time.Now()
+		st.nextDialAfter = st.lastDialAt.Add(computeRedialDelay(st.disconnects))
 		go func(na *p2p.NetAddress) {
 			_ = sw.DialPeerWithAddress(na)
 		}(na)
 	}
 
+	// pickPeer prefers proven (non-provisional) peers up to perPeer
+	// inflight, then falls back to a single provisional probe slot per
+	// peer. This way a freshly-warm peer is never given more than one
+	// concurrent chunk until it has proven it can serve.
 	pickPeer := func() p2p.ID {
-		var best p2p.ID
-		bestInflight := perPeer + 1
+		var bestProven, bestProvis p2p.ID
+		bestProvenInflight := perPeer + 1
+		bestProvisInflight := 2 // provisional cap = 1; sentinel = 2
 		for pid, st := range stats {
 			if st.banned {
 				continue
 			}
-			peer := sw.Peers().Get(pid)
-			if peer == nil {
+			if sw.Peers().Get(pid) == nil {
 				continue
 			}
-			if st.inflight < bestInflight {
-				bestInflight = st.inflight
-				best = pid
+			if st.provisional {
+				if st.inflight < bestProvisInflight {
+					bestProvisInflight = st.inflight
+					bestProvis = pid
+				}
+				continue
+			}
+			if st.inflight < bestProvenInflight {
+				bestProvenInflight = st.inflight
+				bestProven = pid
 			}
 		}
-		if bestInflight > perPeer {
-			return ""
+		if bestProvenInflight <= perPeer {
+			return bestProven
 		}
-		return best
+		if bestProvisInflight <= 1 {
+			return bestProvis
+		}
+		return ""
+	}
+
+	// scanForNewPeers walks sw.Peers() and registers any connected,
+	// not-yet-tracked peer in stats as provisional. This is how peers
+	// arriving via the keepWarm dialer (or PEX) get drawn into the
+	// scheduler without a heavyweight rescan.
+	scanForNewPeers := func() {
+		for _, p := range sw.Peers().List() {
+			pid := p.ID()
+			if _, ok := stats[pid]; ok {
+				continue
+			}
+			stats[pid] = &peerStat{provisional: true}
+			logger.Info("provisional peer added", "peer", string(pid))
+		}
 	}
 
 	dispatch := func() int {
@@ -926,9 +1016,18 @@ func download(ctx context.Context, sw *p2p.Switch, ssR *statesync.Reactor,
 	}
 
 	logger.Info("phase 3: starting download",
-		"chunks", N, "good_peers", len(good), "per_peer_inflight", perPeer)
+		"chunks", N, "good_peers", len(good), "per_peer_inflight", perPeer,
+		"warm_target", warmTarget, "max_redial_backoff", maxRedialBackoff)
 
 	dispatch()
+
+	// Background peer-pool refresher. Keeps the connected peer count
+	// hovering near warmTarget by dialing seeds (shuffled) whenever we
+	// drop below the threshold. scanForNewPeers in the main loop picks
+	// up the resulting connections as provisional peers.
+	if len(seeds) > 0 && warmTarget > 0 {
+		go runKeepWarm(ctx, sw, seeds, warmTarget, warmRefreshInterval, logger)
+	}
 
 	timeoutTicker := time.NewTicker(2 * time.Second)
 	defer timeoutTicker.Stop()
@@ -964,6 +1063,14 @@ func download(ctx context.Context, sw *p2p.Switch, ssR *statesync.Reactor,
 						if st.inflight < 0 {
 							st.inflight = 0
 						}
+						// Provisional peers that time out on their
+						// probe lose their slot immediately — their
+						// connection is suspect.
+						if st.provisional {
+							st.banned = true
+							logger.Info("benching provisional peer (probe timeout)",
+								"peer", string(info.peer))
+						}
 					}
 					delete(inflight, idx)
 					pending[idx] = true
@@ -977,6 +1084,7 @@ func download(ctx context.Context, sw *p2p.Switch, ssR *statesync.Reactor,
 					tryRedial(pid)
 				}
 			}
+			scanForNewPeers()
 			dispatch()
 
 			if now.Sub(lastProgress) >= progressEvery {
@@ -1012,11 +1120,18 @@ func download(ctx context.Context, sw *p2p.Switch, ssR *statesync.Reactor,
 				continue
 			}
 
+			// Provisional peers single-strike: any failure on their
+			// probe bans them. Proven peers get peerFailLimit strikes.
+			banLimit := peerFailLimit
+			if st.provisional {
+				banLimit = 1
+			}
+
 			if ev.Chunk.Missing || len(ev.Chunk.Bytes) == 0 {
 				st.failures++
-				if st.failures >= peerFailLimit {
+				if st.failures >= banLimit {
 					st.banned = true
-					logger.Info("benching peer", "peer", string(peer), "failures", st.failures)
+					logger.Info("benching peer", "peer", string(peer), "failures", st.failures, "provisional", st.provisional)
 				}
 				pending[idx] = true
 				dispatch()
@@ -1030,13 +1145,23 @@ func download(ctx context.Context, sw *p2p.Switch, ssR *statesync.Reactor,
 					"got_sha", hex.EncodeToString(h[:8]),
 					"want_sha", hex.EncodeToString(chunkHashes[idx][:8]))
 				st.failures++
-				if st.failures >= peerFailLimit {
+				if st.failures >= banLimit {
 					st.banned = true
 				}
 				pending[idx] = true
 				dispatch()
 				continue
 			}
+
+			// Verified chunk — promote a provisional peer to proven, and
+			// reset the disconnect/redial backoff so a peer that came
+			// back from a long outage gets a clean slate.
+			if st.provisional {
+				st.provisional = false
+				logger.Info("peer promoted from provisional", "peer", string(peer))
+			}
+			st.disconnects = 0
+			st.nextDialAfter = time.Time{}
 
 			// Hand the verified chunk to the sink. Sink errors are
 			// logged and ignored — the original CLI's behaviour was a
@@ -1062,6 +1187,67 @@ func download(ctx context.Context, sw *p2p.Switch, ssR *statesync.Reactor,
 		"bytes", bytesTotal.Load(),
 		"elapsed", time.Since(startTime))
 	return bytesTotal.Load(), nil
+}
+
+// runKeepWarm dials seeds in the background while the connected peer
+// count is below warmTarget. Each refresh tick, it dials up to
+// dialBatch new seeds (seeds we haven't already connected to). The
+// dialed peers are picked up by download's scanForNewPeers tick and
+// added to stats as provisional.
+//
+// Seeds are shuffled once at start so we don't bias toward the front
+// of the list, and a cursor advances through the shuffled slice with
+// wraparound — over a long bench, every seed eventually gets a try.
+func runKeepWarm(ctx context.Context, sw *p2p.Switch, seeds []peerSeed,
+	warmTarget int, refresh time.Duration, logger cmtlog.Logger) {
+
+	if len(seeds) == 0 {
+		return
+	}
+	const dialBatch = 4
+
+	shuffled := make([]peerSeed, len(seeds))
+	copy(shuffled, seeds)
+	rand.Shuffle(len(shuffled), func(i, j int) {
+		shuffled[i], shuffled[j] = shuffled[j], shuffled[i]
+	})
+	cursor := 0
+
+	t := time.NewTicker(refresh)
+	defer t.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-t.C:
+		}
+		connected := sw.Peers().Size()
+		if connected >= warmTarget {
+			continue
+		}
+		dialed := 0
+		// Walk the seed list for at most one full pass per tick — past
+		// the cap, give up for now and retry next tick.
+		for tries := 0; tries < len(shuffled) && dialed < dialBatch; tries++ {
+			s := shuffled[cursor]
+			cursor = (cursor + 1) % len(shuffled)
+			na, err := p2p.NewNetAddressString(s.addr)
+			if err != nil {
+				continue
+			}
+			if peer := sw.Peers().Get(na.ID); peer != nil {
+				continue
+			}
+			dialed++
+			go func(na *p2p.NetAddress) {
+				_ = sw.DialPeerWithAddress(na)
+			}(na)
+		}
+		if dialed > 0 {
+			logger.Info("keep-warm refresh",
+				"connected", connected, "target", warmTarget, "dialed", dialed)
+		}
+	}
 }
 
 // ─── helpers ────────────────────────────────────────────────────────────
