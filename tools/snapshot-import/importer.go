@@ -10,6 +10,7 @@
 package main
 
 import (
+	"encoding/binary"
 	"fmt"
 	"io"
 	"time"
@@ -45,6 +46,15 @@ type storeImporter struct {
 	// under. Each Add still carries the export node's own version.
 	height int64
 
+	// lastIavlBytes caches the most-recently-emitted IAVL-node bytes.
+	// Because the snapshot stream is post-order LRN, the last node we
+	// emit per store is the root. finalize re-emits these bytes under
+	// (snapshotHeight, 1) so iavl's read path finds the root at the
+	// canonical key — bypassing the need for a redirect entry. (iavl's
+	// isReferenceRoot only follows redirects whose value starts with
+	// the 's' nodeKey prefix; raw nodeKey bytes are NOT recognised.)
+	lastIavlBytes []byte
+
 	// running totals for progress logs
 	itemCount  uint64
 	leafCount  uint64
@@ -78,6 +88,7 @@ func (s *storeImporter) addNode(set func(key, value []byte) error,
 		if err := set(nodeDBKey(s.storePrefix, version, nonce), nodeBytes); err != nil {
 			return fmt.Errorf("set leaf node: %w", err)
 		}
+		s.lastIavlBytes = nodeBytes
 
 		// fast-storage entry: 'f' || userKey → varint(version) || EncodeBytes(value)
 		if err := set(fastDBKey(s.storePrefix, key),
@@ -122,6 +133,7 @@ func (s *storeImporter) addNode(set func(key, value []byte) error,
 	if err := set(nodeDBKey(s.storePrefix, version, nonce), nodeBytes); err != nil {
 		return fmt.Errorf("set inner node: %w", err)
 	}
+	s.lastIavlBytes = nodeBytes
 
 	s.stack = append(s.stack, frame{
 		hash:    h,
@@ -191,45 +203,48 @@ func (s *storeImporter) finalize(set func(key, value []byte) error) ([32]byte, e
 
 	root := s.stack[0]
 
-	// The root we just popped was written at (root.version, root.nonce).
-	// IAVL's read path expects the root to live at (root.version, 1).
-	// Two cases:
-	//   1) root.nonce == 2 (the first allocated): the node we wrote
-	//      doesn't carry the canonical nonce. Re-encode it and re-emit
-	//      under nonce=1. We can't simply alias because the leftNodeKey
-	//      / rightNodeKey of a hypothetical PARENT would have been
-	//      written referring to (root.version, 2); but here root has no
-	//      parent, so the re-emit at nonce=1 is the only place that
-	//      serves it.
-	//   2) Always also handle: if the snapshot height differs from the
-	//      root's own version, write a redirect from
-	//      (snapshotHeight, 1) → 12-byte (root.version, 1). For typical
-	//      cosmos snapshots root.version == snapshotHeight so this is a
-	//      no-op.
+	// IAVL's read path looks for the root at the canonical nodeKey
+	// (root.version, 1). We can't simply use the addNode-time write
+	// (which lives at (root.version, root.nonce ≥ 2)) because iavl's
+	// LoadVersion calls GetRoot(version) which reads at nonce=1
+	// specifically. So we re-emit the root's encoded bytes there.
 	//
-	// We don't have the original encoded inner-bytes anymore; the
-	// importer would have to re-encode. To avoid keeping the root's
-	// key/value bytes around we cheat slightly: at finalize time the
-	// importer writes the root at nonce=1 by re-running the inner
-	// encoding with the same (already-known) inputs. We don't track
-	// node.key on the frame, so we expect the caller to hand us the
-	// root key when it spotted that the next node in the stream is
-	// going to push past the root. Since post-order means the root is
-	// the last node, the simplest thing is for the driver loop to call
-	// addNode with the root and then immediately call finalize — and
-	// for finalize to receive the same key/inner-encoding inputs.
+	// We DON'T write a 12-byte raw-nodeKey "redirect" — iavl's
+	// isReferenceRoot (nodedb.go:1172) only recognises a redirect when
+	// the value's first byte is the 's' nodeKey prefix. A raw 12-byte
+	// nodeKey starting with the version's high byte fails that check;
+	// iavl then tries to MakeNode from the 12-byte garbage and silently
+	// gets wrong-but-plausible state, which propagates as a divergent
+	// post-execute apphash on the next block.
 	//
-	// In practice we sidestep the problem: writing the root at
-	// nonce=2 _and_ a redirect at nonce=1 is functionally equivalent
-	// to re-stamping. A redirect entry is 12 bytes of value (the
-	// target nodeKey) under the source nodeKey. gaiad's
-	// `loadNode(version, 1)` follows redirects.
+	// The encoded inner-node bytes don't embed the node's own nodeKey
+	// (only its children's leftNodeKey/rightNodeKey are encoded), so
+	// the same byte sequence is valid at any storage location.
+	rootCanonicalKey := nodeDBKey(s.storePrefix, root.version, 1)
+	if err := set(rootCanonicalKey, s.lastIavlBytes); err != nil {
+		return [32]byte{}, fmt.Errorf("set canonical root at (rootVersion, 1): %w", err)
+	}
 
-	// Write a redirect from (snapshotHeight, 1) → (root.version, root.nonce).
-	target := nodeKeyBytes(root.version, root.nonce)
-	redirectKey := nodeDBKey(s.storePrefix, s.height, 1)
-	if err := set(redirectKey, target); err != nil {
-		return [32]byte{}, fmt.Errorf("set root redirect: %w", err)
+	// If the snapshot's "current version" (s.height) differs from the
+	// root's actual version (root.version), iavl needs a redirect from
+	// `GetRoot(s.height)` to `(root.version, 1)`. This happens when a
+	// store hasn't been written-to since some earlier height — e.g. on
+	// cosmoshub the `08-wasm` store's root may date to height ~28.6M
+	// while we're snapshotting at 30.9M.
+	//
+	// Wire format (matches iavl's SaveRoot in nodedb.go:1042):
+	//   key   = nodeKeyFormat.Key(GetRootKey(s.height))   = 's'||height||0x00000001
+	//   value = nodeKeyFormat.Key(target.GetKey())         = 's'||rootVersion||0x00000001
+	// (13 bytes each. The 's' prefix on the VALUE is what makes
+	// isReferenceRoot recognise this entry as a redirect.)
+	if root.version != s.height {
+		var redirectVal [13]byte
+		redirectVal[0] = 's'
+		binary.BigEndian.PutUint64(redirectVal[1:], uint64(root.version))
+		binary.BigEndian.PutUint32(redirectVal[9:], 1)
+		if err := set(nodeDBKey(s.storePrefix, s.height, 1), redirectVal[:]); err != nil {
+			return [32]byte{}, fmt.Errorf("set root redirect at (snapshotHeight, 1): %w", err)
+		}
 	}
 
 	// Per-store fast-storage marker: gaiad checks this on load and
