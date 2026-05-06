@@ -6,32 +6,83 @@ so we can pick up on a fresh machine without losing the thread.
 ## What this repo does
 
 A cosmoshub-4 ingestion pipeline. The maintained core flow lives in
-`cmd/malcom/` as a single CLI with five subcommands; legacy / research /
-diagnostic binaries live in `experimental/cmd/`.
+`cmd/malcom/` as a single CLI; legacy / research / diagnostic
+binaries live in `experimental/cmd/`.
 
-**Snapshot → gaiad (the maintained `malcom` flow):**
+**Subcommands:**
 
-1. `malcom snapshot fetch -prefer-fresh` discovers and downloads the
-   newest format-3 cosmos-sdk state-sync snapshot. Phases: peer
-   discovery → chunk-0 probe → parallel chunk fetch with redial.
-2. `malcom snapshot import` reads the downloaded chunks and writes a
-   gaiad-compatible `application.db/` (pebble) plus `extensions/` for
-   wasm/08-wasm payloads. Atop `internal/snapshotimport`, the simple
-   single-goroutine stack-based importer (no iavl, no wave-parallel
-   path — it OOMed on 2 vCPUs). Pre-populates IAVL fast-storage
-   inline so gaiad doesn't run its `upgradeToFastStorageGc1_1_0` pass
-   on first start.
-3. `malcom bootstrap` writes a runnable gaia home dir: cometbft
-   offline state-sync bootstrap, copies application.db, places wasm
-   bytecode for cosmwasm + 08-light-client, generates minimal
-   app.toml/config.toml/client.toml.
-4. Run gaiad against the bootstrap home.
-5. `malcom verify` (optional) reads the imported CommitInfo from
-   `<out>/application.db`, computes the local AppHash, fetches the
-   consensus AppHash from a cometbft RPC at H+1, and reports match/
-   mismatch.
-6. `malcom compact` (optional) runs a full-keyspace pebble compaction
-   to reclaim slack outside the import flow.
+- `init` — seed XDG dirs (config.toml + chains/<id>.toml), generate
+  p2p node key, populate rpcs/peers from cosmos chain-registry.
+  Idempotent; `-force` overwrites templates (never the node key).
+  `-offline` skips the registry fetch.
+- `clean` — wipe the three malcom XDG roots
+  ($XDG_{CONFIG,STATE,CACHE}_HOME/malcom). Backup-by-default (renames
+  to `<dir>.bak.<ts>`); `-clobber` for destructive remove. Iteration
+  helper.
+- `snapshot fetch` — discover and download a state-sync snapshot.
+  Walks back from `floor(currentHeight / interval) * interval` (also
+  jumps up if a peer offers a fresher one). Custom PEX reactor on
+  cometbft AddrBook with active churn for non-snapshot-serving peers.
+- `snapshot import` — read chunks, write gaiad-compatible
+  `application.db/` (pebble) + `extensions/`. Single-goroutine
+  stack-based importer (no iavl, no wave-parallel — OOMed on 2 vCPUs).
+  Pre-populates IAVL fast-storage inline so gaiad skips its
+  `upgradeToFastStorageGc1_1_0` pass on first start.
+- `bootstrap` — assemble runnable gaia home: offline state-sync via
+  cometbft, copy application.db, place wasm bytecode for cosmwasm +
+  08-light-client, write minimal app.toml/config.toml/client.toml.
+  Genesis is downloaded lazily from the URL in chain config if not
+  already cached.
+- `verify` — read CommitInfo from imported `application.db`, compute
+  local AppHash, fetch consensus AppHash from cometbft RPC at H+1,
+  match/mismatch.
+- `compact` — full-keyspace pebble compaction to reclaim slack
+  outside the import flow.
+
+## Config model (XDG, no `-config` flag)
+
+malcom respects the XDG Base Directory Specification end-to-end:
+
+    $XDG_CONFIG_HOME/malcom/config.toml          shared defaults: default_chain, [fetch], [import], [bootstrap]
+    $XDG_CONFIG_HOME/malcom/chains/<id>.toml     per-chain identity (chain_id, genesis URL, rpcs, extra_seeds)
+    $XDG_STATE_HOME/malcom/<id>/node_key.json    cometbft p2p ed25519 identity
+    $XDG_CACHE_HOME/malcom/<id>/                 peer DB, addrbook
+    $XDG_DATA_HOME/malcom/<id>/                  genesis cache
+
+There is no `-config <path>` flag. To isolate a tree:
+
+- Different config: `XDG_CONFIG_HOME=/tmp/foo malcom …`
+- Whole footprint: `env -u XDG_CONFIG_HOME -u XDG_STATE_HOME -u XDG_CACHE_HOME -u XDG_DATA_HOME HOME=/tmp/foo malcom …`
+  (XDG defaults all derive from `$HOME` when unset; the spec deliberately doesn't define a single `XDG_HOME`).
+
+`config.Load()` reads `$XDG_CONFIG_HOME/malcom/config.toml`, sets
+`chainsDir = <its dir>/chains`, and on missing file returns
+"run `malcom init` to create one". `cfg.Resolve(name)` then layers
+chains/<id>.toml on top of the global defaults to produce a fully
+populated `Chain`.
+
+## CLI flag conventions
+
+CLI flags that have config counterparts (`-chain`, `-max-age`, `-rpc`)
+use the **sentinel pattern**: register with the type's zero value,
+and resolution treats `""` / `0` as "fall back to config." This
+suppresses stdlib's auto `(default …)` line. The real default goes
+in the description string via `fmt.Sprintf` against
+`config.DefaultChainID` and `config.DefaultMaxAgeBlocks`, e.g.:
+
+    -chain string
+        chain id (default "cosmoshub-4"; override in config.default_chain)
+    -max-age uint
+        freshness floor in blocks (default 3000; override in config.fetch.max_age_blocks)
+
+This avoids the chicken-egg of "show resolved config in help" while
+keeping a single source of truth for the value (one constant, used
+both as the description text and as the fallback in
+`applyFetchDefaults`). No `seen` map / `fs.Visit` machinery needed.
+
+We considered viper/kong/cobra — none solve the help-text issue
+either; they all show the registered flag default, not the resolved
+post-config value.
 
 **Block archive (experimental, stable):**
 
@@ -93,33 +144,39 @@ hand-rolled snapshot importer).
     # build
     go build -o build/malcom ./cmd/malcom
 
-    # full pipeline (assumes binary built, snapshot will be downloaded)
-    ./build/malcom snapshot fetch -prefer-fresh
+    # one-time setup: writes config.toml + chains/cosmoshub-4.toml
+    # (rpcs + peers populated from cosmos chain-registry).
+    ./build/malcom init
+
+    # full pipeline (chain + tuning come from config; only run-instance
+    # paths/heights are flags).
+    ./build/malcom snapshot fetch -out /mnt/data/cosmos-archive/cosmoshub-4/snapshots
     ./build/malcom snapshot import \
-        -snapshot /mnt/data/cosmos-archive/cosmoshub-4/snapshots/<H>_3 \
-        -out      /mnt/data/cosmos-archive/appdb-out/<H> \
+        -snapshot /mnt/data/cosmos-archive/cosmoshub-4/snapshots/snapshot_cosmoshub-4_<H> \
+        -out      /mnt/data/cosmos-archive/appdb-out \
         -height   <H>
     ./build/malcom bootstrap \
-        -appdb    /mnt/data/cosmos-archive/appdb-out/<H> \
-        -out      /mnt/data/cosmos-archive/gaia-bootstrap/<H> \
-        -genesis  /mnt/data/home/zrbecker/genesis.cosmoshub-4.json \
-        -height   <H> \
-        -rpc      "https://cosmos-rpc.polkachu.com,https://cosmos-rpc.publicnode.com" \
-        -write-configs
+        -appdb    /mnt/data/cosmos-archive/appdb-out/appdb_cosmoshub-4_<H> \
+        -out      /mnt/data/cosmos-archive/gaia-bootstrap \
+        -height   <H>
     cp /tmp/polkachu-addrbook.json \
-        /mnt/data/cosmos-archive/gaia-bootstrap/<H>/config/addrbook.json
+        /mnt/data/cosmos-archive/gaia-bootstrap/gaia_cosmoshub-4_<H>/config/addrbook.json
     nohup /mnt/data/home/zrbecker/bin/gaiad start \
-        --home /mnt/data/cosmos-archive/gaia-bootstrap/<H> \
+        --home /mnt/data/cosmos-archive/gaia-bootstrap/gaia_cosmoshub-4_<H> \
         </dev/null \
-        >/mnt/data/cosmos-archive/gaia-bootstrap/<H>/gaiad.log 2>&1 &
+        >/tmp/gaiad-<H>.log 2>&1 &
 
     # AppHash sanity-check
     ./build/malcom verify \
-        -appdb /mnt/data/cosmos-archive/appdb-out/<H> \
+        -appdb /mnt/data/cosmos-archive/appdb-out/appdb_cosmoshub-4_<H> \
         -height <H>
 
     # pebble manual compaction (slack reclaim outside the import flow)
     ./build/malcom compact -dir /path/to/application.db
+
+    # iteration: reset the malcom XDG tree (keeps backups by default)
+    ./build/malcom clean
+    ./build/malcom clean -clobber   # destructive, no backup
 
 ## Open follow-ons
 
@@ -128,10 +185,13 @@ hand-rolled snapshot importer).
   was a step too far on the "zero cosmos deps" goal; regen from
   copied + simplified `cosmos-sdk/snapshots/types/*.proto`.
 - Snapshot fetch indexing: pre-decompress per-store byte ranges so
-  multiple readers can decompress in parallel. Would unlock real
-  reader-side parallelism (today the zlib stream is single-threaded).
+  multiple readers can decompress in parallel. Today the zlib stream
+  is single-threaded.
 - `experimental/cmd/cosmos-rapid-bootstrap` rework. Currently a
   serial fetch → import → bootstrap → start orchestrator using the
   in-tree CLI packages; the pipelined fetch+import overlap from the
   old wave-parallel path is gone. Refresh design or fold into a
   `malcom run` subcommand.
+- `malcom config show` (long-term, only if config knobs proliferate):
+  prints resolved values after layering. The kubectl/git pattern that
+  sidesteps the "what would `--help` show?" problem.
