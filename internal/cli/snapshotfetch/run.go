@@ -384,11 +384,5 @@ func (d *diskSink) OnComplete(bytesTotal uint64, goodPeerIDs []string, offeredBy
 	if d.logger != nil {
 		d.logger.Info("snapshot saved", "dir", dir)
 	}
-	// We intentionally do NOT call snapfetch.InspectAndEnrich here:
-	// it walks every IAVL node in the snapshot (millions, several
-	// minutes on cosmoshub) and the next pipeline step `malcom
-	// snapshot import` does the same parse anyway — we'd be doing
-	// the work twice. For meta.json enrichment, run
-	// `experimental/cmd/cosmos-snapshot-inspect -dir <dir>` after.
 	return nil
 }
