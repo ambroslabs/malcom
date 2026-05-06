@@ -41,7 +41,7 @@ func Run(args []string) int {
 	chain := fs.String("chain", "", fmt.Sprintf("chain id (default %q; override in config.default_chain)", config.DefaultChainID))
 	out := fs.String("out", ".", "parent dir for the snapshot output (subdir snapshot_<chain>_<height>/ created inside)")
 	targetHeight := fs.Uint64("target-height", 0, "lock to this exact height; otherwise pick the best candidate")
-	currentHeightFlag := fs.Uint64("current-height", 0, "override the chain's current height; skips the RPC /status lookup (useful when RPCs are stale or unreachable)")
+	maxHeightFlag := fs.Uint64("max-height", 0, "upper bound for snapshot selection; skips the RPC /status lookup (useful when RPCs are stale or unreachable). Defaults to the chain's current height.")
 	maxAge := fs.Uint64("max-age", 0, fmt.Sprintf("freshness floor in blocks (default %d; override in config.fetch.max_age_blocks)", config.DefaultMaxAgeBlocks))
 	debug := fs.Bool("debug", false, "verbose snapfetch logging")
 	if err := fs.Parse(args); err != nil {
@@ -97,33 +97,33 @@ func Run(args []string) int {
 
 	fetchLog := logger.With("module", "fetch")
 
-	// Resolve currentHeight. Three paths:
+	// Resolve maxHeight. Three paths:
 	//   - -target-height set: skip lookup entirely (we lock to that one height).
-	//   - -current-height set: use it as-is, skip the RPC.
+	//   - -max-height set: use it as-is, skip the RPC.
 	//   - else: query configured RPCs in order; first success wins.
 	// Failure to resolve when needed is fatal (the walking algorithm
-	// requires a currentHeight to pick its starting target).
-	var currentHeight uint64
+	// requires a maxHeight to pick its starting target).
+	var maxHeight uint64
 	var heightSource string
 	switch {
 	case *targetHeight != 0:
 		// no lookup needed
-	case *currentHeightFlag != 0:
-		currentHeight = *currentHeightFlag
-		heightSource = "-current-height flag"
+	case *maxHeightFlag != 0:
+		maxHeight = *maxHeightFlag
+		heightSource = "-max-height flag"
 	default:
 		if len(ch.RPCs) == 0 {
-			fetchLog.Error("config has no rpcs; pass -target-height or -current-height, or fix chains config",
+			fetchLog.Error("config has no rpcs; pass -target-height or -max-height, or fix chains config",
 				"chain", ch.ChainID)
 			return 1
 		}
 		h, src, err := fetchCurrentHeightVerbose(ch.RPCs, fetchLog)
 		if err != nil {
-			fetchLog.Error("all rpcs failed; cannot determine current height (use -current-height to override)",
+			fetchLog.Error("all rpcs failed; cannot determine chain head (use -max-height to override)",
 				"chain", ch.ChainID, "rpc_count", len(ch.RPCs))
 			return 1
 		}
-		currentHeight = h
+		maxHeight = h
 		heightSource = src
 	}
 
@@ -134,12 +134,12 @@ func Run(args []string) int {
 		effMaxAge = *maxAge
 	}
 	var minHeight uint64
-	if effMaxAge > 0 && currentHeight > effMaxAge {
-		minHeight = currentHeight - effMaxAge
+	if effMaxAge > 0 && maxHeight > effMaxAge {
+		minHeight = maxHeight - effMaxAge
 	}
-	if currentHeight > 0 {
+	if maxHeight > 0 {
 		fetchLog.Info("freshness floor",
-			"current_height", currentHeight,
+			"max_height", maxHeight,
 			"source", heightSource,
 			"max_age_blocks", effMaxAge,
 			"min_height", minHeight)
@@ -165,7 +165,7 @@ func Run(args []string) int {
 		PeerRedialMax:     ch.Fetch.PeerRedials,
 		PeerRedialBackoff: ch.Fetch.RedialBackoff.Duration(),
 		TargetHeight:      *targetHeight,
-		CurrentHeight:     currentHeight,
+		MaxHeight:         maxHeight,
 		MinHeight:         minHeight,
 		SnapshotInterval:  ch.Fetch.SnapshotInterval,
 		PerHeightTimeout:  ch.Fetch.PerHeightTimeout.Duration(),

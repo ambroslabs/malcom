@@ -56,7 +56,7 @@ pex_target_peers   = 48
 pex_max_per_wave   = 8
 
 # After a peer connects we send SnapshotsRequest immediately. Any
-# peer that hasn't advertised a snapshot in [min_height, current_height]
+# peer that hasn't advertised a snapshot in [min_height, max_height]
 # within churn_grace is gracefully disconnected so PEX can dial
 # someone more useful from the addrbook.
 churn_grace = "3s"

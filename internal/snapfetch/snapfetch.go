@@ -84,15 +84,15 @@ type Config struct {
 
 	TargetHeight      uint64
 
-	// CurrentHeight is the chain's latest committed block, looked up
-	// by the cli via RPC. Used as the upper bound when computing the
-	// starting target = floor(CurrentHeight, SnapshotInterval).
+	// MaxHeight is the upper bound for snapshot selection. The cli
+	// resolves it to the chain's current height via RPC by default.
+	// Walking starts from floor(MaxHeight, SnapshotInterval).
 	// Required (the walking algorithm has no useful behavior without it).
-	CurrentHeight uint64
+	MaxHeight uint64
 
 	// MinHeight is the freshness floor: walking stops once the
 	// candidate target height drops below this. Typically
-	// CurrentHeight - MaxAgeBlocks. Zero disables the floor (walks
+	// MaxHeight - MaxAgeBlocks. Zero disables the floor (walks
 	// all the way to height 1 — usually undesirable).
 	MinHeight uint64
 
@@ -761,9 +761,9 @@ func (w *peerWatch) run(ctx context.Context, evs chan statesync.Event) {
 // walkBackward replaces the old discover→rank→race-probe pipeline with
 // a direct walk: it dials seeds, lets PEX warm the peer set for ~3s,
 // then iterates target heights in descending order (interval-aligned)
-// from floor(currentHeight, interval) down to MinHeight. For each
-// target it asks every offering peer for chunk-0 and accepts the
-// first valid response. On timeout it walks back by SnapshotInterval.
+// from floor(MaxHeight, interval) down to MinHeight. For each target
+// it asks every offering peer for chunk-0 and accepts the first valid
+// response. On timeout it walks back by SnapshotInterval.
 //
 // If TargetHeight is set, walks exactly that one height (no fallback).
 //
@@ -812,13 +812,13 @@ func walkBackward(
 	switch {
 	case cfg.TargetHeight != 0:
 		targets = []uint64{cfg.TargetHeight}
-	case cfg.CurrentHeight == 0:
-		return nil, nil, fmt.Errorf("walking requires CurrentHeight > 0 or an explicit TargetHeight")
+	case cfg.MaxHeight == 0:
+		return nil, nil, fmt.Errorf("walking requires MaxHeight > 0 or an explicit TargetHeight")
 	default:
-		targets = walkTargets(cfg.CurrentHeight, cfg.MinHeight, cfg.SnapshotInterval)
+		targets = walkTargets(cfg.MaxHeight, cfg.MinHeight, cfg.SnapshotInterval)
 		if len(targets) == 0 {
 			return nil, nil, fmt.Errorf("no target heights in [%d, %d] with stride %d",
-				cfg.MinHeight, cfg.CurrentHeight, cfg.SnapshotInterval)
+				cfg.MinHeight, cfg.MaxHeight, cfg.SnapshotInterval)
 		}
 	}
 
@@ -1041,7 +1041,7 @@ walkLoop:
 	}
 
 	return nil, nil, fmt.Errorf("no servable snapshot found in window [%d, %d]",
-		cfg.MinHeight, cfg.CurrentHeight)
+		cfg.MinHeight, cfg.MaxHeight)
 }
 
 // offerCount returns the number of distinct snapshot offers we've

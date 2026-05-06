@@ -68,7 +68,7 @@ type FetchTuning struct {
 	// SnapshotInterval is the stride between snapshot heights on the
 	// chain. cosmoshub-4 mints every 1000 blocks; tune per chain.
 	// The walking algorithm uses this to compute target =
-	// floor(currentHeight / interval) * interval and decrement by
+	// floor(maxHeight / interval) * interval and decrement by
 	// interval on each per-height probe failure.
 	SnapshotInterval uint64 `toml:"snapshot_interval"`
 
@@ -93,7 +93,7 @@ type FetchTuning struct {
 	PEXMaxPerWave int `toml:"pex_max_per_wave"`
 
 	// ChurnGrace is how long a freshly-connected peer has to
-	// advertise a snapshot in [MinHeight, CurrentHeight] before
+	// advertise a snapshot in [MinHeight, MaxHeight] before
 	// being dropped as useless. Too short → drop peers before
 	// they respond; too long → dead slots stick around.
 	ChurnGrace duration `toml:"churn_grace"`
