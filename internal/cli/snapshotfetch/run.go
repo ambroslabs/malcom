@@ -1,132 +1,349 @@
 // Package snapshotfetch is the `malcom snapshot fetch` subcommand:
-// discover a fetchable cosmoshub state-sync snapshot, download every
-// chunk with per-chunk hash verification, and write the result to disk
-// in the layout cosmos-bootstrap-gaia / snapshotimport consume.
+// download a state-sync snapshot for the configured chain.
 //
-// Output:
+// Output: <-out>/snapshot_<chain>_<height>/ (chunks + meta.json +
+// metadata.bin + .complete marker). Default -out is the current
+// working directory.
 //
-//	<out>/<height>_<format>/
-//	  meta.json           — height, format, chunks, hash, peers, timing
-//	  metadata.bin        — raw cosmos-sdk Metadata blob
-//	  chunk_NNNNN.bin     — one file per chunk
-//	  .complete           — empty marker, written when every chunk verified
+// Tuning knobs (timeouts, parallelism, peer-selection rules) live in
+// the [chains.<id>.fetch] section of config.toml; only operational
+// flags survive on the CLI.
 package snapshotfetch
 
 import (
 	"context"
 	"encoding/hex"
+	"encoding/json"
+	"errors"
 	"flag"
 	"fmt"
+	"io"
+	"net/http"
 	"os"
 	"os/signal"
 	"path/filepath"
+	"strconv"
+	"strings"
 	"sync"
 	"syscall"
 	"time"
 
 	cmtlog "github.com/cometbft/cometbft/libs/log"
 
+	"github.com/zrbecker/cosmos-p2p/internal/cli/cliutil"
+	"github.com/zrbecker/cosmos-p2p/internal/config"
+	malcomlog "github.com/zrbecker/cosmos-p2p/internal/log"
 	"github.com/zrbecker/cosmos-p2p/internal/snapfetch"
 )
 
-// Run is the malcom subcommand entry point. Returns the process exit
-// code (0 on success).
+// Run is the malcom subcommand entry point.
 func Run(args []string) int {
+	// Two-pass flag handling: peek -config and -chain from raw args
+	// so we can load the config first, then register the rest of the
+	// flags with defaults sourced FROM the config. That makes
+	// `<subcommand> -h` show the actual values that will be used
+	// (e.g. "(default 3000)" for max-age) instead of placeholder zeros.
+	peekedConfig := cliutil.PeekFlag(args, "config")
+	peekedChain := cliutil.PeekFlag(args, "chain")
+
+	cfg, cfgErr := config.LoadOrSuggestInit(peekedConfig)
+	var ch config.Chain
+	chainName := peekedChain
+	if cfgErr == nil {
+		if chainName == "" {
+			chainName = cfg.DefaultChain
+		}
+		var err error
+		ch, err = cfg.Resolve(chainName)
+		if err != nil {
+			cfgErr = err
+		}
+	}
+	// Fallback so -h shows real default values even when config
+	// hasn't been initialized yet. The cfgErr is enforced after
+	// Parse (so help still works); only a real run errors out.
+	if cfgErr != nil {
+		ch = config.DefaultChain()
+		ch.ChainID = config.DefaultChainID
+	}
+	defaultChain := ch.ChainID
+
 	fs := flag.NewFlagSet("malcom snapshot fetch", flag.ContinueOnError)
-	var (
-		chainID      = fs.String("chain-id", "cosmoshub-4", "expected chain ID")
-		cumulativeDB = fs.String("cumulative", "data/peers-cumulative.json", "peer DB from cosmos-crawl runs")
-		addrBookPath = fs.String("addrbook", "data/polkachu_cosmoshub.json", "Polkachu addrbook fallback")
-		nodeKeyPath  = fs.String("node-key", "data/snapfetch_node_key.json", "node key (separate from downloader)")
-		listen       = fs.String("listen", "tcp://0.0.0.0:0", "p2p listen URL")
-		moniker      = fs.String("moniker", "cosmos-p2p-snapfetch", "self-reported moniker")
-		outRoot      = fs.String("out", "/mnt/data/cosmos-archive/cosmoshub-4/snapshots", "snapshot store root")
-
-		discoverFor       = fs.Duration("discover", 25*time.Second, "phase 1: time spent discovering snapshots")
-		dialParallel      = fs.Int("dial-parallel", 32, "max concurrent dials during discovery")
-		maxCandidates     = fs.Int("max-candidates", 5, "phase 2: probe top-N newest unique snapshots in parallel")
-		probeTimeout      = fs.Duration("probe-timeout", 12*time.Second, "phase 2: time to wait for chunk-0 probe replies")
-		minGoodPeers      = fs.Int("min-peers", 1, "phase 2: minimum 'good' peers required to accept a candidate")
-		perPeerLimit      = fs.Int("per-peer", 2, "phase 3: max in-flight chunks per peer (low to avoid pong-timeouts on the peer side)")
-		chunkTimeout      = fs.Duration("chunk-timeout", 45*time.Second, "phase 3: per-chunk wait before re-dispatching")
-		maxFetchTime      = fs.Duration("max-fetch", 30*time.Minute, "phase 3: hard cap on full download")
-		peerFailLimit     = fs.Int("peer-fails", 3, "phase 3: bench a peer after this many missing/hash-mismatch responses (NOT counting disconnects)")
-		peerRedialMax     = fs.Int("peer-redials", 3, "phase 3: max redial attempts when a peer drops the connection")
-		peerRedialBackoff = fs.Duration("redial-backoff", 5*time.Second, "phase 3: minimum wait between redial attempts to the same peer")
-
-		extraSeedsCSV     = fs.String("extra-seeds", "", "comma-separated nodeID@host:port seeds in addition to DB")
-		targetHeight      = fs.Uint64("target-height", 0, "if non-zero, force this exact snapshot height (else pick best)")
-		preferFresh       = fs.Bool("prefer-fresh", false, "rank candidates by newest-height first (peers as tiebreak). Default ranks by peer count first.")
-		maxRescans        = fs.Int("max-rescans", 3, "if all peers fail for the chosen snapshot, rescan up to this many times to find a fresh snapshot (or fall back)")
-		rescanDiscoverFor = fs.Duration("rescan-discover", 15*time.Second, "shorter discovery duration on rescans (peer DB is already warm)")
-		debug             = fs.Bool("debug", false, "verbose logging")
-	)
+	fs.Usage = func() { cliutil.NiceUsage(fs) }
+	chain := fs.String("chain", defaultChain, "chain id (sourced from config.default_chain)")
+	out := fs.String("out", ".", "parent dir for the snapshot output (subdir snapshot_<chain>_<height>/ created inside)")
+	targetHeight := fs.Uint64("target-height", 0, "lock to this exact height; otherwise pick the best candidate")
+	currentHeightFlag := fs.Uint64("current-height", 0, "override the chain's current height; skips the RPC /status lookup (useful when RPCs are stale or unreachable)")
+	maxAge := fs.Uint64("max-age", ch.Fetch.MaxAgeBlocks,
+		"freshness floor in blocks: drop offers older than currentHeight - max-age. 0 disables. (sourced from config.fetch.max_age_blocks)")
+	configPath := fs.String("config", peekedConfig, "config file path (default: $XDG_CONFIG_HOME/malcom/config.toml)")
+	debug := fs.Bool("debug", false, "verbose snapfetch logging")
 	if err := fs.Parse(args); err != nil {
 		return 2
 	}
 
-	logger := cmtlog.NewTMLogger(cmtlog.NewSyncWriter(os.Stderr))
+	if cfgErr != nil {
+		fmt.Fprintln(os.Stderr, cfgErr)
+		return 1
+	}
+	// If user passed an explicit -chain that differs from the peeked
+	// one, re-resolve. Cheap; covers `-config X -chain Y` ordering.
+	if *chain != defaultChain {
+		var err error
+		ch, err = cfg.Resolve(*chain)
+		if err != nil {
+			fmt.Fprintln(os.Stderr, err)
+			return 1
+		}
+	}
+	_ = configPath // already resolved via peekedConfig
+
+	if err := os.MkdirAll(*out, 0o755); err != nil {
+		fmt.Fprintf(os.Stderr, "mkdir out: %v\n", err)
+		return 1
+	}
+	// Ensure node key + cache dirs exist (config.Resolve gave us paths
+	// but didn't create them).
+	if err := os.MkdirAll(filepath.Dir(ch.NodeKey), 0o755); err != nil {
+		fmt.Fprintf(os.Stderr, "mkdir node-key dir: %v\n", err)
+		return 1
+	}
+	if err := os.MkdirAll(filepath.Dir(ch.PeerDB), 0o755); err != nil {
+		fmt.Fprintf(os.Stderr, "mkdir peer-db dir: %v\n", err)
+		return 1
+	}
+
+	// Default mode silences cometbft's per-peer EOF spam — the p2p
+	// module logs every disconnect at Error level even when it's a
+	// normal seed-mode close. -debug flips to AllowDebug (everything).
+	// Pass os.Stderr directly — malcomlog handles its own
+	// serialization, and we need the *os.File for TTY detection.
+	logger := malcomlog.New(os.Stderr)
 	if *debug {
 		logger = cmtlog.NewFilter(logger, cmtlog.AllowDebug())
 	} else {
-		logger = cmtlog.NewFilter(logger, cmtlog.AllowError(),
-			cmtlog.AllowInfoWith("module", "snapfetch"))
+		logger = cmtlog.NewFilter(logger,
+			cmtlog.AllowInfoWith("module", "fetch"),
+			cmtlog.AllowInfoWith("module", "snapfetch"),
+			cmtlog.AllowErrorWith("module", "addrbook"),
+			// pex / p2p / mconnection silenced by default
+		)
 	}
 
-	if err := os.MkdirAll(*outRoot, 0o755); err != nil {
-		fmt.Fprintf(os.Stderr, "mkdir out root: %v\n", err)
-		return 1
-	}
-	fmt.Printf("[snapfetch] out=%s\n", *outRoot)
+	fetchLog := logger.With("module", "fetch")
 
-	cfg := snapfetch.Config{
-		ChainID:           *chainID,
-		NodeKeyPath:       *nodeKeyPath,
-		Listen:            *listen,
-		Moniker:           *moniker,
-		Cumulative:        *cumulativeDB,
-		AddrBook:          *addrBookPath,
-		ExtraSeedsCSV:     *extraSeedsCSV,
-		DiscoverFor:       *discoverFor,
-		DialParallel:      *dialParallel,
-		MaxCandidates:     *maxCandidates,
-		ProbeTimeout:      *probeTimeout,
-		MinGoodPeers:      *minGoodPeers,
-		PerPeerLimit:      *perPeerLimit,
-		ChunkTimeout:      *chunkTimeout,
-		MaxFetchTime:      *maxFetchTime,
-		PeerFailLimit:     *peerFailLimit,
-		PeerRedialMax:     *peerRedialMax,
-		PeerRedialBackoff: *peerRedialBackoff,
+	// Resolve currentHeight. Three paths:
+	//   - -target-height set: skip lookup entirely (we lock to that one height).
+	//   - -current-height set: use it as-is, skip the RPC.
+	//   - else: query configured RPCs in order; first success wins.
+	// Failure to resolve when needed is fatal (the walking algorithm
+	// requires a currentHeight to pick its starting target).
+	var currentHeight uint64
+	var heightSource string
+	switch {
+	case *targetHeight != 0:
+		// no lookup needed
+	case *currentHeightFlag != 0:
+		currentHeight = *currentHeightFlag
+		heightSource = "-current-height flag"
+	default:
+		if len(ch.RPCs) == 0 {
+			fetchLog.Error("config has no rpcs; pass -target-height or -current-height, or fix chains config",
+				"chain", ch.ChainID)
+			return 1
+		}
+		h, src, err := fetchCurrentHeightVerbose(ch.RPCs, fetchLog)
+		if err != nil {
+			fetchLog.Error("all rpcs failed; cannot determine current height (use -current-height to override)",
+				"chain", ch.ChainID, "rpc_count", len(ch.RPCs))
+			return 1
+		}
+		currentHeight = h
+		heightSource = src
+	}
+
+	// Freshness floor.
+	effMaxAge := *maxAge
+	var minHeight uint64
+	if effMaxAge > 0 && currentHeight > effMaxAge {
+		minHeight = currentHeight - effMaxAge
+	}
+	if currentHeight > 0 {
+		fetchLog.Info("freshness floor",
+			"current_height", currentHeight,
+			"source", heightSource,
+			"max_age_blocks", effMaxAge,
+			"min_height", minHeight)
+	}
+
+	scfg := snapfetch.Config{
+		ChainID:           ch.ChainID,
+		NodeKeyPath:       ch.NodeKey,
+		Listen:            ch.Fetch.Listen,
+		Moniker:           ch.Fetch.Moniker,
+		Cumulative:        ch.PeerDB,
+		AddrBook:          ch.AddrBook,
+		ExtraSeedsCSV:     joinCSV(ch.Fetch.ExtraSeeds),
+		DiscoverFor:       ch.Fetch.Discover.Duration(),
+		DialParallel:      ch.Fetch.DialParallel,
+		MaxCandidates:     ch.Fetch.MaxCandidates,
+		ProbeTimeout:      ch.Fetch.ProbeTimeout.Duration(),
+		MinGoodPeers:      ch.Fetch.MinPeers,
+		PerPeerLimit:      ch.Fetch.PerPeer,
+		ChunkTimeout:      ch.Fetch.ChunkTimeout.Duration(),
+		MaxFetchTime:      ch.Fetch.MaxFetch.Duration(),
+		PeerFailLimit:     ch.Fetch.PeerFails,
+		PeerRedialMax:     ch.Fetch.PeerRedials,
+		PeerRedialBackoff: ch.Fetch.RedialBackoff.Duration(),
 		TargetHeight:      *targetHeight,
-		PreferFresh:       *preferFresh,
-		MaxRescans:        *maxRescans,
-		RescanDiscoverFor: *rescanDiscoverFor,
+		CurrentHeight:     currentHeight,
+		MinHeight:         minHeight,
+		SnapshotInterval:  ch.Fetch.SnapshotInterval,
+		PerHeightTimeout:  ch.Fetch.PerHeightTimeout.Duration(),
+		MaxOutboundPeers:  ch.Fetch.MaxOutboundPeers,
+		PEXTargetPeers:    ch.Fetch.PEXTargetPeers,
+		PEXMaxPerWave:     ch.Fetch.PEXMaxPerWave,
+		ChurnGrace:        ch.Fetch.ChurnGrace.Duration(),
+		MaxRescans:        ch.Fetch.MaxRescans,
+		RescanDiscoverFor: ch.Fetch.RescanDiscover.Duration(),
 		Logger:            logger,
 	}
 
-	rootCtx, cancelAll := context.WithCancel(context.Background())
-	defer cancelAll()
+	fetchLog.Info("config", "path", cfg.Path())
+	fetchLog.Info("chain", "id", ch.ChainID)
+	fetchLog.Info("out", "dir", *out)
+	fetchLog.Info("node key", "path", ch.NodeKey)
+
+	rootCtx, cancel := context.WithCancel(context.Background())
+	defer cancel()
 	sigCh := make(chan os.Signal, 1)
 	signal.Notify(sigCh, os.Interrupt, syscall.SIGTERM)
-	go func() { <-sigCh; cancelAll() }()
+	go func() {
+		<-sigCh
+		fetchLog.Info("interrupted, shutting down")
+		cancel()
+	}()
 
-	sink := &diskSink{outRoot: *outRoot}
-	if _, err := snapfetch.RunFetch(rootCtx, cfg, sink); err != nil {
+	sink := &diskSink{outRoot: *out, chainID: ch.ChainID, logger: fetchLog}
+	if _, err := snapfetch.RunFetch(rootCtx, scfg, sink); err != nil {
 		fmt.Fprintf(os.Stderr, "snapfetch: %v\n", err)
 		return 1
 	}
 	return 0
 }
 
-// diskSink writes streamed snapshot output under outRoot/<height>_<format>/.
-// Behaviour matches the original cosmos-snapshot-fetch storage layout
-// exactly so existing snapshotimport.Import + snapshot inspectors keep
-// working unchanged.
+// fetchCurrentHeightVerbose is fetchCurrentHeight with per-URL
+// failure logging — each unreachable RPC gets an Error line so the
+// user can see which to prune from chains/<id>.toml. Returns the
+// successful URL alongside the height so the caller can surface
+// where the value came from (some RPCs cache and are minutes stale).
+func fetchCurrentHeightVerbose(rpcs []string, logger cmtlog.Logger) (uint64, string, error) {
+	if len(rpcs) == 0 {
+		return 0, "", errors.New("no RPC URLs configured")
+	}
+	client := &http.Client{Timeout: 5 * time.Second}
+	for _, base := range rpcs {
+		url := strings.TrimRight(base, "/") + "/status"
+		h, err := tryStatus(client, url)
+		if err == nil {
+			return h, url, nil
+		}
+		logger.Error("rpc unreachable", "url", url, "err", err)
+	}
+	return 0, "", fmt.Errorf("all %d RPCs failed", len(rpcs))
+}
+
+func tryStatus(client *http.Client, url string) (uint64, error) {
+	resp, err := client.Get(url)
+	if err != nil {
+		return 0, err
+	}
+	defer resp.Body.Close()
+	body, _ := io.ReadAll(resp.Body)
+	if resp.StatusCode != 200 {
+		return 0, fmt.Errorf("HTTP %d: %s", resp.StatusCode, body)
+	}
+	var raw struct {
+		Result struct {
+			SyncInfo struct {
+				LatestBlockHeight string `json:"latest_block_height"`
+			} `json:"sync_info"`
+		} `json:"result"`
+	}
+	if err := json.Unmarshal(body, &raw); err != nil {
+		return 0, fmt.Errorf("decode: %w", err)
+	}
+	h, err := strconv.ParseUint(raw.Result.SyncInfo.LatestBlockHeight, 10, 64)
+	if err != nil {
+		return 0, fmt.Errorf("parse height %q: %w", raw.Result.SyncInfo.LatestBlockHeight, err)
+	}
+	return h, nil
+}
+
+// fetchCurrentHeight queries cometbft's /status endpoint on the
+// configured RPCs (in order) and returns the latest block height.
+// Tries each URL with a 5s timeout; returns the first success.
+func fetchCurrentHeight(rpcs []string) (uint64, error) {
+	if len(rpcs) == 0 {
+		return 0, errors.New("no RPC URLs configured")
+	}
+	client := &http.Client{Timeout: 5 * time.Second}
+	var lastErr error
+	for _, base := range rpcs {
+		url := strings.TrimRight(base, "/") + "/status"
+		resp, err := client.Get(url)
+		if err != nil {
+			lastErr = err
+			continue
+		}
+		body, _ := io.ReadAll(resp.Body)
+		resp.Body.Close()
+		if resp.StatusCode != 200 {
+			lastErr = fmt.Errorf("%s: HTTP %d", url, resp.StatusCode)
+			continue
+		}
+		var raw struct {
+			Result struct {
+				SyncInfo struct {
+					LatestBlockHeight string `json:"latest_block_height"`
+				} `json:"sync_info"`
+			} `json:"result"`
+		}
+		if err := json.Unmarshal(body, &raw); err != nil {
+			lastErr = fmt.Errorf("%s: decode: %w", url, err)
+			continue
+		}
+		h, err := strconv.ParseUint(raw.Result.SyncInfo.LatestBlockHeight, 10, 64)
+		if err != nil {
+			lastErr = fmt.Errorf("%s: parse height %q: %w", url, raw.Result.SyncInfo.LatestBlockHeight, err)
+			continue
+		}
+		return h, nil
+	}
+	return 0, fmt.Errorf("all RPCs failed: %w", lastErr)
+}
+
+func joinCSV(items []string) string {
+	if len(items) == 0 {
+		return ""
+	}
+	out := items[0]
+	for _, s := range items[1:] {
+		out += "," + s
+	}
+	return out
+}
+
+// diskSink writes streamed snapshot output under
+// <outRoot>/snapshot_<chain>_<height>/. Layout matches what
+// `malcom snapshot import` reads.
 type diskSink struct {
 	outRoot string
-	mu      sync.Mutex
-	dir     string
+	chainID string
+	logger  cmtlog.Logger
+
+	mu  sync.Mutex
+	dir string
 
 	height uint64
 	format uint32
@@ -138,7 +355,7 @@ type diskSink struct {
 func (d *diskSink) OnChosen(height uint64, format uint32, chunks uint32, hash []byte, metadata []byte, _ [][]byte) error {
 	d.mu.Lock()
 	defer d.mu.Unlock()
-	d.dir = filepath.Join(d.outRoot, fmt.Sprintf("%d_%d", height, format))
+	d.dir = filepath.Join(d.outRoot, fmt.Sprintf("snapshot_%s_%d", d.chainID, height))
 	if err := os.MkdirAll(d.dir, 0o755); err != nil {
 		return fmt.Errorf("mkdir snapshot dir: %w", err)
 	}
@@ -195,9 +412,14 @@ func (d *diskSink) OnComplete(bytesTotal uint64, goodPeerIDs []string, offeredBy
 	if err := os.WriteFile(filepath.Join(dir, ".complete"), nil, 0o644); err != nil {
 		return fmt.Errorf("mark complete: %w", err)
 	}
-	fmt.Printf("            dir=%s\n", dir)
-	if err := snapfetch.InspectAndEnrich(dir); err != nil {
-		fmt.Printf("[snapfetch] inspect skipped: %v\n", err)
+	if d.logger != nil {
+		d.logger.Info("snapshot saved", "dir", dir)
 	}
+	// We intentionally do NOT call snapfetch.InspectAndEnrich here:
+	// it walks every IAVL node in the snapshot (millions, several
+	// minutes on cosmoshub) and the next pipeline step `malcom
+	// snapshot import` does the same parse anyway — we'd be doing
+	// the work twice. For meta.json enrichment, run
+	// `experimental/cmd/cosmos-snapshot-inspect -dir <dir>` after.
 	return nil
 }

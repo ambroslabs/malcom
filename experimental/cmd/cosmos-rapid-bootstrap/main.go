@@ -275,9 +275,9 @@ func runFetch(b *Bench, ctx context.Context, stagingRoot string) (string, int64)
 		ChainID:     *chainID,
 		NodeKeyPath: *nodeKeyPath,
 		Cumulative:  *peersFile,
-		PreferFresh: *preferFresh,
 		Logger:      buildSnapfetchLogger(*debugFetch),
 	}
+	_ = *preferFresh // legacy flag, ignored after PreferFresh was replaced by MinHeight
 	if *addrbookURL != "" {
 		path, err := materializeAddrbook(*addrbookURL)
 		if err != nil {

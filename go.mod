@@ -2,7 +2,10 @@ module github.com/zrbecker/cosmos-p2p
 
 go 1.23.4
 
-require github.com/cometbft/cometbft v0.38.22
+require (
+	github.com/BurntSushi/toml v1.6.0
+	github.com/cometbft/cometbft v0.38.22
+)
 
 require (
 	github.com/google/orderedcode v0.0.1 // indirect

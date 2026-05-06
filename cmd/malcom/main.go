@@ -16,7 +16,9 @@ import (
 	"os"
 
 	"github.com/zrbecker/cosmos-p2p/internal/cli/bootstrap"
+	"github.com/zrbecker/cosmos-p2p/internal/cli/cleancmd"
 	"github.com/zrbecker/cosmos-p2p/internal/cli/compact"
+	"github.com/zrbecker/cosmos-p2p/internal/cli/initcmd"
 	"github.com/zrbecker/cosmos-p2p/internal/cli/snapshotfetch"
 	"github.com/zrbecker/cosmos-p2p/internal/cli/snapshotimport"
 	"github.com/zrbecker/cosmos-p2p/internal/cli/verify"
@@ -29,6 +31,10 @@ func main() {
 	}
 	rest := os.Args[2:]
 	switch os.Args[1] {
+	case "init":
+		os.Exit(initcmd.Run(rest))
+	case "clean":
+		os.Exit(cleancmd.Run(rest))
 	case "snapshot":
 		os.Exit(snapshotDispatch(rest))
 	case "bootstrap":
@@ -73,6 +79,8 @@ func usage() {
 usage: malcom <command> [args...]
 
 commands:
+  init               seed XDG dirs + config.toml + p2p node key
+  clean              back up (or -clobber) the XDG malcom dirs
   snapshot fetch     download a cosmoshub state-sync snapshot
   snapshot import    convert a snapshot dir into application.db + extensions/
   bootstrap          assemble a runnable gaiad home directory

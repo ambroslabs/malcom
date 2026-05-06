@@ -33,9 +33,11 @@ import (
 	cmtlog "github.com/cometbft/cometbft/libs/log"
 	"github.com/cometbft/cometbft/p2p"
 	"github.com/cometbft/cometbft/p2p/conn"
+	pexcb "github.com/cometbft/cometbft/p2p/pex"
 	"github.com/cometbft/cometbft/version"
 
 	"github.com/zrbecker/cosmos-p2p/internal/crawler"
+	localpex "github.com/zrbecker/cosmos-p2p/internal/pex"
 	"github.com/zrbecker/cosmos-p2p/internal/peers"
 	"github.com/zrbecker/cosmos-p2p/internal/snapshotinspect"
 	"github.com/zrbecker/cosmos-p2p/internal/statesync"
@@ -81,7 +83,40 @@ type Config struct {
 	WarmRefreshInterval time.Duration // default 5s
 
 	TargetHeight      uint64
-	PreferFresh       bool
+
+	// CurrentHeight is the chain's latest committed block, looked up
+	// by the cli via RPC. Used as the upper bound when computing the
+	// starting target = floor(CurrentHeight, SnapshotInterval).
+	// Required (the walking algorithm has no useful behavior without it).
+	CurrentHeight uint64
+
+	// MinHeight is the freshness floor: walking stops once the
+	// candidate target height drops below this. Typically
+	// CurrentHeight - MaxAgeBlocks. Zero disables the floor (walks
+	// all the way to height 1 — usually undesirable).
+	MinHeight uint64
+
+	// SnapshotInterval is the chain's snapshot stride (cosmoshub
+	// mints every 1000 blocks). Walking decrements target by this on
+	// each per-height failure.
+	SnapshotInterval uint64
+
+	// PerHeightTimeout is how long to wait for a peer to serve
+	// chunk-0 at the current target height before walking back.
+	PerHeightTimeout time.Duration
+
+	// MaxOutboundPeers is the hard cap on the cometbft Switch's
+	// outbound connection count.
+	MaxOutboundPeers int
+
+	// PEXTargetPeers / PEXMaxPerWave control our PEX auto-dial
+	// reactor's pace. TargetPeers should be < MaxOutboundPeers.
+	PEXTargetPeers int
+	PEXMaxPerWave  int
+
+	// ChurnGrace is how long a connected peer has to advertise a
+	// useful snapshot before being dropped. See walkBackward.
+	ChurnGrace time.Duration
 	MaxRescans        int           // default 3
 	RescanDiscoverFor time.Duration // default 15s
 
@@ -146,6 +181,24 @@ func (c *Config) applyDefaults() {
 	}
 	if c.RescanDiscoverFor == 0 {
 		c.RescanDiscoverFor = 15 * time.Second
+	}
+	if c.SnapshotInterval == 0 {
+		c.SnapshotInterval = 1000
+	}
+	if c.PerHeightTimeout == 0 {
+		c.PerHeightTimeout = 10 * time.Second
+	}
+	if c.MaxOutboundPeers == 0 {
+		c.MaxOutboundPeers = 64
+	}
+	if c.PEXTargetPeers == 0 {
+		c.PEXTargetPeers = 48
+	}
+	if c.PEXMaxPerWave == 0 {
+		c.PEXMaxPerWave = 8
+	}
+	if c.ChurnGrace == 0 {
+		c.ChurnGrace = 3 * time.Second
 	}
 	if c.Logger == nil {
 		c.Logger = cmtlog.NewNopLogger()
@@ -266,19 +319,24 @@ func RunFetch(ctx context.Context, cfg Config, sink Sink) (*Result, error) {
 			addrByNodeID[parts[0]] = s.addr
 		}
 	}
-	fmt.Printf("[snapfetch] node_id=%s seeds=%d\n", nodeKey.ID(), len(seeds))
+	logger.With("module", "snapfetch").Info("starting",
+		"node_id", string(nodeKey.ID()), "seeds", len(seeds))
 
 	listenAddr, err := p2p.NewNetAddressString(p2p.IDAddressString(nodeKey.ID(), cfg.Listen))
 	if err != nil {
 		return nil, fmt.Errorf("listen addr: %w", err)
 	}
+	// Channels: PEX (0x00) lets us harvest addresses from peers via
+	// cometbft's peer-exchange; state-sync (0x60/0x61) is what we're
+	// here for. Advertising 0x00 is what makes well-behaved peers
+	// reply to our PexRequest.
 	nodeInfo := p2p.DefaultNodeInfo{
 		ProtocolVersion: p2p.NewProtocolVersion(version.P2PProtocol, version.BlockProtocol, 0),
 		DefaultNodeID:   nodeKey.ID(),
 		ListenAddr:      listenAddr.DialString(),
 		Network:         cfg.ChainID,
 		Version:         version.TMCoreSemVer,
-		Channels:        []byte{statesync.SnapshotChannel, statesync.ChunkChannel},
+		Channels:        []byte{localpex.Channel, statesync.SnapshotChannel, statesync.ChunkChannel},
 		Moniker:         cfg.Moniker,
 		Other:           p2p.DefaultNodeInfoOther{TxIndex: "off"},
 	}
@@ -286,6 +344,7 @@ func RunFetch(ctx context.Context, cfg Config, sink Sink) (*Result, error) {
 		return nil, fmt.Errorf("nodeInfo invalid: %w", err)
 	}
 	p2pConfig := buildP2PConfig()
+	p2pConfig.MaxNumOutboundPeers = cfg.MaxOutboundPeers
 	mConfig := buildMConnConfig()
 
 	transport := p2p.NewMultiplexTransport(nodeInfo, *nodeKey, mConfig)
@@ -294,21 +353,88 @@ func RunFetch(ctx context.Context, cfg Config, sink Sink) (*Result, error) {
 	}
 	ssR := statesync.NewReactor(logger.With("module", "statesync"))
 	ssR.KeepBytes = true
+
+	// AddrBook holds peer addresses learned via PEX (and seeded with
+	// our extra_seeds list at startup). cometbft's implementation —
+	// JSON-persistent, bucket-balanced, freshness-tracked.
+	bookPath := cfg.AddrBook
+	if bookPath == "" {
+		bookPath = filepath.Join(filepath.Dir(cfg.NodeKeyPath), "addrbook.json")
+	}
+	if err := os.MkdirAll(filepath.Dir(bookPath), 0o755); err != nil {
+		return nil, fmt.Errorf("mkdir addrbook dir: %w", err)
+	}
+	book := pexcb.NewAddrBook(bookPath, false /* routabilityStrict */)
+	book.SetLogger(logger.With("module", "addrbook"))
+
+	// PEX reactor: sends PexRequest on every AddPeer, writes received
+	// PexAddrs to the book, and runs a dial loop that grows the
+	// connected-peer set toward TargetPeers in parallel waves. ~30×
+	// more aggressive than cometbft's ensurePeers default — we're a
+	// one-shot fetcher, not a long-running node.
+	pexR := localpex.NewAutoReactor(book, localpex.AutoConfig{
+		TargetPeers:  cfg.PEXTargetPeers,
+		MaxPerWave:   cfg.PEXMaxPerWave,
+		DialInterval: 2 * time.Second,
+		BookBias:     50,
+	}, logger.With("module", "pex"))
+
 	sw := p2p.NewSwitch(p2pConfig, transport)
 	sw.SetLogger(logger.With("module", "p2p"))
 	sw.SetNodeKey(nodeKey)
 	sw.SetNodeInfo(nodeInfo)
+	sw.SetAddrBook(book)
+	sw.AddReactor("PEX", pexR)
 	sw.AddReactor("STATESYNC", ssR)
+
+	// Don't dial ourselves.
+	if selfAddr, err := p2p.NewNetAddressString(p2p.IDAddressString(nodeKey.ID(), listenAddr.DialString())); err == nil {
+		book.AddOurAddress(selfAddr)
+	}
+
+	// Seed the book with our extra_seeds (chain-registry entries).
+	// Source = seed's own address (it "told us about itself").
+	seeded := 0
+	for _, s := range seeds {
+		na, err := p2p.NewNetAddressString(s.addr)
+		if err != nil {
+			continue
+		}
+		if err := book.AddAddress(na, na); err == nil {
+			seeded++
+		}
+	}
+	logger.With("module", "snapfetch").Info("addrbook ready",
+		"path", bookPath, "seeded", seeded)
+
 	if err := sw.Start(); err != nil {
 		return nil, fmt.Errorf("switch.Start: %w", err)
 	}
-	defer func() { _ = sw.Stop() }()
+	// Defers run LIFO. book.Save first (fast, JSON dump), then sw.Stop
+	// — but skip sw.Stop on ctx cancel: cometbft's clean peer-disconnect
+	// can take 5-10s with many peers, and the OS reaps the TCP sockets
+	// regardless when the process exits.
+	defer func() {
+		if ctx.Err() != nil {
+			return
+		}
+		_ = sw.Stop()
+	}()
+	defer book.Save()
 
 	flog := logger.With("module", "snapfetch")
 	mux := newEventMux(ctx, ssR.Out)
 	defer mux.stop()
 
-	failedKeys := map[string]bool{}
+	// peerWatch: long-lived churn loop. Spans both walking and
+	// downloading phases — drops peers that don't advertise anything
+	// in our freshness window, and addrbook-bans them so PEX picks
+	// fresher candidates. Started here so churn pressure is on the
+	// peer set from the moment we start collecting offers.
+	watchCtx, watchCancel := context.WithCancel(ctx)
+	defer watchCancel()
+	watch := newPeerWatch(sw, book, cfg.MinHeight, cfg.ChurnGrace, flog)
+	go watch.run(watchCtx, mux.subscribe())
 
 	var (
 		chosen      *snapshotOffer
@@ -316,89 +442,44 @@ func RunFetch(ctx context.Context, cfg Config, sink Sink) (*Result, error) {
 		bytesTotal  uint64
 		chunkHashes [][]byte
 	)
-	attempts := cfg.MaxRescans + 1
-	for attempt := 0; attempt < attempts; attempt++ {
-		discDur := cfg.DiscoverFor
-		if attempt > 0 {
-			discDur = cfg.RescanDiscoverFor
-			fmt.Printf("\n[snapfetch] === RESCAN attempt %d/%d (failed targets: %d) ===\n",
-				attempt, cfg.MaxRescans, len(failedKeys))
-		}
 
-		// ─── Phase 1: discover ─────────────────────────────────────────
-		offers := discover(ctx, sw, mux.subscribe(), seeds, cfg.DialParallel, discDur, flog)
-		if len(offers) == 0 {
-			flog.Error("no snapshots discovered")
-			continue
-		}
-		for k := range failedKeys {
-			delete(offers, k)
-		}
-		candidates := rankCandidates(offers, cfg.TargetHeight, cfg.MaxCandidates, cfg.PreferFresh)
-		if len(candidates) == 0 {
-			flog.Error("no usable candidates after exclusions")
-			continue
-		}
-		fmt.Printf("\n[snapfetch] candidate snapshots (attempt %d):\n", attempt+1)
-		for i, c := range candidates {
-			fmt.Printf("  %d) height=%d format=%d chunks=%d peers=%d hash=%s\n",
-				i+1, c.Height, c.Format, c.Chunks, len(c.Peers), hex.EncodeToString(c.Hash)[:16])
-		}
-
-		// ─── Phase 2: race chunk-0 probes ──────────────────────────────
-		c, peerIDs := raceProbe(ctx, sw, ssR, mux.subscribe(), candidates, addrByNodeID, cfg.ProbeTimeout, cfg.MinGoodPeers, cfg.PreferFresh, flog)
-		if c == nil {
-			flog.Error("no candidate had enough good peers", "min_peers", cfg.MinGoodPeers)
-			continue
-		}
-		chosen, goodPeers = c, peerIDs
-		fmt.Printf("\n[snapfetch] chosen: height=%d format=%d chunks=%d good_peers=%d hash=%s\n",
-			chosen.Height, chosen.Format, chosen.Chunks, len(goodPeers), hex.EncodeToString(chosen.Hash)[:16])
-
-		var perr error
-		chunkHashes, perr = parseChunkHashes(chosen.Metadata)
-		if perr != nil {
-			flog.Error("parse chunk_hashes", "err", perr)
-			failedKeys[snapKeyOffer(chosen)] = true
-			chosen = nil
-			continue
-		}
-		if uint32(len(chunkHashes)) != chosen.Chunks {
-			flog.Error("metadata mismatch",
-				"chunk_hashes", len(chunkHashes), "expected", chosen.Chunks)
-			failedKeys[snapKeyOffer(chosen)] = true
-			chosen = nil
-			continue
-		}
-
-		// Hand metadata + chunk hashes to the sink before any chunk
-		// arrives. Streaming sinks need this to allocate a reorder
-		// buffer / spawn a downstream importer keyed on chunk count.
-		if err := sink.OnChosen(chosen.Height, chosen.Format, chosen.Chunks, chosen.Hash, chosen.Metadata, chunkHashes); err != nil {
-			return nil, fmt.Errorf("sink.OnChosen: %w", err)
-		}
-
-		// ─── Phase 3: download all chunks ─────────────────────────────
-		fetchCtx, fetchCancel := context.WithTimeout(ctx, cfg.MaxFetchTime)
-		bt, derr := download(fetchCtx, sw, ssR, mux.subscribe(),
-			chosen, chunkHashes, goodPeers, addrByNodeID, sink, seeds,
-			cfg.PerPeerLimit, cfg.ChunkTimeout, cfg.PeerFailLimit,
-			cfg.PeerRedialBackoff, cfg.MaxRedialBackoff,
-			cfg.WarmPeerTarget, cfg.WarmRefreshInterval, flog)
-		fetchCancel()
-		if derr != nil {
-			flog.Error("download failed; will rescan",
-				"chosen_height", chosen.Height, "err", derr)
-			failedKeys[snapKeyOffer(chosen)] = true
-			chosen = nil
-			continue
-		}
-		bytesTotal = bt
-		break
+	// Walk: dial seeds, warm up, then probe target heights in
+	// descending order until one peer serves chunk-0. No rescan
+	// loop — if the walk exhausts the freshness window, error out.
+	chosen, goodPeers, err = walkBackward(ctx, sw, ssR, mux, seeds,
+		cfg, addrByNodeID, flog)
+	if err != nil {
+		return nil, err
 	}
-	if chosen == nil {
-		return nil, fmt.Errorf("exhausted %d rescan attempts without a successful download", attempts)
+
+	chunkHashes, err = parseChunkHashes(chosen.Metadata)
+	if err != nil {
+		return nil, fmt.Errorf("parse chunk_hashes: %w", err)
 	}
+	if uint32(len(chunkHashes)) != chosen.Chunks {
+		return nil, fmt.Errorf("metadata mismatch: chunk_hashes=%d expected=%d",
+			len(chunkHashes), chosen.Chunks)
+	}
+
+	// Hand metadata + chunk hashes to the sink before any chunk arrives.
+	// Streaming sinks need this to allocate a reorder buffer / spawn a
+	// downstream importer keyed on chunk count.
+	if err := sink.OnChosen(chosen.Height, chosen.Format, chosen.Chunks, chosen.Hash, chosen.Metadata, chunkHashes); err != nil {
+		return nil, fmt.Errorf("sink.OnChosen: %w", err)
+	}
+
+	// ─── Phase 3: download all chunks ─────────────────────────────────
+	fetchCtx, fetchCancel := context.WithTimeout(ctx, cfg.MaxFetchTime)
+	bt, derr := download(fetchCtx, sw, ssR, mux.subscribe(),
+		chosen, chunkHashes, goodPeers, addrByNodeID, sink, seeds,
+		cfg.PerPeerLimit, cfg.ChunkTimeout, cfg.PeerFailLimit,
+		cfg.PeerRedialBackoff, cfg.MaxRedialBackoff,
+		cfg.WarmPeerTarget, cfg.WarmRefreshInterval, watch, flog)
+	fetchCancel()
+	if derr != nil {
+		return nil, fmt.Errorf("download failed: %w", derr)
+	}
+	bytesTotal = bt
 
 	offered := make([]string, 0, len(chosen.Peers))
 	for p := range chosen.Peers {
@@ -414,8 +495,9 @@ func RunFetch(ctx context.Context, cfg Config, sink Sink) (*Result, error) {
 	if err := sink.OnComplete(bytesTotal, good, offered); err != nil {
 		return nil, fmt.Errorf("sink.OnComplete: %w", err)
 	}
-	fmt.Printf("\n[snapfetch] DONE  height=%d format=%d chunks=%d bytes=%s\n",
-		chosen.Height, chosen.Format, chosen.Chunks, humanBytes(bytesTotal))
+	flog.Info("download complete",
+		"height", chosen.Height, "format", chosen.Format,
+		"chunks", chosen.Chunks, "bytes", humanBytes(bytesTotal))
 
 	return &Result{
 		Height:      chosen.Height,
@@ -435,7 +517,11 @@ func buildP2PConfig() *cfg.P2PConfig {
 	p.AllowDuplicateIP = true
 	p.HandshakeTimeout = 5 * time.Second
 	p.DialTimeout = 5 * time.Second
-	p.MaxNumOutboundPeers = 256
+	// Cap outbound peers below cometbft's 256 hard ceiling. Caller
+	// can override via Config.MaxOutboundPeers; 64 is the polite-low
+	// default that still absorbs PEX-harvested addrbooks dominated
+	// by non-snapshot peers.
+	p.MaxNumOutboundPeers = 64 // overridden in NewSwitch by Config below
 	return p
 }
 
@@ -456,9 +542,12 @@ func buildMConnConfig() conn.MConnConfig {
 
 // InspectAndEnrich runs the snapshotinspect package on a completed
 // snapshot directory and rewrites meta.json with structural details.
-// Used by the disk-sink CLI; streaming sinks don't need it.
-func InspectAndEnrich(dir string) error {
-	fmt.Printf("\n[snapfetch] inspecting (decompress + parse SnapshotItem stream)...\n")
+// Used by the disk-sink CLI; streaming sinks don't need it. logger
+// may be nil for silent operation.
+func InspectAndEnrich(dir string, logger cmtlog.Logger) error {
+	if logger != nil {
+		logger.Info("inspecting", "dir", dir)
+	}
 	t0 := time.Now()
 	res, err := snapshotinspect.Inspect(dir)
 	if err != nil {
@@ -499,11 +588,14 @@ func InspectAndEnrich(dir string) error {
 	if err := os.WriteFile(mp, append(enriched, '\n'), 0o644); err != nil {
 		return err
 	}
-	fmt.Printf("[snapfetch] inspect: %d items, decompressed=%s, %d stores, %d extensions in %s\n",
-		res.TotalItems,
-		snapshotinspect.HumanBytes(res.DecompressedBytes),
-		len(res.Stores), len(res.Extensions),
-		time.Since(t0).Truncate(time.Millisecond))
+	if logger != nil {
+		logger.Info("inspect complete",
+			"items", res.TotalItems,
+			"decompressed", snapshotinspect.HumanBytes(res.DecompressedBytes),
+			"stores", len(res.Stores),
+			"extensions", len(res.Extensions),
+			"elapsed", time.Since(t0).Truncate(time.Millisecond))
+	}
 	return nil
 }
 
@@ -555,16 +647,447 @@ func (m *eventMux) subscribe() chan statesync.Event {
 
 func (m *eventMux) stop() { close(m.close) }
 
-// ─── Phase 1 ─────────────────────────────────────────────────────────────
+// ─── peerWatch: long-lived churn loop ──────────────────────────────────
+//
+// Spans walk + download. Listens for SnapshotsResponse events; marks
+// each peer "useful" if it ever advertised a snapshot at height
+// >= minHeight. On a 1s tick, peers connected for ≥ grace with no
+// useful flag get StopPeerGracefully'd AND MarkBad'd in the addrbook
+// (1h ban) so PEX won't re-dial them this run.
+//
+// minHeight = 0 disables churning (peerWatch still subscribes; just
+// never drops anyone).
+type peerWatch struct {
+	sw        *p2p.Switch
+	book      pexcb.AddrBook
+	minHeight uint64
+	grace     time.Duration
+	log       cmtlog.Logger
+
+	mu        sync.Mutex
+	firstSeen map[p2p.ID]time.Time
+	useful    map[p2p.ID]bool
+}
+
+func newPeerWatch(sw *p2p.Switch, book pexcb.AddrBook, minHeight uint64, grace time.Duration, log cmtlog.Logger) *peerWatch {
+	return &peerWatch{
+		sw:        sw,
+		book:      book,
+		minHeight: minHeight,
+		grace:     grace,
+		log:       log,
+		firstSeen: map[p2p.ID]time.Time{},
+		useful:    map[p2p.ID]bool{},
+	}
+}
+
+// markUseful records that the named peer offered something inside
+// our freshness window. Safe to call from any goroutine.
+func (w *peerWatch) markUseful(peerID p2p.ID) {
+	w.mu.Lock()
+	w.useful[peerID] = true
+	w.mu.Unlock()
+}
+
+// banPeer is the one-stop shop for "this peer is useless; evict it":
+// disconnect + addrbook-ban. Used by both the periodic churn tick
+// and download()'s misbehavior path.
+func (w *peerWatch) banPeer(peer p2p.Peer, reason string) {
+	addr := peer.SocketAddr()
+	w.log.Debug("evicting peer", "peer", string(peer.ID()), "reason", reason)
+	w.sw.StopPeerGracefully(peer)
+	if w.book != nil {
+		w.book.MarkBad(addr, time.Hour)
+	}
+	w.mu.Lock()
+	delete(w.firstSeen, peer.ID())
+	w.mu.Unlock()
+}
+
+func (w *peerWatch) tick() {
+	if w.minHeight == 0 {
+		return
+	}
+	now := time.Now()
+	for _, peer := range w.sw.Peers().List() {
+		id := peer.ID()
+		w.mu.Lock()
+		if _, ok := w.firstSeen[id]; !ok {
+			w.firstSeen[id] = now
+			w.mu.Unlock()
+			continue
+		}
+		if w.useful[id] {
+			w.mu.Unlock()
+			continue
+		}
+		first := w.firstSeen[id]
+		w.mu.Unlock()
+		if now.Sub(first) < w.grace {
+			continue
+		}
+		w.banPeer(peer, "no useful offer in window")
+	}
+}
+
+// run is the watcher's main loop. Subscribes to evs (the caller
+// supplies the mux subscription so subscriber lifecycle matches
+// peerWatch's). Returns when ctx is cancelled.
+func (w *peerWatch) run(ctx context.Context, evs chan statesync.Event) {
+	t := time.NewTicker(1 * time.Second)
+	defer t.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-t.C:
+			w.tick()
+		case ev, ok := <-evs:
+			if !ok {
+				return
+			}
+			if ev.Snapshot == nil {
+				continue
+			}
+			if w.minHeight == 0 || ev.Snapshot.Height >= w.minHeight {
+				w.markUseful(p2p.ID(ev.PeerID))
+			}
+		}
+	}
+}
+
+// ─── Walking algorithm: deterministic newest-first picker ───────────────
+
+// walkBackward replaces the old discover→rank→race-probe pipeline with
+// a direct walk: it dials seeds, lets PEX warm the peer set for ~3s,
+// then iterates target heights in descending order (interval-aligned)
+// from floor(currentHeight, interval) down to MinHeight. For each
+// target it asks every offering peer for chunk-0 and accepts the
+// first valid response. On timeout it walks back by SnapshotInterval.
+//
+// If TargetHeight is set, walks exactly that one height (no fallback).
+//
+// Returns the chosen offer + a starter good-peers list (the chunk-0
+// responder, plus any peer in the offer's Peers map; phase 3
+// dispatches to all of them).
+func walkBackward(
+	ctx context.Context,
+	sw *p2p.Switch,
+	ssR *statesync.Reactor,
+	mux *eventMux,
+	seeds []peerSeed,
+	cfg Config,
+	addrByNodeID map[string]string,
+	logger cmtlog.Logger,
+) (*snapshotOffer, []p2p.ID, error) {
+	_ = addrByNodeID
+
+	// Subscribe to events BEFORE dialing so any SnapshotsResponse
+	// arriving during the seed-dial wave + warmup is captured (the
+	// mux drops events when there are no subscribers).
+	evs := mux.subscribe()
+
+	// Kickstart: fire-and-forget dials to a capped subset of seeds.
+	// We don't wait for results — each unreachable peer can take 30s+
+	// to time out, and with PEX-accumulated addrbooks of thousands of
+	// peers a synchronous wait would stall fetch for tens of minutes.
+	// PEX's auto-dial loop (running on a 2s tick against the addrbook)
+	// handles the rest.
+	const kickstartCap = 64
+	{
+		addrs := make([]string, 0, kickstartCap)
+		for i, s := range seeds {
+			if i >= kickstartCap {
+				break
+			}
+			addrs = append(addrs, s.addr)
+		}
+		if err := sw.DialPeersAsync(addrs); err != nil {
+			logger.Error("kickstart dial", "err", err)
+		}
+	}
+
+	// Target list.
+	var targets []uint64
+	switch {
+	case cfg.TargetHeight != 0:
+		targets = []uint64{cfg.TargetHeight}
+	case cfg.CurrentHeight == 0:
+		return nil, nil, fmt.Errorf("walking requires CurrentHeight > 0 or an explicit TargetHeight")
+	default:
+		targets = walkTargets(cfg.CurrentHeight, cfg.MinHeight, cfg.SnapshotInterval)
+		if len(targets) == 0 {
+			return nil, nil, fmt.Errorf("no target heights in [%d, %d] with stride %d",
+				cfg.MinHeight, cfg.CurrentHeight, cfg.SnapshotInterval)
+		}
+	}
+
+	// Single subscription drives both offer collection and chunk-0
+	// reception. New SnapshotsResponse events update the offers map;
+	// new ChunkResponse events at the current target trigger acceptance.
+	// (`evs` was subscribed earlier, before the dial wave.)
+	offers := map[string]*snapshotOffer{}
+	offerByHeight := map[uint64][]string{}
+
+	// Churn lives in peerWatch (started by RunFetch). We just collect
+	// offers here; peerWatch sees them via its own subscription.
+
+	addOffer := func(s *statesync.Snapshot, peerID string) {
+		k := snapKey(s)
+		rec, ok := offers[k]
+		if !ok {
+			rec = &snapshotOffer{
+				Height:   s.Height,
+				Format:   s.Format,
+				Chunks:   s.Chunks,
+				Hash:     s.Hash,
+				Metadata: s.Metadata,
+				Peers:    map[string]bool{},
+			}
+			offers[k] = rec
+			offerByHeight[s.Height] = append(offerByHeight[s.Height], k)
+		}
+		rec.Peers[peerID] = true
+	}
+
+	// Drain any events that arrived during the seed-dial wave into
+	// the offers map BEFORE we start the 3s warmup. Otherwise the
+	// warmup `time.After` blocks the receive loop and offers
+	// accumulate in the channel buffer.
+	drainEvents := func() {
+		for {
+			select {
+			case ev := <-evs:
+				if ev.Snapshot != nil {
+					addOffer(ev.Snapshot, ev.PeerID)
+				}
+			default:
+				return
+			}
+		}
+	}
+	drainEvents()
+
+	// 3s warmup so PEX-harvested peers can connect and send their
+	// SnapshotsResponse. Drain again afterward.
+	warmupDeadline := time.NewTimer(3 * time.Second)
+	for {
+		drainEvents()
+		select {
+		case <-ctx.Done():
+			warmupDeadline.Stop()
+			return nil, nil, ctx.Err()
+		case <-warmupDeadline.C:
+			drainEvents()
+			goto walkLoop
+		case ev := <-evs:
+			if ev.Snapshot != nil {
+				addOffer(ev.Snapshot, ev.PeerID)
+			}
+		}
+	}
+walkLoop:
+	// Dynamic target queue. Walks the precomputed `targets` (newest
+	// first) but allows jumping back UP if a fresher offer arrives
+	// mid-iteration. `failed` records heights whose deadline has
+	// expired (don't revisit). `asked` tracks (peer, snapKey)
+	// pairs across iterations so jumping doesn't re-spam peers we
+	// already asked.
+	queue := append([]uint64(nil), targets...)
+	failed := map[uint64]bool{}
+	asked := map[string]bool{}
+	askKey := func(peerID, k string) string { return peerID + ":" + k }
+
+	dispatch := func(target uint64) int {
+		n := 0
+		for _, k := range offerByHeight[target] {
+			offer := offers[k]
+			for pid := range offer.Peers {
+				ak := askKey(pid, k)
+				if asked[ak] {
+					continue
+				}
+				peer := sw.Peers().Get(p2p.ID(pid))
+				if peer == nil {
+					continue
+				}
+				if ssR.RequestChunk(peer, offer.Height, offer.Format, 0) {
+					asked[ak] = true
+					n++
+				}
+			}
+		}
+		return n
+	}
+
+	for len(queue) > 0 {
+		if ctx.Err() != nil {
+			return nil, nil, ctx.Err()
+		}
+		target := queue[0]
+		queue = queue[1:]
+		if failed[target] {
+			continue
+		}
+
+		initialAsks := dispatch(target)
+		out, _, dialing := sw.NumPeers()
+		logger.Info("searching for snapshot",
+			"height", target,
+			"asking_peers", initialAsks,
+			"connected", out,
+			"dialing", dialing,
+			"book_size", offerCount(offers))
+
+		deadline := time.NewTimer(cfg.PerHeightTimeout)
+		var accepted *snapshotOffer
+		var responder p2p.ID
+		jumped := false
+	heightLoop:
+		for {
+			select {
+			case <-ctx.Done():
+				deadline.Stop()
+				return nil, nil, ctx.Err()
+			case <-deadline.C:
+				break heightLoop
+			case ev, ok := <-evs:
+				if !ok {
+					deadline.Stop()
+					return nil, nil, fmt.Errorf("event channel closed")
+				}
+				if ev.Snapshot != nil {
+					addOffer(ev.Snapshot, ev.PeerID)
+					// Jump-up: a new offer arrived for a height
+					// fresher than our current target. Abort this
+					// iteration; the queue gets the new height
+					// prioritized (and the current target requeued
+					// behind it, since we never gave it the full
+					// 10s window).
+					if cfg.TargetHeight == 0 &&
+						ev.Snapshot.Height > target &&
+						(cfg.MinHeight == 0 || ev.Snapshot.Height >= cfg.MinHeight) &&
+						!failed[ev.Snapshot.Height] {
+						logger.Info("found higher snapshot from new peer; jumping",
+							"from_height", target,
+							"to_height", ev.Snapshot.Height,
+							"peer", ev.PeerID)
+						deadline.Stop()
+						queue = append([]uint64{ev.Snapshot.Height, target}, queue...)
+						jumped = true
+						break heightLoop
+					}
+					if ev.Snapshot.Height == target {
+						// New offer at our target — dispatch chunk-0 to this peer.
+						dispatch(target)
+					}
+					continue
+				}
+				if ev.Chunk == nil || ev.Chunk.Index != 0 {
+					continue
+				}
+				if ev.Chunk.Height != target {
+					continue
+				}
+				if ev.Chunk.Missing || len(ev.Chunk.Bytes) == 0 {
+					continue
+				}
+				// Find the offer whose (height, format) matches.
+				for _, k := range offerByHeight[target] {
+					o := offers[k]
+					if o.Format == ev.Chunk.Format {
+						accepted = o
+						responder = p2p.ID(ev.PeerID)
+						deadline.Stop()
+						break heightLoop
+					}
+				}
+			}
+		}
+
+		if accepted != nil {
+			logger.Info("downloading snapshot",
+				"height", accepted.Height, "format", accepted.Format,
+				"chunks", accepted.Chunks,
+				"hash", hex.EncodeToString(accepted.Hash)[:16],
+				"served_by", string(responder))
+			good := []p2p.ID{responder}
+			seen := map[p2p.ID]bool{responder: true}
+			for pid := range accepted.Peers {
+				id := p2p.ID(pid)
+				if !seen[id] {
+					good = append(good, id)
+					seen[id] = true
+				}
+			}
+			return accepted, good, nil
+		}
+
+		if jumped {
+			continue
+		}
+
+		if cfg.TargetHeight != 0 {
+			return nil, nil, fmt.Errorf("target height %d: no peer served chunk-0 within %s",
+				cfg.TargetHeight, cfg.PerHeightTimeout)
+		}
+		failed[target] = true
+		next := uint64(0)
+		if len(queue) > 0 {
+			next = queue[0]
+		}
+		logger.Info("no served offer; walking back",
+			"height", target, "next", next)
+	}
+
+	return nil, nil, fmt.Errorf("no servable snapshot found in window [%d, %d]",
+		cfg.MinHeight, cfg.CurrentHeight)
+}
+
+// offerCount returns the number of distinct snapshot offers we've
+// collected so far (sum across heights). Used for diagnostic logs.
+func offerCount(offers map[string]*snapshotOffer) int { return len(offers) }
+
+// walkTargets returns a descending list of heights from
+// floor(top, interval) down to >= minHeight, stepping by interval.
+func walkTargets(top, minHeight, interval uint64) []uint64 {
+	if interval == 0 || top < minHeight {
+		return nil
+	}
+	start := (top / interval) * interval
+	var out []uint64
+	for h := start; h >= minHeight && h > 0; h -= interval {
+		out = append(out, h)
+		if h < interval {
+			break
+		}
+	}
+	return out
+}
+
+// ─── Phase 1 (legacy; replaced by walkBackward, retained for callers) ───
 
 func discover(ctx context.Context, sw *p2p.Switch, evs chan statesync.Event, seeds []peerSeed,
-	parallel int, dur time.Duration, logger cmtlog.Logger) map[string]*snapshotOffer {
+	parallel int, dur time.Duration, wantCandidates int, logger cmtlog.Logger) map[string]*snapshotOffer {
 
 	dctx, cancel := context.WithTimeout(ctx, dur)
 	defer cancel()
 
 	offers := map[string]*snapshotOffer{}
 	var mu sync.Mutex
+
+	// Early-exit: once we have at least MaxCandidates distinct
+	// snapshot offers AND a minimum amount of time has elapsed (to
+	// let peer diversity build up), cut discovery short. PEX is
+	// growing the connected set in the background, but we don't need
+	// 25s of soaking when 6-second results already gave us a strong
+	// candidate slate.
+	const earlyExitMinWait = 5 * time.Second
+	earlyExitThreshold := wantCandidates
+	if earlyExitThreshold < 1 {
+		earlyExitThreshold = 5
+	}
+	startedAt := time.Now()
 
 	go func() {
 		for {
@@ -588,6 +1111,12 @@ func discover(ctx context.Context, sw *p2p.Switch, evs chan statesync.Event, see
 						Peers:    map[string]bool{},
 					}
 					offers[k] = rec
+					if len(offers) >= earlyExitThreshold && time.Since(startedAt) >= earlyExitMinWait {
+						logger.Info("phase 1 early exit",
+							"unique_snapshots", len(offers),
+							"elapsed", time.Since(startedAt).Truncate(time.Millisecond))
+						cancel()
+					}
 				}
 				rec.Peers[ev.PeerID] = true
 				mu.Unlock()
@@ -654,7 +1183,11 @@ func discover(ctx context.Context, sw *p2p.Switch, evs chan statesync.Event, see
 	return offers
 }
 
-func rankCandidates(offers map[string]*snapshotOffer, force uint64, max int, preferFresh bool) []*snapshotOffer {
+// rankCandidates picks the top-N offers, ordered newest-first with
+// peer count as the tiebreaker. The freshness floor (MinHeight)
+// upstream has already filtered out anything stale, so here we just
+// rank.
+func rankCandidates(offers map[string]*snapshotOffer, force uint64, max int) []*snapshotOffer {
 	cands := make([]*snapshotOffer, 0, len(offers))
 	for _, o := range offers {
 		if force != 0 && o.Height != force {
@@ -663,17 +1196,10 @@ func rankCandidates(offers map[string]*snapshotOffer, force uint64, max int, pre
 		cands = append(cands, o)
 	}
 	sort.Slice(cands, func(i, j int) bool {
-		if preferFresh {
-			if cands[i].Height != cands[j].Height {
-				return cands[i].Height > cands[j].Height
-			}
-			return len(cands[i].Peers) > len(cands[j].Peers)
+		if cands[i].Height != cands[j].Height {
+			return cands[i].Height > cands[j].Height
 		}
-		ci, cj := len(cands[i].Peers), len(cands[j].Peers)
-		if ci != cj {
-			return ci > cj
-		}
-		return cands[i].Height > cands[j].Height
+		return len(cands[i].Peers) > len(cands[j].Peers)
 	})
 	if len(cands) > max {
 		cands = cands[:max]
@@ -685,7 +1211,7 @@ func rankCandidates(offers map[string]*snapshotOffer, force uint64, max int, pre
 
 func raceProbe(ctx context.Context, sw *p2p.Switch, ssR *statesync.Reactor,
 	evs chan statesync.Event, candidates []*snapshotOffer, addrByNodeID map[string]string,
-	timeout time.Duration, minGood int, preferFresh bool, logger cmtlog.Logger) (*snapshotOffer, []p2p.ID) {
+	timeout time.Duration, minGood int, logger cmtlog.Logger) (*snapshotOffer, []p2p.ID) {
 
 	type cand struct {
 		offer *snapshotOffer
@@ -730,6 +1256,8 @@ func raceProbe(ctx context.Context, sw *p2p.Switch, ssR *statesync.Reactor,
 	select {
 	case <-waitDone:
 	case <-time.After(12 * time.Second):
+	case <-ctx.Done():
+		return nil, nil
 	}
 
 	dispatched := 0
@@ -752,7 +1280,7 @@ func raceProbe(ctx context.Context, sw *p2p.Switch, ssR *statesync.Reactor,
 	for {
 		select {
 		case <-ctx.Done():
-			break
+			return nil, nil
 		case <-deadline.C:
 			goto pick
 		case ev := <-evs:
@@ -778,7 +1306,7 @@ func raceProbe(ctx context.Context, sw *p2p.Switch, ssR *statesync.Reactor,
 					c.good = append(c.good, p2p.ID(ev.PeerID))
 				}
 				c.mu.Unlock()
-				logger.Info("good peer for candidate",
+				logger.Debug("good peer for candidate",
 					"height", ev.Chunk.Height, "format", ev.Chunk.Format,
 					"peer", ev.PeerID, "chunk_bytes", len(ev.Chunk.Bytes))
 				break
@@ -787,42 +1315,24 @@ func raceProbe(ctx context.Context, sw *p2p.Switch, ssR *statesync.Reactor,
 	}
 
 pick:
-	if preferFresh {
-		// FORK: with prefer-fresh, height is the primary key. Pick the
-		// FRESHEST candidate that meets the min-peers threshold; older
-		// candidates with more peers are ignored. Cost of "more peers"
-		// (better redundancy) is trivial vs. the catchup cost of
-		// state-syncing an older snapshot — every 1000 older blocks is
-		// ~1.5 min of extra blocksync time on cosmos-hub.
-		sort.Slice(cands, func(i, j int) bool {
-			return cands[i].offer.Height > cands[j].offer.Height
-		})
-		for _, c := range cands {
-			if len(c.good) >= minGood {
-				logger.Info("phase 2 result (prefer-fresh)",
-					"candidates", len(cands),
-					"chosen_height", c.offer.Height,
-					"chosen_good_peers", len(c.good))
-				return c.offer, c.good
-			}
-		}
-		return nil, nil
-	}
+	// Always pick the FRESHEST candidate that meets the min-peers
+	// threshold. The cost of "more peers" (better redundancy) is
+	// trivial vs. the catchup cost of state-syncing an older snapshot
+	// — every 1000 older blocks is ~1.5 min of extra blocksync time
+	// on cosmos-hub.
 	sort.Slice(cands, func(i, j int) bool {
-		gi, gj := len(cands[i].good), len(cands[j].good)
-		if gi != gj {
-			return gi > gj
-		}
 		return cands[i].offer.Height > cands[j].offer.Height
 	})
-	logger.Info("phase 2 result",
-		"candidates", len(cands),
-		"top_height", cands[0].offer.Height,
-		"top_good_peers", len(cands[0].good))
-	if len(cands) == 0 || len(cands[0].good) < minGood {
-		return nil, nil
+	for _, c := range cands {
+		if len(c.good) >= minGood {
+			logger.Info("phase 2 result",
+				"candidates", len(cands),
+				"chosen_height", c.offer.Height,
+				"chosen_good_peers", len(c.good))
+			return c.offer, c.good
+		}
 	}
-	return cands[0].offer, cands[0].good
+	return nil, nil
 }
 
 // ─── Phase 3: chunk download scheduler ──────────────────────────────────
@@ -859,7 +1369,20 @@ func download(ctx context.Context, sw *p2p.Switch, ssR *statesync.Reactor,
 	perPeer int, chunkTimeout time.Duration, peerFailLimit int,
 	redialBackoff, maxRedialBackoff time.Duration,
 	warmTarget int, warmRefreshInterval time.Duration,
+	watch *peerWatch,
 	logger cmtlog.Logger) (uint64, error) {
+
+	// banAndDrop disconnects + addrbook-bans a misbehaving peer so
+	// PEX can dial a replacement (banned peers occupying connection
+	// slots was previously starving fresh dials at TargetPeers cap).
+	banAndDrop := func(pid p2p.ID, reason string) {
+		if watch == nil {
+			return
+		}
+		if peer := sw.Peers().Get(pid); peer != nil {
+			watch.banPeer(peer, reason)
+		}
+	}
 
 	N := target.Chunks
 	pending := make([]bool, N)
@@ -882,7 +1405,10 @@ func download(ctx context.Context, sw *p2p.Switch, ssR *statesync.Reactor,
 
 	startTime := time.Now()
 	lastProgress := time.Now()
-	progressEvery := 15 * time.Second
+	// Aligned to the outer 2s timeoutTicker — multiples of 2s land
+	// exactly on a tick (10s gives 10, 20, 30, …). Non-multiples
+	// round up: 15s would fire at 16, 32, …
+	progressEvery := 10 * time.Second
 
 	// computeRedialDelay returns redialBackoff * 2^(disconnects-1), capped
 	// at maxRedialBackoff. With redialBackoff=5s and cap=5m, sequence is
@@ -982,7 +1508,7 @@ func download(ctx context.Context, sw *p2p.Switch, ssR *statesync.Reactor,
 				continue
 			}
 			stats[pid] = &peerStat{provisional: true}
-			logger.Info("provisional peer added", "peer", string(pid))
+			logger.Debug("provisional peer added", "peer", string(pid))
 		}
 	}
 
@@ -1016,8 +1542,8 @@ func download(ctx context.Context, sw *p2p.Switch, ssR *statesync.Reactor,
 	}
 
 	logger.Info("phase 3: starting download",
-		"chunks", N, "good_peers", len(good), "per_peer_inflight", perPeer,
-		"warm_target", warmTarget, "max_redial_backoff", maxRedialBackoff)
+		"chunks", N, "good_peers", len(good),
+		"per_peer_inflight", perPeer, "warm_target", warmTarget)
 
 	dispatch()
 
@@ -1068,8 +1594,9 @@ func download(ctx context.Context, sw *p2p.Switch, ssR *statesync.Reactor,
 						// connection is suspect.
 						if st.provisional {
 							st.banned = true
-							logger.Info("benching provisional peer (probe timeout)",
+							logger.Debug("benching provisional peer (probe timeout)",
 								"peer", string(info.peer))
+							banAndDrop(info.peer, "probe timeout")
 						}
 					}
 					delete(inflight, idx)
@@ -1089,8 +1616,12 @@ func download(ctx context.Context, sw *p2p.Switch, ssR *statesync.Reactor,
 
 			if now.Sub(lastProgress) >= progressEvery {
 				rate := float64(doneCount) / now.Sub(startTime).Seconds()
-				fmt.Printf("[snapfetch] %d/%d chunks (%dMB) %.1f c/s peers=%d/%d inflight=%d\n",
-					doneCount, N, bytesTotal.Load()>>20, rate, connected, alive, len(inflight))
+				logger.Info("download progress",
+					"chunks", fmt.Sprintf("%d/%d", doneCount, N),
+					"MB", bytesTotal.Load()>>20,
+					"chunks_per_s", fmt.Sprintf("%.1f", rate),
+					"peers", fmt.Sprintf("%d/%d", connected, alive),
+					"inflight", len(inflight))
 				lastProgress = now
 			}
 
@@ -1131,7 +1662,8 @@ func download(ctx context.Context, sw *p2p.Switch, ssR *statesync.Reactor,
 				st.failures++
 				if st.failures >= banLimit {
 					st.banned = true
-					logger.Info("benching peer", "peer", string(peer), "failures", st.failures, "provisional", st.provisional)
+					logger.Debug("benching peer", "peer", string(peer), "failures", st.failures, "provisional", st.provisional)
+					banAndDrop(peer, "missing/empty chunk")
 				}
 				pending[idx] = true
 				dispatch()
@@ -1147,6 +1679,7 @@ func download(ctx context.Context, sw *p2p.Switch, ssR *statesync.Reactor,
 				st.failures++
 				if st.failures >= banLimit {
 					st.banned = true
+					banAndDrop(peer, "chunk hash mismatch")
 				}
 				pending[idx] = true
 				dispatch()
@@ -1244,7 +1777,7 @@ func runKeepWarm(ctx context.Context, sw *p2p.Switch, seeds []peerSeed,
 			}(na)
 		}
 		if dialed > 0 {
-			logger.Info("keep-warm refresh",
+			logger.Debug("keep-warm refresh",
 				"connected", connected, "target", warmTarget, "dialed", dialed)
 		}
 	}

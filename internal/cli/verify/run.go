@@ -24,14 +24,47 @@ import (
 
 	"github.com/cockroachdb/pebble"
 	"github.com/cometbft/cometbft/crypto/merkle"
+
+	"github.com/zrbecker/cosmos-p2p/internal/cli/cliutil"
+	"github.com/zrbecker/cosmos-p2p/internal/config"
 )
 
 // Run is the malcom subcommand entry point.
 func Run(args []string) int {
+	// Two-pass: peek -config + -chain, load config, register flags
+	// with config-sourced defaults so -h shows actual values.
+	peekedConfig := cliutil.PeekFlag(args, "config")
+	peekedChain := cliutil.PeekFlag(args, "chain")
+	cfg, cfgErr := config.LoadOrSuggestInit(peekedConfig)
+	var ch config.Chain
+	chainName := peekedChain
+	if cfgErr == nil {
+		if chainName == "" {
+			chainName = cfg.DefaultChain
+		}
+		var err error
+		ch, err = cfg.Resolve(chainName)
+		if err != nil {
+			cfgErr = err
+		}
+	}
+	if cfgErr != nil {
+		ch = config.DefaultChain()
+		ch.ChainID = config.DefaultChainID
+	}
+	defaultChain := ch.ChainID
+	defaultRPC := ""
+	if len(ch.RPCs) > 0 {
+		defaultRPC = ch.RPCs[0]
+	}
+
 	fs := flag.NewFlagSet("malcom verify", flag.ContinueOnError)
-	appdb := fs.String("appdb", "", "path to the application.db parent dir (the dir containing application.db/)")
+	fs.Usage = func() { cliutil.NiceUsage(fs) }
+	chain := fs.String("chain", defaultChain, "chain id (sourced from config.default_chain)")
+	appdb := fs.String("appdb", "", "path to the application.db parent dir (required)")
 	height := fs.Int64("height", 0, "snapshot height committed to application.db (required)")
-	rpcURL := fs.String("rpc", "https://cosmos-rpc.polkachu.com", "cometbft RPC endpoint")
+	rpcURL := fs.String("rpc", defaultRPC, "cometbft RPC endpoint (sourced from first config.chains.<id>.rpcs entry)")
+	configPath := fs.String("config", peekedConfig, "config file path (default: $XDG_CONFIG_HOME/malcom/config.toml)")
 	if err := fs.Parse(args); err != nil {
 		return 2
 	}
@@ -40,8 +73,31 @@ func Run(args []string) int {
 		return 2
 	}
 
+	if cfgErr != nil && *rpcURL == "" {
+		fmt.Fprintln(os.Stderr, cfgErr)
+		return 1
+	}
+	if *chain != defaultChain && cfgErr == nil {
+		var err error
+		ch, err = cfg.Resolve(*chain)
+		if err != nil {
+			fmt.Fprintln(os.Stderr, err)
+			return 1
+		}
+	}
+	rpc := *rpcURL
+	if rpc == "" && len(ch.RPCs) > 0 {
+		rpc = ch.RPCs[0]
+	}
+	if rpc == "" {
+		fmt.Fprintf(os.Stderr, "no rpc; pass -rpc or set chains.%s.rpcs in config\n", *chain)
+		return 1
+	}
+	_ = configPath
+
 	fmt.Printf("[verify] appdb   %s\n", *appdb)
 	fmt.Printf("[verify] height  %d\n", *height)
+	fmt.Printf("[verify] rpc     %s\n", rpc)
 
 	infos, err := readCommitInfo(*appdb, *height)
 	if err != nil {
@@ -57,7 +113,7 @@ func Run(args []string) int {
 	fmt.Printf("[verify] local AppHash:     %X\n", localHash)
 
 	consHeight := *height + 1
-	consHash, err := fetchAppHash(*rpcURL, consHeight)
+	consHash, err := fetchAppHash(rpc, consHeight)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "fetch consensus app hash: %v\n", err)
 		return 1

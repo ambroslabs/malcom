@@ -1,13 +1,12 @@
 // Package snapshotimport is the `malcom snapshot import` subcommand:
-// take a downloaded cosmos-sdk snapshot directory and produce the
-// gaiad-compatible artefacts cosmos-bootstrap-gaia consumes:
+// take a downloaded snapshot directory and produce gaiad-compatible
+// artefacts.
 //
-//	<out>/application.db/      pebble DB (gaiad reads with db_backend = "pebbledb")
-//	<out>/extensions/<name>/   wasm bytecode payloads (cosmwasm + 08-light-client)
+// Output: <-out>/appdb_<chain>_<height>/{application.db,extensions}/.
+// Default -out is the current working directory.
 //
-// Atop internal/snapshotimport, which is the single-goroutine
-// stack-based importer (no iavl dependency, ~10× memory reduction vs
-// the deleted wave-parallel path).
+// Pebble bulk-load tuning lives in the [chains.<id>.import] section
+// of config.toml.
 package snapshotimport
 
 import (
@@ -17,6 +16,8 @@ import (
 	"os"
 	"path/filepath"
 
+	"github.com/zrbecker/cosmos-p2p/internal/cli/cliutil"
+	"github.com/zrbecker/cosmos-p2p/internal/config"
 	"github.com/zrbecker/cosmos-p2p/internal/snapshotdiff"
 	"github.com/zrbecker/cosmos-p2p/internal/snapshotimport"
 )
@@ -26,27 +27,60 @@ type metaJSON struct {
 	HashHex string `json:"hash_hex"`
 }
 
-// Run is the malcom subcommand entry point. Returns the process exit
-// code (0 on success).
+// Run is the malcom subcommand entry point.
 func Run(args []string) int {
+	// Two-pass: peek -config + -chain, load config, register flags
+	// with config-sourced defaults so -h shows actual values.
+	peekedConfig := cliutil.PeekFlag(args, "config")
+	peekedChain := cliutil.PeekFlag(args, "chain")
+	cfg, cfgErr := config.LoadOrSuggestInit(peekedConfig)
+	var ch config.Chain
+	chainName := peekedChain
+	if cfgErr == nil {
+		if chainName == "" {
+			chainName = cfg.DefaultChain
+		}
+		var err error
+		ch, err = cfg.Resolve(chainName)
+		if err != nil {
+			cfgErr = err
+		}
+	}
+	if cfgErr != nil {
+		ch = config.DefaultChain()
+		ch.ChainID = config.DefaultChainID
+	}
+	defaultChain := ch.ChainID
+
 	fs := flag.NewFlagSet("malcom snapshot import", flag.ContinueOnError)
-	var (
-		snapshotDir = fs.String("snapshot", "", "snapshot directory (with chunk_*.bin + meta.json)")
-		outDir      = fs.String("out", "", "output directory (will contain application.db/ and extensions/)")
-		height      = fs.Int64("height", 0, "height to import (default: read from snapshot meta.json)")
-		noExt       = fs.Bool("no-extensions", false, "skip writing extension payloads")
-		minFreeGB   = fs.Int64("min-free-gb", 30, "abort if -out's filesystem has less than this many GB free; 0 to skip")
-		memtableMB  = fs.Int("memtable-mb", 256, "pebble memtable size (per memtable; 2 slots are kept)")
-		cacheMB     = fs.Int("cache-mb", 16, "pebble block cache size (small for write-only workload)")
-		maxCompact  = fs.Int("max-concurrent-compactions", 4, "max concurrent pebble compactions")
-	)
+	fs.Usage = func() { cliutil.NiceUsage(fs) }
+	chain := fs.String("chain", defaultChain, "chain id (sourced from config.default_chain)")
+	snapshotDir := fs.String("snapshot", "", "snapshot directory to import (with chunk_*.bin + meta.json)")
+	out := fs.String("out", ".", "parent dir for the output (subdir appdb_<chain>_<height>/ created inside)")
+	height := fs.Int64("height", 0, "height to import (default: read from snapshot meta.json)")
+	noExt := fs.Bool("no-extensions", false, "skip writing extension payloads")
+	configPath := fs.String("config", peekedConfig, "config file path (default: $XDG_CONFIG_HOME/malcom/config.toml)")
 	if err := fs.Parse(args); err != nil {
 		return 2
 	}
-	if *snapshotDir == "" || *outDir == "" {
+	if *snapshotDir == "" {
 		fs.Usage()
 		return 2
 	}
+
+	if cfgErr != nil {
+		fmt.Fprintln(os.Stderr, cfgErr)
+		return 1
+	}
+	if *chain != defaultChain {
+		var err error
+		ch, err = cfg.Resolve(*chain)
+		if err != nil {
+			fmt.Fprintln(os.Stderr, err)
+			return 1
+		}
+	}
+	_ = configPath
 
 	if *height == 0 {
 		m, err := readMeta(filepath.Join(*snapshotDir, "meta.json"))
@@ -57,30 +91,38 @@ func Run(args []string) int {
 		*height = int64(m.Height)
 	}
 
-	if *minFreeGB > 0 {
-		if err := snapshotdiff.CheckFreeSpace(*outDir, uint64(*minFreeGB)<<30); err != nil {
+	outDir := filepath.Join(*out, fmt.Sprintf("appdb_%s_%d", ch.ChainID, *height))
+	if err := os.MkdirAll(outDir, 0o755); err != nil {
+		fmt.Fprintf(os.Stderr, "mkdir out: %v\n", err)
+		return 1
+	}
+
+	if ch.Import.MinFreeGB > 0 {
+		if err := snapshotdiff.CheckFreeSpace(outDir, uint64(ch.Import.MinFreeGB)<<30); err != nil {
 			fmt.Fprintf(os.Stderr, "disk check: %v\n", err)
 			return 1
 		}
 	}
 
-	fmt.Printf("[import] snapshot      %s\n", *snapshotDir)
-	fmt.Printf("[import] out           %s\n", *outDir)
-	fmt.Printf("[import] height        %d\n", *height)
-	fmt.Printf("[import] memtable      %d MiB\n", *memtableMB)
-	fmt.Printf("[import] cache         %d MiB\n", *cacheMB)
-	fmt.Printf("[import] max-compact   %d\n", *maxCompact)
-	fmt.Printf("[import] extensions    %v\n", !*noExt)
+	fmt.Printf("[import] config:       %s\n", cfg.Path())
+	fmt.Printf("[import] chain:        %s\n", ch.ChainID)
+	fmt.Printf("[import] snapshot:     %s\n", *snapshotDir)
+	fmt.Printf("[import] out:          %s\n", outDir)
+	fmt.Printf("[import] height:       %d\n", *height)
+	fmt.Printf("[import] memtable:     %d MiB\n", ch.Import.MemtableMB)
+	fmt.Printf("[import] cache:        %d MiB\n", ch.Import.CacheMB)
+	fmt.Printf("[import] max-compact:  %d\n", ch.Import.MaxConcurrentCompactions)
+	fmt.Printf("[import] extensions:   %v\n", !*noExt)
 	fmt.Println()
 
 	stats, err := snapshotimport.Import(snapshotimport.Options{
 		SnapshotDir:              *snapshotDir,
-		OutDir:                   *outDir,
+		OutDir:                   outDir,
 		Height:                   *height,
 		NoExtensions:             *noExt,
-		MemtableMB:               *memtableMB,
-		CacheMB:                  *cacheMB,
-		MaxConcurrentCompactions: *maxCompact,
+		MemtableMB:               ch.Import.MemtableMB,
+		CacheMB:                  ch.Import.CacheMB,
+		MaxConcurrentCompactions: ch.Import.MaxConcurrentCompactions,
 		Log:                      os.Stdout,
 	})
 	if err != nil {
@@ -88,7 +130,7 @@ func Run(args []string) int {
 		return 1
 	}
 
-	finalDB := filepath.Join(*outDir, "application.db")
+	finalDB := filepath.Join(outDir, "application.db")
 	fmt.Println()
 	fmt.Printf("[import] complete in %s\n", stats.Elapsed)
 	fmt.Printf("  stores written:     %d\n", len(stats.Stores))

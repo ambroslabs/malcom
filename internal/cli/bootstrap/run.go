@@ -4,18 +4,11 @@
 //   - a cometbft RPC (for state.db + blockstore.db via offline state-sync)
 //   - a chain genesis.json
 //
-// What it writes:
+// Output: <-out>/gaia_<chain>_<height>/{config,data}/. Default -out is
+// the current working directory.
 //
-//	<out>/config/genesis.json     copy of the supplied genesis
-//	<out>/data/application.db/    independent copy of <appdb>/application.db
-//	<out>/data/state.db/          fresh, populated via cometbft offline state-sync
-//	<out>/data/blockstore.db/     fresh, holds the seen commit at H
-//	<out>/data/wasm-payloads/     copy of extensions/, for follow-up placement
-//
-// What it does NOT do:
-//   - install wasm contract bytecode under data/wasm/ (gaia-specific layout —
-//     keep them at wasm-payloads/ for inspection; -place-wasm handles this)
-//   - run gaiad
+// Tuning (trust period, wasm placement, db backends, moniker) lives
+// in the [chains.<id>.bootstrap] section of config.toml.
 package bootstrap
 
 import (
@@ -36,54 +29,110 @@ import (
 
 	cfg "github.com/cometbft/cometbft/config"
 	"github.com/cometbft/cometbft/node"
+
+	"github.com/zrbecker/cosmos-p2p/internal/cli/cliutil"
+	"github.com/zrbecker/cosmos-p2p/internal/config"
 )
 
 // Run is the malcom subcommand entry point. Returns the process exit
 // code (0 on success).
 func Run(args []string) int {
+	// Two-pass: peek -config + -chain, load config, register flags
+	// with config-sourced defaults so -h shows actual values.
+	peekedConfig := cliutil.PeekFlag(args, "config")
+	peekedChain := cliutil.PeekFlag(args, "chain")
+	cfgFile, cfgErr := config.LoadOrSuggestInit(peekedConfig)
+	var ch config.Chain
+	chainName := peekedChain
+	if cfgErr == nil {
+		if chainName == "" {
+			chainName = cfgFile.DefaultChain
+		}
+		var err error
+		ch, err = cfgFile.Resolve(chainName)
+		if err != nil {
+			cfgErr = err
+		}
+	}
+	if cfgErr != nil {
+		ch = config.DefaultChain()
+		ch.ChainID = config.DefaultChainID
+	}
+	defaultChain := ch.ChainID
+
 	fs := flag.NewFlagSet("malcom bootstrap", flag.ContinueOnError)
+	fs.Usage = func() { cliutil.NiceUsage(fs) }
+	chain := fs.String("chain", defaultChain, "chain id (sourced from config.default_chain)")
 	appdb := fs.String("appdb", "", "directory containing application.db/ and extensions/ (output of `malcom snapshot import`)")
-	genesis := fs.String("genesis", "", "path to chain genesis.json")
-	rpcStr := fs.String("rpc", "", "comma-separated cometbft RPC URLs (light client requires >= 2)")
 	height := fs.Int64("height", 0, "snapshot height (must match application.db)")
-	out := fs.String("out", "", "output gaia root directory (will contain config/ and data/)")
+	out := fs.String("out", ".", "parent dir for the gaia home (subdir gaia_<chain>_<height>/ created inside)")
 	trustHeight := fs.Int64("trust-height", 0, "trust height for light client (defaults to -height)")
 	trustHashHex := fs.String("trust-hash", "", "trust block hash (hex) at -trust-height; auto-fetched from RPC if empty")
-	trustPeriod := fs.Duration("trust-period", 30*24*time.Hour, "trust period for light client")
-	overwrite := fs.Bool("overwrite", false, "wipe <out>/data/ before bootstrapping")
-	writeConfigs := fs.Bool("write-configs", false, "write minimal app.toml/config.toml/client.toml under <out>/config/")
-	moniker := fs.String("moniker", "bootstrap-node", "moniker for the node (when -write-configs)")
-	appDBBackend := fs.String("app-db-backend", "pebbledb", "db_backend value for app.toml (must match application.db format)")
-	cmtDBBackend := fs.String("cmt-db-backend", "goleveldb", "db_backend value for config.toml (cometbft state.db/blockstore.db)")
-	placeWasm := fs.Bool("place-wasm", true, "extract wasm payloads to <out>/wasm/state/wasm/ (cosmwasm) and <out>/data/08-light-client/state/wasm/ (08-wasm)")
-	skipAppCopy := fs.Bool("skip-app-copy", false, "skip cloning <appdb>/application.db into <out>/data/application.db. Use when you've already written application.db directly to the destination")
+	overwrite := fs.Bool("overwrite", false, "wipe gaia home's data/ before bootstrapping")
+	skipAppCopy := fs.Bool("skip-app-copy", false, "skip cloning <appdb>/application.db into the gaia home; assume it's already there")
+	configPath := fs.String("config", peekedConfig, "config file path (default: $XDG_CONFIG_HOME/malcom/config.toml)")
 	if err := fs.Parse(args); err != nil {
 		return 2
 	}
 
-	if *appdb == "" || *genesis == "" || *rpcStr == "" || *height == 0 || *out == "" {
-		fs.Usage()
+	if cfgErr != nil {
+		fmt.Fprintln(os.Stderr, cfgErr)
+		return 1
+	}
+	if *chain != defaultChain {
+		var err error
+		ch, err = cfgFile.Resolve(*chain)
+		if err != nil {
+			fmt.Fprintln(os.Stderr, err)
+			return 1
+		}
+	}
+	_ = configPath
+
+	if *appdb == "" || *height == 0 {
+		fmt.Fprintln(os.Stderr, "required: -appdb -height")
 		return 2
 	}
-
-	rpcs := strings.Split(*rpcStr, ",")
-	for i := range rpcs {
-		rpcs[i] = strings.TrimSpace(rpcs[i])
+	genesis, err := resolveGenesis(ch)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "%v (set chains.%s.genesis in %s)\n", err, ch.ChainID, cfgFile.Path())
+		return 1
 	}
+	if len(ch.RPCs) == 0 {
+		fmt.Fprintf(os.Stderr, "config %s: chains.%s.rpcs is empty\n", cfgFile.Path(), ch.ChainID)
+		return 1
+	}
+
+	rpcs := append([]string(nil), ch.RPCs...)
 	if len(rpcs) == 1 {
 		// cometbft's light client wants at least 2 (1 primary + 1 witness).
 		// Duplicate the single URL — works in practice for our use case
 		// where we trust the operator's RPC choice.
 		rpcs = append(rpcs, rpcs[0])
-		fmt.Fprintln(os.Stderr, "[bootstrap] note: only 1 RPC URL provided; duplicating for cometbft light-client (it requires >=2)")
+		fmt.Fprintln(os.Stderr, "[bootstrap] note: only 1 RPC URL configured; duplicating for cometbft light-client (it requires >=2)")
 	}
+
+	outRoot := filepath.Join(*out, fmt.Sprintf("gaia_%s_%d", ch.ChainID, *height))
+	trustPeriod := ch.Bootstrap.TrustPeriod.Duration()
+	moniker := ch.Bootstrap.Moniker
+	appDBBackend := ch.Bootstrap.AppDBBackend
+	cmtDBBackend := ch.Bootstrap.CmtDBBackend
+	placeWasmFlag := ch.Bootstrap.PlaceWasm
+	writeConfigsFlag := ch.Bootstrap.WriteConfigs
+
+	fmt.Printf("[bootstrap] config:    %s\n", cfgFile.Path())
+	fmt.Printf("[bootstrap] chain:     %s\n", ch.ChainID)
+	fmt.Printf("[bootstrap] out:       %s\n", outRoot)
+	fmt.Printf("[bootstrap] appdb in:  %s\n", *appdb)
+	fmt.Printf("[bootstrap] height:    %d\n", *height)
+	fmt.Println()
 
 	if *trustHeight == 0 {
 		*trustHeight = *height
 	}
 
-	configDir := filepath.Join(*out, "config")
-	dataDir := filepath.Join(*out, "data")
+	configDir := filepath.Join(outRoot, "config")
+	dataDir := filepath.Join(outRoot, "data")
 	if err := os.MkdirAll(configDir, 0o755); err != nil {
 		fmt.Fprintf(os.Stderr, "mkdir config: %v\n", err)
 		return 1
@@ -101,11 +150,11 @@ func Run(args []string) int {
 
 	// 1. Copy genesis.json into <out>/config/.
 	gPath := filepath.Join(configDir, "genesis.json")
-	fmt.Printf("[bootstrap] genesis  %s -> %s\n", *genesis, gPath)
-	srcAbs, _ := filepath.Abs(*genesis)
+	fmt.Printf("[bootstrap] genesis  %s -> %s\n", genesis, gPath)
+	srcAbs, _ := filepath.Abs(genesis)
 	dstAbs, _ := filepath.Abs(gPath)
 	if srcAbs != dstAbs {
-		if err := copyFile(*genesis, gPath); err != nil {
+		if err := copyFile(genesis, gPath); err != nil {
 			fmt.Fprintf(os.Stderr, "copy genesis: %v\n", err)
 			return 1
 		}
@@ -141,13 +190,13 @@ func Run(args []string) int {
 
 	// 4. Build cometbft config rooted at <out>.
 	c := cfg.DefaultConfig()
-	c.SetRoot(*out)
+	c.SetRoot(outRoot)
 	c.DBBackend = "goleveldb"
 	c.Genesis = "config/genesis.json"
 	c.StateSync.RPCServers = rpcs
 	c.StateSync.TrustHeight = *trustHeight
 	c.StateSync.TrustHash = *trustHashHex
-	c.StateSync.TrustPeriod = *trustPeriod
+	c.StateSync.TrustPeriod = trustPeriod
 	c.StateSync.Enable = false
 
 	fmt.Printf("[bootstrap] running cometbft offline state-sync bootstrap (height=%d)...\n", *height)
@@ -188,8 +237,8 @@ func Run(args []string) int {
 			fmt.Fprintf(os.Stderr, "place extensions: %v\n", err)
 			return 1
 		}
-		if *placeWasm {
-			if err := placeWasmPayloads(srcExt, *out); err != nil {
+		if placeWasmFlag {
+			if err := placeWasmPayloads(srcExt, outRoot); err != nil {
 				fmt.Fprintf(os.Stderr, "place wasm payloads: %v\n", err)
 				return 1
 			}
@@ -197,21 +246,21 @@ func Run(args []string) int {
 	}
 
 	// 7. Optionally write minimal config files.
-	if *writeConfigs {
-		if err := writeConfigFiles(*out, *moniker, *appDBBackend, *cmtDBBackend); err != nil {
+	if writeConfigsFlag {
+		if err := writeConfigFiles(outRoot, moniker, appDBBackend, cmtDBBackend); err != nil {
 			fmt.Fprintf(os.Stderr, "write configs: %v\n", err)
 			return 1
 		}
-		fmt.Printf("[bootstrap] wrote %s/config/{app,config,client}.toml\n", *out)
+		fmt.Printf("[bootstrap] wrote %s/config/{app,config,client}.toml\n", outRoot)
 	}
 
 	fmt.Println()
 	fmt.Println("[bootstrap] done. layout:")
-	fmt.Printf("  %s/config/genesis.json\n", *out)
-	fmt.Printf("  %s/data/application.db/   (from %s)\n", *out, srcApp)
-	fmt.Printf("  %s/data/state.db/         (fresh, height=%d)\n", *out, *height)
-	fmt.Printf("  %s/data/blockstore.db/    (seen commit at %d, offline-sync height set)\n", *out, *height)
-	fmt.Printf("  %s/data/wasm-payloads/    (parking — install under data/wasm/ when you wire up gaiad)\n", *out)
+	fmt.Printf("  %s/config/genesis.json\n", outRoot)
+	fmt.Printf("  %s/data/application.db/   (from %s)\n", outRoot, srcApp)
+	fmt.Printf("  %s/data/state.db/         (fresh, height=%d)\n", outRoot, *height)
+	fmt.Printf("  %s/data/blockstore.db/    (seen commit at %d, offline-sync height set)\n", outRoot, *height)
+	fmt.Printf("  %s/data/wasm-payloads/    (parking — install under data/wasm/ when you wire up gaiad)\n", outRoot)
 	return 0
 }
 

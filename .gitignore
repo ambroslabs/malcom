@@ -30,6 +30,15 @@
 # crawl results, per-peer activity dumps. Keep these out of git.
 /data/
 
+# Output dirs from `malcom snapshot fetch / import` and `malcom bootstrap`.
+# Live wherever -out points; pattern matches the repo-root case.
+/snapshot_*/
+/appdb_*/
+/gaia_*/
+
+# Backup dirs created by `malcom clean`.
+*.bak.*
+
 # Local Claude/IDE state
 .claude/scheduled_tasks.lock
 .claude/local/
