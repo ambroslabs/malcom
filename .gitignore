@@ -1,17 +1,20 @@
-# Compiled binaries
-/cosmos-p2p
-/cosmos-crawl
-/cosmos-blockcache
+# Compiled binary at repo root (the one canonical CLI; everything else
+# under build/ or experimental's stray binaries is also covered below).
+/malcom
+
+# Stray binaries from experimental builds at repo root.
 /cosmos-archive
-/cosmos-snapshot-fetch
+/cosmos-block
+/cosmos-blockcache
+/cosmos-crawl
+/cosmos-p2p
 /cosmos-rapid-bootstrap
-/cosmos-snapshot-inspect
-/cosmos-snapshot-diff
 /cosmos-snapshot-apply
-/cosmos-snapshot-to-appdb
+/cosmos-snapshot-diff
+/cosmos-snapshot-inspect
+/cosmos-statesync-bench
 /cosmos-statesync-probe
-/cosmos-bootstrap-gaia
-/pebble-compact
+
 /bin/
 /build/
 *.exe
@@ -41,8 +44,3 @@
 # OS
 .DS_Store
 Thumbs.db
-/cosmos-statesync-bench
-
-# Build artefacts in tools/ submodules
-/tools/*/snapshot-import
-/tools/*/cmd/*/main
