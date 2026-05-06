@@ -28,9 +28,9 @@ peer_fails     = 3          # missing/hash-mismatch strikes before banning
 peer_redials   = 3
 redial_backoff = "5s"
 
-listen      = "tcp://0.0.0.0:0"
-moniker     = "malcom-snapfetch"
-extra_seeds = []
+listen          = "tcp://0.0.0.0:0"
+moniker         = "malcom-snapfetch"
+bootstrap_peers = []
 
 # Freshness floor: drop snapshots older than currentChainHeight -
 # max_age_blocks. cli looks up current height via the chain's RPC
@@ -85,7 +85,7 @@ moniker        = "bootstrap-node"
 // no overrides) — used in -offline mode or when chain-registry has no
 // entry for the chain.
 //
-// If info is populated, rpcs and the [fetch].extra_seeds list are
+// If info is populated, rpcs and the [fetch].bootstrap_peers list are
 // filled from chain-registry. genesisPath, when non-empty, is written
 // as the local path to the downloaded genesis file.
 func ChainTemplate(chainID string, info *registry.ChainInfo, genesisPath string) string {
@@ -118,20 +118,18 @@ func ChainTemplate(chainID string, info *registry.ChainInfo, genesisPath string)
 	// Path overrides.
 	fmt.Fprintln(&b, "# Optional path overrides. Blank = XDG-derived:")
 	fmt.Fprintln(&b, "#   node_key  → $XDG_STATE_HOME/malcom/<chain>/node_key.json")
-	fmt.Fprintln(&b, "#   peer_db   → $XDG_CACHE_HOME/malcom/<chain>/peers.json")
 	fmt.Fprintln(&b, "#   addrbook  → $XDG_CACHE_HOME/malcom/<chain>/addrbook.json")
 	fmt.Fprintln(&b, "# node_key = \"\"")
-	fmt.Fprintln(&b, "# peer_db  = \"\"")
 	fmt.Fprintln(&b, "# addrbook = \"\"")
 	fmt.Fprintln(&b)
 
-	// extra_seeds populated from chain-registry's seeds + persistent_peers.
+	// bootstrap_peers populated from chain-registry's seeds + persistent_peers.
 	allPeers := append([]string{}, peersUniqueSorted(info)...)
 	if len(allPeers) > 0 {
 		fmt.Fprintln(&b, "# Seeds + persistent_peers from cosmos chain-registry, layered into")
 		fmt.Fprintln(&b, "# the snapfetch dial set. Peer entries also rot — prune as needed.")
 		fmt.Fprintln(&b, "[fetch]")
-		fmt.Fprintln(&b, "extra_seeds = [")
+		fmt.Fprintln(&b, "bootstrap_peers = [")
 		for _, p := range allPeers {
 			fmt.Fprintf(&b, "  %q,\n", p)
 		}

@@ -71,10 +71,6 @@ func Run(args []string) int {
 		fmt.Fprintf(os.Stderr, "mkdir node-key dir: %v\n", err)
 		return 1
 	}
-	if err := os.MkdirAll(filepath.Dir(ch.PeerDB), 0o755); err != nil {
-		fmt.Fprintf(os.Stderr, "mkdir peer-db dir: %v\n", err)
-		return 1
-	}
 
 	// Default mode silences cometbft's per-peer EOF spam — the p2p
 	// module logs every disconnect at Error level even when it's a
@@ -148,9 +144,8 @@ func Run(args []string) int {
 		NodeKeyPath:       ch.NodeKey,
 		Listen:            ch.Fetch.Listen,
 		Moniker:           ch.Fetch.Moniker,
-		Cumulative:        ch.PeerDB,
 		AddrBook:          ch.AddrBook,
-		ExtraSeedsCSV:     joinCSV(ch.Fetch.ExtraSeeds),
+		BootstrapPeersCSV: joinCSV(ch.Fetch.BootstrapPeers),
 		DiscoverFor:       ch.Fetch.Discover.Duration(),
 		DialParallel:      ch.Fetch.DialParallel,
 		MaxCandidates:     ch.Fetch.MaxCandidates,

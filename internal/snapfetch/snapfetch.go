@@ -29,7 +29,6 @@ import (
 	pexcb "github.com/cometbft/cometbft/p2p/pex"
 	"github.com/cometbft/cometbft/version"
 
-	"github.com/zrbecker/cosmos-p2p/internal/crawler"
 	localpex "github.com/zrbecker/cosmos-p2p/internal/pex"
 	"github.com/zrbecker/cosmos-p2p/internal/peers"
 	"github.com/zrbecker/cosmos-p2p/internal/snapshotinspect"
@@ -43,9 +42,8 @@ type Config struct {
 	NodeKeyPath string
 	Listen      string // default "tcp://0.0.0.0:0"
 	Moniker     string // default "cosmos-p2p-snapfetch"
-	Cumulative  string // path to peers DB
-	AddrBook    string // optional path to polkachu addrbook
-	ExtraSeedsCSV string
+	AddrBook    string // path to cometbft PEX-managed addrbook
+	BootstrapPeersCSV string
 
 	DiscoverFor       time.Duration // default 25s
 	DialParallel      int           // default 32
@@ -213,7 +211,7 @@ type Result struct {
 	OfferedBy   []string
 }
 
-// peerSeed is one address (with provenance) pulled from the peers DB or
+// peerSeed is one address (with provenance) pulled from the addrbook or
 // addrbook. Internal.
 type peerSeed struct{ addr, source string }
 
@@ -273,11 +271,11 @@ func RunFetch(ctx context.Context, cfg Config, outRoot string) (*Result, error) 
 		return nil, fmt.Errorf("node key: %w", err)
 	}
 
-	seeds := loadSeeds(cfg.Cumulative, cfg.AddrBook, logger)
-	for _, s := range strings.Split(cfg.ExtraSeedsCSV, ",") {
+	seeds := loadAddrBookSeeds(cfg.AddrBook, logger)
+	for _, s := range strings.Split(cfg.BootstrapPeersCSV, ",") {
 		s = strings.TrimSpace(s)
 		if s != "" {
-			seeds = append([]peerSeed{{addr: s, source: "flag"}}, seeds...)
+			seeds = append([]peerSeed{{addr: s, source: "bootstrap"}}, seeds...)
 		}
 	}
 	if len(seeds) == 0 {
@@ -326,7 +324,7 @@ func RunFetch(ctx context.Context, cfg Config, outRoot string) (*Result, error) 
 	ssR.KeepBytes = true
 
 	// AddrBook holds peer addresses learned via PEX (and seeded with
-	// our extra_seeds list at startup). cometbft's implementation —
+	// our bootstrap_peers list at startup). cometbft's implementation —
 	// JSON-persistent, bucket-balanced, freshness-tracked.
 	bookPath := cfg.AddrBook
 	if bookPath == "" {
@@ -363,8 +361,8 @@ func RunFetch(ctx context.Context, cfg Config, outRoot string) (*Result, error) 
 		book.AddOurAddress(selfAddr)
 	}
 
-	// Seed the book with our extra_seeds (chain-registry entries).
-	// Source = seed's own address (it "told us about itself").
+	// Seed the book with our bootstrap_peers (chain-registry entries).
+	// Source = peer's own address (it "told us about itself").
 	seeded := 0
 	for _, s := range seeds {
 		na, err := p2p.NewNetAddressString(s.addr)
@@ -1549,40 +1547,24 @@ func parseChunkHashes(metadata []byte) ([][]byte, error) {
 	return out, nil
 }
 
-func loadSeeds(cumPath, addrBookPath string, logger cmtlog.Logger) []peerSeed {
-	out := []peerSeed{}
-	seen := map[string]bool{}
-	if f, err := os.Open(cumPath); err == nil {
-		defer f.Close()
-		var recs []crawler.PeerRecord
-		if err := json.NewDecoder(f).Decode(&recs); err == nil {
-			sort.Slice(recs, func(i, j int) bool { return recs[i].LatestHeight > recs[j].LatestHeight })
-			for _, r := range recs {
-				if r.Addr == "" || seen[r.Addr] {
-					continue
-				}
-				seen[r.Addr] = true
-				out = append(out, peerSeed{addr: r.Addr, source: "cumulative"})
-			}
-		}
+func loadAddrBookSeeds(addrBookPath string, logger cmtlog.Logger) []peerSeed {
+	if addrBookPath == "" {
+		return nil
 	}
-	if len(out) == 0 {
-		if addrBookPath == "" {
-			return out
+	items, err := peers.Load(addrBookPath)
+	if err != nil {
+		logger.Error("load addrbook failed", "err", err)
+		return nil
+	}
+	out := make([]peerSeed, 0, len(items))
+	seen := map[string]bool{}
+	for _, it := range items {
+		s := it.String()
+		if seen[s] {
+			continue
 		}
-		items, err := peers.Load(addrBookPath)
-		if err != nil {
-			logger.Error("load addrbook failed", "err", err)
-			return nil
-		}
-		for _, it := range items {
-			s := it.String()
-			if seen[s] {
-				continue
-			}
-			seen[s] = true
-			out = append(out, peerSeed{addr: s, source: "addrbook"})
-		}
+		seen[s] = true
+		out = append(out, peerSeed{addr: s, source: "addrbook"})
 	}
 	return out
 }

@@ -46,7 +46,6 @@ type Chain struct {
 
 	// Small persistent state. Blank = use XDG-derived default.
 	NodeKey  string `toml:"node_key"`
-	PeerDB   string `toml:"peer_db"`
 	AddrBook string `toml:"addrbook"`
 
 	Fetch     FetchTuning     `toml:"fetch"`
@@ -56,9 +55,9 @@ type Chain struct {
 
 // FetchTuning maps onto snapfetch.Config's tuning fields.
 type FetchTuning struct {
-	Listen     string   `toml:"listen"`
-	Moniker    string   `toml:"moniker"`
-	ExtraSeeds []string `toml:"extra_seeds"`
+	Listen         string   `toml:"listen"`
+	Moniker        string   `toml:"moniker"`
+	BootstrapPeers []string `toml:"bootstrap_peers"`
 
 	// MaxAgeBlocks is the freshness floor: any snapshot older than
 	// currentChainHeight - MaxAgeBlocks is dropped from candidates.
@@ -187,7 +186,7 @@ func Load() (*Config, error) {
 //  1. The global tuning sections from config.toml (lowest priority).
 //  2. chains/<name>.toml on top (overrides individual fields).
 //  3. Built-in defaults for any field still zero-valued.
-//  4. XDG-derived defaults for blank node_key / peer_db / addrbook.
+//  4. XDG-derived defaults for blank node_key / addrbook.
 func (c *Config) Resolve(name string) (Chain, error) {
 	if name == "" {
 		name = c.DefaultChain
@@ -248,13 +247,6 @@ func fillXDGDefaults(ch *Chain) error {
 			return err
 		}
 		ch.NodeKey = filepath.Join(d, ch.ChainID, "node_key.json")
-	}
-	if ch.PeerDB == "" {
-		d, err := CacheDir()
-		if err != nil {
-			return err
-		}
-		ch.PeerDB = filepath.Join(d, ch.ChainID, "peers.json")
 	}
 	if ch.AddrBook == "" {
 		d, err := CacheDir()

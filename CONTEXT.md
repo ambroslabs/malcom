@@ -44,7 +44,7 @@ binaries live in `experimental/cmd/`.
 malcom respects the XDG Base Directory Specification end-to-end:
 
     $XDG_CONFIG_HOME/malcom/config.toml          shared defaults: default_chain, [fetch], [import], [bootstrap]
-    $XDG_CONFIG_HOME/malcom/chains/<id>.toml     per-chain identity (chain_id, genesis URL, rpcs, extra_seeds)
+    $XDG_CONFIG_HOME/malcom/chains/<id>.toml     per-chain identity (chain_id, genesis URL, rpcs, bootstrap_peers)
     $XDG_STATE_HOME/malcom/<id>/node_key.json    cometbft p2p ed25519 identity
     $XDG_CACHE_HOME/malcom/<id>/                 peer DB, addrbook
     $XDG_DATA_HOME/malcom/<id>/                  genesis cache
