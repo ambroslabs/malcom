@@ -25,46 +25,16 @@ import (
 	"github.com/cockroachdb/pebble"
 	"github.com/cometbft/cometbft/crypto/merkle"
 
-	"github.com/zrbecker/cosmos-p2p/internal/cli/cliutil"
 	"github.com/zrbecker/cosmos-p2p/internal/config"
 )
 
 // Run is the malcom subcommand entry point.
 func Run(args []string) int {
-	// Two-pass: peek -config + -chain, load config, register flags
-	// with config-sourced defaults so -h shows actual values.
-	peekedConfig := cliutil.PeekFlag(args, "config")
-	peekedChain := cliutil.PeekFlag(args, "chain")
-	cfg, cfgErr := config.LoadOrSuggestInit(peekedConfig)
-	var ch config.Chain
-	chainName := peekedChain
-	if cfgErr == nil {
-		if chainName == "" {
-			chainName = cfg.DefaultChain
-		}
-		var err error
-		ch, err = cfg.Resolve(chainName)
-		if err != nil {
-			cfgErr = err
-		}
-	}
-	if cfgErr != nil {
-		ch = config.DefaultChain()
-		ch.ChainID = config.DefaultChainID
-	}
-	defaultChain := ch.ChainID
-	defaultRPC := ""
-	if len(ch.RPCs) > 0 {
-		defaultRPC = ch.RPCs[0]
-	}
-
 	fs := flag.NewFlagSet("malcom verify", flag.ContinueOnError)
-	fs.Usage = func() { cliutil.NiceUsage(fs) }
-	chain := fs.String("chain", defaultChain, "chain id (sourced from config.default_chain)")
+	chain := fs.String("chain", "", fmt.Sprintf("chain id (default %q; override in config.default_chain)", config.DefaultChainID))
 	appdb := fs.String("appdb", "", "path to the application.db parent dir (required)")
 	height := fs.Int64("height", 0, "snapshot height committed to application.db (required)")
-	rpcURL := fs.String("rpc", defaultRPC, "cometbft RPC endpoint (sourced from first config.chains.<id>.rpcs entry)")
-	configPath := fs.String("config", peekedConfig, "config file path (default: $XDG_CONFIG_HOME/malcom/config.toml)")
+	rpcURL := fs.String("rpc", "", "cometbft RPC endpoint (defaults to first config.chains.<id>.rpcs entry)")
 	if err := fs.Parse(args); err != nil {
 		return 2
 	}
@@ -73,27 +43,44 @@ func Run(args []string) int {
 		return 2
 	}
 
-	if cfgErr != nil && *rpcURL == "" {
-		fmt.Fprintln(os.Stderr, cfgErr)
-		return 1
-	}
-	if *chain != defaultChain && cfgErr == nil {
-		var err error
-		ch, err = cfg.Resolve(*chain)
-		if err != nil {
-			fmt.Fprintln(os.Stderr, err)
-			return 1
-		}
-	}
+	// -rpc lets verify run against a single RPC without needing a
+	// chains/<id>.toml — convenient for one-off checks. Only load
+	// config if we need it (no explicit -rpc, or -chain not given).
 	rpc := *rpcURL
+	var ch config.Chain
+	if rpc == "" || *chain == "" {
+		cfg, err := config.Load()
+		if err != nil {
+			if rpc != "" {
+				// -rpc passed but config still failed; run with a
+				// minimal Chain populated from -chain (which may be
+				// empty — Resolve isn't needed in this branch).
+				ch.ChainID = *chain
+			} else {
+				fmt.Fprintln(os.Stderr, err)
+				return 1
+			}
+		} else {
+			chainName := *chain
+			if chainName == "" {
+				chainName = cfg.DefaultChain
+			}
+			ch, err = cfg.Resolve(chainName)
+			if err != nil {
+				fmt.Fprintln(os.Stderr, err)
+				return 1
+			}
+		}
+	} else {
+		ch.ChainID = *chain
+	}
 	if rpc == "" && len(ch.RPCs) > 0 {
 		rpc = ch.RPCs[0]
 	}
 	if rpc == "" {
-		fmt.Fprintf(os.Stderr, "no rpc; pass -rpc or set chains.%s.rpcs in config\n", *chain)
+		fmt.Fprintf(os.Stderr, "no rpc; pass -rpc or set chains.%s.rpcs in config\n", ch.ChainID)
 		return 1
 	}
-	_ = configPath
 
 	fmt.Printf("[verify] appdb   %s\n", *appdb)
 	fmt.Printf("[verify] height  %d\n", *height)

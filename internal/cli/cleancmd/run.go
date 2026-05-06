@@ -24,19 +24,14 @@ import (
 func Run(args []string) int {
 	fs := flag.NewFlagSet("malcom clean", flag.ContinueOnError)
 	clobber := fs.Bool("clobber", false, "delete instead of backing up to <dir>.bak.<ts>")
-	configPath := fs.String("config", "", "config file path (default: $XDG_CONFIG_HOME/malcom/config.toml)")
 	if err := fs.Parse(args); err != nil {
 		return 2
 	}
 
-	cfgPath := *configPath
-	if cfgPath == "" {
-		p, err := config.DefaultConfigPath()
-		if err != nil {
-			fmt.Fprintf(os.Stderr, "resolve config path: %v\n", err)
-			return 1
-		}
-		cfgPath = p
+	cfgPath, err := config.DefaultConfigPath()
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "resolve config path: %v\n", err)
+		return 1
 	}
 	configRoot := filepath.Dir(cfgPath)
 

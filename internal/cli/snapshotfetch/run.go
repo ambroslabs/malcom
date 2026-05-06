@@ -30,7 +30,6 @@ import (
 
 	cmtlog "github.com/cometbft/cometbft/libs/log"
 
-	"github.com/zrbecker/cosmos-p2p/internal/cli/cliutil"
 	"github.com/zrbecker/cosmos-p2p/internal/config"
 	malcomlog "github.com/zrbecker/cosmos-p2p/internal/log"
 	"github.com/zrbecker/cosmos-p2p/internal/snapfetch"
@@ -38,65 +37,31 @@ import (
 
 // Run is the malcom subcommand entry point.
 func Run(args []string) int {
-	// Two-pass flag handling: peek -config and -chain from raw args
-	// so we can load the config first, then register the rest of the
-	// flags with defaults sourced FROM the config. That makes
-	// `<subcommand> -h` show the actual values that will be used
-	// (e.g. "(default 3000)" for max-age) instead of placeholder zeros.
-	peekedConfig := cliutil.PeekFlag(args, "config")
-	peekedChain := cliutil.PeekFlag(args, "chain")
-
-	cfg, cfgErr := config.LoadOrSuggestInit(peekedConfig)
-	var ch config.Chain
-	chainName := peekedChain
-	if cfgErr == nil {
-		if chainName == "" {
-			chainName = cfg.DefaultChain
-		}
-		var err error
-		ch, err = cfg.Resolve(chainName)
-		if err != nil {
-			cfgErr = err
-		}
-	}
-	// Fallback so -h shows real default values even when config
-	// hasn't been initialized yet. The cfgErr is enforced after
-	// Parse (so help still works); only a real run errors out.
-	if cfgErr != nil {
-		ch = config.DefaultChain()
-		ch.ChainID = config.DefaultChainID
-	}
-	defaultChain := ch.ChainID
-
 	fs := flag.NewFlagSet("malcom snapshot fetch", flag.ContinueOnError)
-	fs.Usage = func() { cliutil.NiceUsage(fs) }
-	chain := fs.String("chain", defaultChain, "chain id (sourced from config.default_chain)")
+	chain := fs.String("chain", "", fmt.Sprintf("chain id (default %q; override in config.default_chain)", config.DefaultChainID))
 	out := fs.String("out", ".", "parent dir for the snapshot output (subdir snapshot_<chain>_<height>/ created inside)")
 	targetHeight := fs.Uint64("target-height", 0, "lock to this exact height; otherwise pick the best candidate")
 	currentHeightFlag := fs.Uint64("current-height", 0, "override the chain's current height; skips the RPC /status lookup (useful when RPCs are stale or unreachable)")
-	maxAge := fs.Uint64("max-age", ch.Fetch.MaxAgeBlocks,
-		"freshness floor in blocks: drop offers older than currentHeight - max-age. 0 disables. (sourced from config.fetch.max_age_blocks)")
-	configPath := fs.String("config", peekedConfig, "config file path (default: $XDG_CONFIG_HOME/malcom/config.toml)")
+	maxAge := fs.Uint64("max-age", 0, fmt.Sprintf("freshness floor in blocks (default %d; override in config.fetch.max_age_blocks)", config.DefaultMaxAgeBlocks))
 	debug := fs.Bool("debug", false, "verbose snapfetch logging")
 	if err := fs.Parse(args); err != nil {
 		return 2
 	}
 
-	if cfgErr != nil {
-		fmt.Fprintln(os.Stderr, cfgErr)
+	cfg, err := config.Load()
+	if err != nil {
+		fmt.Fprintln(os.Stderr, err)
 		return 1
 	}
-	// If user passed an explicit -chain that differs from the peeked
-	// one, re-resolve. Cheap; covers `-config X -chain Y` ordering.
-	if *chain != defaultChain {
-		var err error
-		ch, err = cfg.Resolve(*chain)
-		if err != nil {
-			fmt.Fprintln(os.Stderr, err)
-			return 1
-		}
+	chainName := *chain
+	if chainName == "" {
+		chainName = cfg.DefaultChain
 	}
-	_ = configPath // already resolved via peekedConfig
+	ch, err := cfg.Resolve(chainName)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		return 1
+	}
 
 	if err := os.MkdirAll(*out, 0o755); err != nil {
 		fmt.Fprintf(os.Stderr, "mkdir out: %v\n", err)
@@ -162,8 +127,12 @@ func Run(args []string) int {
 		heightSource = src
 	}
 
-	// Freshness floor.
-	effMaxAge := *maxAge
+	// Freshness floor. 0 = "use config value" (which itself defaults
+	// to DefaultMaxAgeBlocks via applyFetchDefaults if unset).
+	effMaxAge := ch.Fetch.MaxAgeBlocks
+	if *maxAge != 0 {
+		effMaxAge = *maxAge
+	}
 	var minHeight uint64
 	if effMaxAge > 0 && currentHeight > effMaxAge {
 		minHeight = currentHeight - effMaxAge

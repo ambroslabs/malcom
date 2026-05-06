@@ -155,20 +155,24 @@ func (d *duration) UnmarshalText(b []byte) error {
 // Duration returns the underlying time.Duration.
 func (d duration) Duration() time.Duration { return time.Duration(d) }
 
-// Load reads config.toml from path. If path is empty,
-// $XDG_CONFIG_HOME/malcom/config.toml is used. The chains/ subdir is
-// resolved relative to the config file.
-func Load(path string) (*Config, error) {
-	if path == "" {
-		var err error
-		path, err = DefaultConfigPath()
-		if err != nil {
-			return nil, err
-		}
+// Load reads $XDG_CONFIG_HOME/malcom/config.toml. The chains/ subdir
+// is resolved relative to the config file. Users isolate trees by
+// setting $XDG_CONFIG_HOME (or by unsetting all XDG_*_HOME and
+// pointing $HOME at a fresh directory).
+//
+// If config.toml is missing, the returned error tells the user to run
+// `malcom init`.
+func Load() (*Config, error) {
+	path, err := DefaultConfigPath()
+	if err != nil {
+		return nil, err
 	}
 	var c Config
 	md, err := toml.DecodeFile(path, &c)
 	if err != nil {
+		if os.IsNotExist(err) {
+			return nil, fmt.Errorf("no config at %s — run `malcom init` to create one", path)
+		}
 		return nil, err
 	}
 	if undecoded := md.Undecoded(); len(undecoded) > 0 {
@@ -288,20 +292,3 @@ func isGenesisURL(s string) bool {
 	return strings.HasPrefix(s, "http://") || strings.HasPrefix(s, "https://")
 }
 
-// LoadOrSuggestInit is a convenience for subcommands that require
-// config: returns the loaded config or an error message that points
-// the user at `malcom init`.
-func LoadOrSuggestInit(path string) (*Config, error) {
-	cfg, err := Load(path)
-	if err == nil {
-		return cfg, nil
-	}
-	if os.IsNotExist(err) {
-		want := path
-		if want == "" {
-			want, _ = DefaultConfigPath()
-		}
-		return nil, fmt.Errorf("no config at %s — run `malcom init` to create one", want)
-	}
-	return nil, err
-}

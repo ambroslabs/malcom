@@ -7,6 +7,13 @@ package config
 
 import "time"
 
+// Built-in default constants. Exposed so cli help text can reference
+// the same values applyFetchDefaults uses, keeping description
+// strings honest if the defaults ever change.
+const (
+	DefaultMaxAgeBlocks = 3000 // ~5h on cosmoshub-4 at 6s blocks
+)
+
 func applyFetchDefaults(t *FetchTuning) {
 	if t.Listen == "" {
 		t.Listen = "tcp://0.0.0.0:0"
@@ -15,7 +22,7 @@ func applyFetchDefaults(t *FetchTuning) {
 		t.Moniker = "malcom-snapfetch"
 	}
 	if t.MaxAgeBlocks == 0 {
-		t.MaxAgeBlocks = 3000 // ~5h on cosmoshub-4 at 6s blocks
+		t.MaxAgeBlocks = DefaultMaxAgeBlocks
 	}
 	if t.SnapshotInterval == 0 {
 		t.SnapshotInterval = 1000 // cosmoshub-4 default

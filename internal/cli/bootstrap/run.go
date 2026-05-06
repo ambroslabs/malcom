@@ -30,39 +30,14 @@ import (
 	cfg "github.com/cometbft/cometbft/config"
 	"github.com/cometbft/cometbft/node"
 
-	"github.com/zrbecker/cosmos-p2p/internal/cli/cliutil"
 	"github.com/zrbecker/cosmos-p2p/internal/config"
 )
 
 // Run is the malcom subcommand entry point. Returns the process exit
 // code (0 on success).
 func Run(args []string) int {
-	// Two-pass: peek -config + -chain, load config, register flags
-	// with config-sourced defaults so -h shows actual values.
-	peekedConfig := cliutil.PeekFlag(args, "config")
-	peekedChain := cliutil.PeekFlag(args, "chain")
-	cfgFile, cfgErr := config.LoadOrSuggestInit(peekedConfig)
-	var ch config.Chain
-	chainName := peekedChain
-	if cfgErr == nil {
-		if chainName == "" {
-			chainName = cfgFile.DefaultChain
-		}
-		var err error
-		ch, err = cfgFile.Resolve(chainName)
-		if err != nil {
-			cfgErr = err
-		}
-	}
-	if cfgErr != nil {
-		ch = config.DefaultChain()
-		ch.ChainID = config.DefaultChainID
-	}
-	defaultChain := ch.ChainID
-
 	fs := flag.NewFlagSet("malcom bootstrap", flag.ContinueOnError)
-	fs.Usage = func() { cliutil.NiceUsage(fs) }
-	chain := fs.String("chain", defaultChain, "chain id (sourced from config.default_chain)")
+	chain := fs.String("chain", "", fmt.Sprintf("chain id (default %q; override in config.default_chain)", config.DefaultChainID))
 	appdb := fs.String("appdb", "", "directory containing application.db/ and extensions/ (output of `malcom snapshot import`)")
 	height := fs.Int64("height", 0, "snapshot height (must match application.db)")
 	out := fs.String("out", ".", "parent dir for the gaia home (subdir gaia_<chain>_<height>/ created inside)")
@@ -70,24 +45,24 @@ func Run(args []string) int {
 	trustHashHex := fs.String("trust-hash", "", "trust block hash (hex) at -trust-height; auto-fetched from RPC if empty")
 	overwrite := fs.Bool("overwrite", false, "wipe gaia home's data/ before bootstrapping")
 	skipAppCopy := fs.Bool("skip-app-copy", false, "skip cloning <appdb>/application.db into the gaia home; assume it's already there")
-	configPath := fs.String("config", peekedConfig, "config file path (default: $XDG_CONFIG_HOME/malcom/config.toml)")
 	if err := fs.Parse(args); err != nil {
 		return 2
 	}
 
-	if cfgErr != nil {
-		fmt.Fprintln(os.Stderr, cfgErr)
+	cfgFile, err := config.Load()
+	if err != nil {
+		fmt.Fprintln(os.Stderr, err)
 		return 1
 	}
-	if *chain != defaultChain {
-		var err error
-		ch, err = cfgFile.Resolve(*chain)
-		if err != nil {
-			fmt.Fprintln(os.Stderr, err)
-			return 1
-		}
+	chainName := *chain
+	if chainName == "" {
+		chainName = cfgFile.DefaultChain
 	}
-	_ = configPath
+	ch, err := cfgFile.Resolve(chainName)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		return 1
+	}
 
 	if *appdb == "" || *height == 0 {
 		fmt.Fprintln(os.Stderr, "required: -appdb -height")

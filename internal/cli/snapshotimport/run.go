@@ -16,7 +16,6 @@ import (
 	"os"
 	"path/filepath"
 
-	"github.com/zrbecker/cosmos-p2p/internal/cli/cliutil"
 	"github.com/zrbecker/cosmos-p2p/internal/config"
 	"github.com/zrbecker/cosmos-p2p/internal/snapshotdiff"
 	"github.com/zrbecker/cosmos-p2p/internal/snapshotimport"
@@ -29,37 +28,12 @@ type metaJSON struct {
 
 // Run is the malcom subcommand entry point.
 func Run(args []string) int {
-	// Two-pass: peek -config + -chain, load config, register flags
-	// with config-sourced defaults so -h shows actual values.
-	peekedConfig := cliutil.PeekFlag(args, "config")
-	peekedChain := cliutil.PeekFlag(args, "chain")
-	cfg, cfgErr := config.LoadOrSuggestInit(peekedConfig)
-	var ch config.Chain
-	chainName := peekedChain
-	if cfgErr == nil {
-		if chainName == "" {
-			chainName = cfg.DefaultChain
-		}
-		var err error
-		ch, err = cfg.Resolve(chainName)
-		if err != nil {
-			cfgErr = err
-		}
-	}
-	if cfgErr != nil {
-		ch = config.DefaultChain()
-		ch.ChainID = config.DefaultChainID
-	}
-	defaultChain := ch.ChainID
-
 	fs := flag.NewFlagSet("malcom snapshot import", flag.ContinueOnError)
-	fs.Usage = func() { cliutil.NiceUsage(fs) }
-	chain := fs.String("chain", defaultChain, "chain id (sourced from config.default_chain)")
+	chain := fs.String("chain", "", fmt.Sprintf("chain id (default %q; override in config.default_chain)", config.DefaultChainID))
 	snapshotDir := fs.String("snapshot", "", "snapshot directory to import (with chunk_*.bin + meta.json)")
 	out := fs.String("out", ".", "parent dir for the output (subdir appdb_<chain>_<height>/ created inside)")
 	height := fs.Int64("height", 0, "height to import (default: read from snapshot meta.json)")
 	noExt := fs.Bool("no-extensions", false, "skip writing extension payloads")
-	configPath := fs.String("config", peekedConfig, "config file path (default: $XDG_CONFIG_HOME/malcom/config.toml)")
 	if err := fs.Parse(args); err != nil {
 		return 2
 	}
@@ -68,19 +42,20 @@ func Run(args []string) int {
 		return 2
 	}
 
-	if cfgErr != nil {
-		fmt.Fprintln(os.Stderr, cfgErr)
+	cfg, err := config.Load()
+	if err != nil {
+		fmt.Fprintln(os.Stderr, err)
 		return 1
 	}
-	if *chain != defaultChain {
-		var err error
-		ch, err = cfg.Resolve(*chain)
-		if err != nil {
-			fmt.Fprintln(os.Stderr, err)
-			return 1
-		}
+	chainName := *chain
+	if chainName == "" {
+		chainName = cfg.DefaultChain
 	}
-	_ = configPath
+	ch, err := cfg.Resolve(chainName)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		return 1
+	}
 
 	if *height == 0 {
 		m, err := readMeta(filepath.Join(*snapshotDir, "meta.json"))

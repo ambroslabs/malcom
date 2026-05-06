@@ -46,20 +46,15 @@ func Run(args []string) int {
 	fs := flag.NewFlagSet("malcom init", flag.ContinueOnError)
 	force := fs.Bool("force", false, "overwrite existing config.toml and chains/<id>.toml (node key + downloaded genesis are never overwritten)")
 	offline := fs.Bool("offline", false, "skip cosmos chain-registry fetch + genesis download; write blank chain templates")
-	configPath := fs.String("config", "", "config file path (default: $XDG_CONFIG_HOME/malcom/config.toml)")
 	if err := fs.Parse(args); err != nil {
 		return 2
 	}
 
 	// ─── resolve XDG roots ──────────────────────────────────────────
-	cfgPath := *configPath
-	if cfgPath == "" {
-		p, err := config.DefaultConfigPath()
-		if err != nil {
-			fmt.Fprintf(os.Stderr, "resolve config path: %v\n", err)
-			return 1
-		}
-		cfgPath = p
+	cfgPath, err := config.DefaultConfigPath()
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "resolve config path: %v\n", err)
+		return 1
 	}
 	configRoot := filepath.Dir(cfgPath)
 	chainsDir := filepath.Join(configRoot, "chains")
