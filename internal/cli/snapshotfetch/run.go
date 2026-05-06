@@ -12,7 +12,6 @@ package snapshotfetch
 
 import (
 	"context"
-	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"flag"
@@ -24,7 +23,6 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
-	"sync"
 	"syscall"
 	"time"
 
@@ -193,8 +191,7 @@ func Run(args []string) int {
 		cancel()
 	}()
 
-	sink := &diskSink{outRoot: *out, chainID: ch.ChainID, logger: fetchLog}
-	if _, err := snapfetch.RunFetch(rootCtx, scfg, sink); err != nil {
+	if _, err := snapfetch.RunFetch(rootCtx, scfg, *out); err != nil {
 		fmt.Fprintf(os.Stderr, "snapfetch: %v\n", err)
 		return 1
 	}
@@ -303,86 +300,3 @@ func joinCSV(items []string) string {
 	return out
 }
 
-// diskSink writes streamed snapshot output under
-// <outRoot>/snapshot_<chain>_<height>/. Layout matches what
-// `malcom snapshot import` reads.
-type diskSink struct {
-	outRoot string
-	chainID string
-	logger  cmtlog.Logger
-
-	mu  sync.Mutex
-	dir string
-
-	height uint64
-	format uint32
-	chunks uint32
-	hash   []byte
-	mdLen  int
-}
-
-func (d *diskSink) OnChosen(height uint64, format uint32, chunks uint32, hash []byte, metadata []byte, _ [][]byte) error {
-	d.mu.Lock()
-	defer d.mu.Unlock()
-	d.dir = filepath.Join(d.outRoot, fmt.Sprintf("snapshot_%s_%d", d.chainID, height))
-	if err := os.MkdirAll(d.dir, 0o755); err != nil {
-		return fmt.Errorf("mkdir snapshot dir: %w", err)
-	}
-	if err := os.WriteFile(filepath.Join(d.dir, "metadata.bin"), metadata, 0o644); err != nil {
-		return fmt.Errorf("write metadata.bin: %w", err)
-	}
-	d.height = height
-	d.format = format
-	d.chunks = chunks
-	d.hash = hash
-	d.mdLen = len(metadata)
-	return nil
-}
-
-func (d *diskSink) OnChunk(idx uint32, data []byte) error {
-	d.mu.Lock()
-	dir := d.dir
-	d.mu.Unlock()
-	if dir == "" {
-		return fmt.Errorf("OnChunk before OnChosen")
-	}
-	path := filepath.Join(dir, fmt.Sprintf("chunk_%05d.bin", idx))
-	if err := os.WriteFile(path, data, 0o644); err != nil {
-		return fmt.Errorf("write chunk %d: %w", idx, err)
-	}
-	return nil
-}
-
-func (d *diskSink) OnComplete(bytesTotal uint64, goodPeerIDs []string, offeredBy []string) error {
-	d.mu.Lock()
-	dir := d.dir
-	height := d.height
-	format := d.format
-	chunks := d.chunks
-	hash := d.hash
-	mdLen := d.mdLen
-	d.mu.Unlock()
-
-	meta := snapfetch.SavedMeta{
-		Height:          height,
-		Format:          format,
-		Chunks:          chunks,
-		HashHex:         hex.EncodeToString(hash),
-		MetadataLen:     mdLen,
-		GoodPeers:       goodPeerIDs,
-		OfferedBy:       offeredBy,
-		DownloadedAt:    time.Now().UTC(),
-		BytesTotal:      bytesTotal,
-		BytesTotalHuman: snapfetch.HumanBytes(bytesTotal),
-	}
-	if err := snapfetch.WriteJSONFile(filepath.Join(dir, "meta.json"), meta); err != nil {
-		return fmt.Errorf("write meta: %w", err)
-	}
-	if err := os.WriteFile(filepath.Join(dir, ".complete"), nil, 0o644); err != nil {
-		return fmt.Errorf("mark complete: %w", err)
-	}
-	if d.logger != nil {
-		d.logger.Info("snapshot saved", "dir", dir)
-	}
-	return nil
-}

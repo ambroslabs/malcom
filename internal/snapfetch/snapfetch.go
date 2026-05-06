@@ -1,16 +1,9 @@
-// Package snapfetch is the reusable core behind cosmos-snapshot-fetch.
-// It runs a 3-phase pipeline against state-sync peers:
-//
-//  1. discover — short broad dial wave to harvest snapshot offers.
-//  2. raceProbe — chunk-0 probe across top-N candidates, pick the one
-//     with the most peers that actually return real bytes.
-//  3. download — schedule every chunk across good peers, verify each
-//     against the per-chunk SHA256 in the snapshot Metadata blob.
-//
-// Output is delivered through a Sink: chunks are not buffered to disk,
-// allowing callers (e.g. cosmos-rapid-bootstrap) to stream them straight
-// into a downstream importer. The original cosmos-snapshot-fetch CLI is
-// a thin wrapper that implements Sink as on-disk file writes.
+// Package snapfetch is the reusable core behind `malcom snapshot fetch`.
+// It walks candidate snapshot heights against state-sync peers, picks
+// the freshest offer that any peer will serve, downloads every chunk
+// in parallel, verifies each against the per-chunk SHA256 in the
+// snapshot Metadata blob, and writes everything under a per-snapshot
+// directory ready for `malcom snapshot import` to consume.
 package snapfetch
 
 import (
@@ -205,31 +198,9 @@ func (c *Config) applyDefaults() {
 	}
 }
 
-// Sink receives streamed events as the fetch proceeds.
-//
-// Lifecycle (on success): OnChosen → OnChunk × N → OnComplete. On
-// failure within a single attempt the CLI will rescan with a new
-// candidate, so OnChosen may be called more than once before a final
-// OnComplete; sinks should therefore reset their per-snapshot state on
-// each OnChosen.
-type Sink interface {
-	// OnChosen is called once after phase-2 selects a candidate. It
-	// includes the snapshot proto metadata bytes and per-chunk SHA256
-	// hashes.
-	OnChosen(height uint64, format uint32, chunks uint32, hash []byte, metadata []byte, chunkHashes [][]byte) error
-
-	// OnChunk is called for each chunk as it arrives, hash-verified, in
-	// arbitrary order. Implementations should not block long-term —
-	// heavy work should be pushed to another goroutine via a channel.
-	OnChunk(idx uint32, data []byte) error
-
-	// OnComplete is called once when all chunks are downloaded.
-	OnComplete(bytesTotal uint64, goodPeerIDs []string, offeredBy []string) error
-}
-
-// Result is what RunFetch returns to the caller. Fields mirror what was
-// delivered via Sink callbacks for callers that don't want to track
-// state in the sink.
+// Result is what RunFetch returns to the caller. Mirrors the contents
+// of the on-disk meta.json so consumers (the cli, tests) don't need to
+// re-parse the file.
 type Result struct {
 	Height      uint64
 	Format      uint32
@@ -257,10 +228,9 @@ type snapshotOffer struct {
 	Peers    map[string]bool
 }
 
-// SavedMeta is the JSON shape written to <dir>/meta.json by the disk
-// sink. Exported so the CLI can use the same struct (and so callers
-// can decode existing meta.json files if they want).
-type SavedMeta struct {
+// savedMeta is the JSON shape written to <dir>/meta.json after a
+// successful fetch.
+type savedMeta struct {
 	Height          uint64    `json:"height"`
 	Format          uint32    `json:"format"`
 	Chunks          uint32    `json:"chunks"`
@@ -281,14 +251,15 @@ func snapKeyOffer(o *snapshotOffer) string {
 	return fmt.Sprintf("%d_%d_%s", o.Height, o.Format, hex.EncodeToString(o.Hash))
 }
 
-// RunFetch is the library entry point. It builds a p2p.Switch, runs the
-// 3-phase pipeline (discover → race → download), and emits results
-// through sink. The returned *Result is also reflected in sink calls.
+// RunFetch is the library entry point. It builds a p2p.Switch, walks
+// candidate heights, downloads chunks, and writes everything under
+// <outRoot>/snapshot_<chain>_<height>/ (chunks + metadata.bin +
+// meta.json + .complete marker).
 //
-// On error the partial state (anything emitted via sink so far) is left
-// to the caller to interpret — typically the caller cancels its context
-// and lets sink consumers drain naturally.
-func RunFetch(ctx context.Context, cfg Config, sink Sink) (*Result, error) {
+// On error any partial output under outRoot is left in place — no
+// .complete marker is written, so the cli can detect incomplete dirs
+// and the user can inspect / remove them.
+func RunFetch(ctx context.Context, cfg Config, outRoot string) (*Result, error) {
 	cfg.applyDefaults()
 	logger := cfg.Logger
 
@@ -461,17 +432,21 @@ func RunFetch(ctx context.Context, cfg Config, sink Sink) (*Result, error) {
 			len(chunkHashes), chosen.Chunks)
 	}
 
-	// Hand metadata + chunk hashes to the sink before any chunk arrives.
-	// Streaming sinks need this to allocate a reorder buffer / spawn a
-	// downstream importer keyed on chunk count.
-	if err := sink.OnChosen(chosen.Height, chosen.Format, chosen.Chunks, chosen.Hash, chosen.Metadata, chunkHashes); err != nil {
-		return nil, fmt.Errorf("sink.OnChosen: %w", err)
+	// Create the output dir and write metadata.bin before any chunk
+	// arrives — chunk goroutines write into snapDir concurrently and
+	// rely on it existing.
+	snapDir := filepath.Join(outRoot, fmt.Sprintf("snapshot_%s_%d", cfg.ChainID, chosen.Height))
+	if err := os.MkdirAll(snapDir, 0o755); err != nil {
+		return nil, fmt.Errorf("mkdir snapshot dir: %w", err)
+	}
+	if err := os.WriteFile(filepath.Join(snapDir, "metadata.bin"), chosen.Metadata, 0o644); err != nil {
+		return nil, fmt.Errorf("write metadata.bin: %w", err)
 	}
 
 	// ─── Download all chunks ──────────────────────────────────────────
 	fetchCtx, fetchCancel := context.WithTimeout(ctx, cfg.MaxFetchTime)
 	bt, derr := download(fetchCtx, sw, ssR, mux.subscribe(),
-		chosen, chunkHashes, goodPeers, addrByNodeID, sink, seeds,
+		chosen, chunkHashes, goodPeers, addrByNodeID, snapDir, seeds,
 		cfg.PerPeerLimit, cfg.ChunkTimeout, cfg.PeerFailLimit,
 		cfg.PeerRedialBackoff, cfg.MaxRedialBackoff,
 		cfg.WarmPeerTarget, cfg.WarmRefreshInterval, watch, flog)
@@ -492,9 +467,25 @@ func RunFetch(ctx context.Context, cfg Config, sink Sink) (*Result, error) {
 	}
 	sort.Strings(good)
 
-	if err := sink.OnComplete(bytesTotal, good, offered); err != nil {
-		return nil, fmt.Errorf("sink.OnComplete: %w", err)
+	meta := savedMeta{
+		Height:          chosen.Height,
+		Format:          chosen.Format,
+		Chunks:          chosen.Chunks,
+		HashHex:         hex.EncodeToString(chosen.Hash),
+		MetadataLen:     len(chosen.Metadata),
+		GoodPeers:       good,
+		OfferedBy:       offered,
+		DownloadedAt:    time.Now().UTC(),
+		BytesTotal:      bytesTotal,
+		BytesTotalHuman: humanBytes(bytesTotal),
 	}
+	if err := writeJSON(filepath.Join(snapDir, "meta.json"), meta); err != nil {
+		return nil, fmt.Errorf("write meta.json: %w", err)
+	}
+	if err := os.WriteFile(filepath.Join(snapDir, ".complete"), nil, 0o644); err != nil {
+		return nil, fmt.Errorf("mark complete: %w", err)
+	}
+	flog.Info("snapshot saved", "dir", snapDir)
 	flog.Info("download complete",
 		"height", chosen.Height, "format", chosen.Format,
 		"chunks", chosen.Chunks, "bytes", humanBytes(bytesTotal))
@@ -542,8 +533,9 @@ func buildMConnConfig() conn.MConnConfig {
 
 // InspectAndEnrich runs the snapshotinspect package on a completed
 // snapshot directory and rewrites meta.json with structural details.
-// Used by the disk-sink CLI; streaming sinks don't need it. logger
-// may be nil for silent operation.
+// Optional post-process — RunFetch doesn't call it (the next pipeline
+// step parses the snapshot anyway). logger may be nil for silent
+// operation.
 func InspectAndEnrich(dir string, logger cmtlog.Logger) error {
 	if logger != nil {
 		logger.Info("inspecting", "dir", dir)
@@ -1078,8 +1070,8 @@ type peerStat struct {
 }
 
 // download is the phase-3 chunk scheduler. It dispatches chunks across
-// good peers, verifies SHA256 against the metadata hashes, and emits
-// each verified chunk through sink.OnChunk. Returns total bytes
+// good peers, verifies SHA256 against the metadata hashes, and writes
+// each verified chunk to <snapDir>/chunk_<idx>.bin. Returns total bytes
 // transferred (sum of verified chunk lengths).
 //
 // Resilience features:
@@ -1095,7 +1087,7 @@ type peerStat struct {
 //     mismatch single-strikes them out.
 func download(ctx context.Context, sw *p2p.Switch, ssR *statesync.Reactor,
 	evs chan statesync.Event, target *snapshotOffer, chunkHashes [][]byte,
-	good []p2p.ID, addrByNodeID map[string]string, sink Sink, seeds []peerSeed,
+	good []p2p.ID, addrByNodeID map[string]string, snapDir string, seeds []peerSeed,
 	perPeer int, chunkTimeout time.Duration, peerFailLimit int,
 	redialBackoff, maxRedialBackoff time.Duration,
 	warmTarget int, warmRefreshInterval time.Duration,
@@ -1426,13 +1418,13 @@ func download(ctx context.Context, sw *p2p.Switch, ssR *statesync.Reactor,
 			st.disconnects = 0
 			st.nextDialAfter = time.Time{}
 
-			// Hand the verified chunk to the sink. Sink errors are
-			// logged and ignored — the original CLI's behaviour was a
-			// fatal exit on disk-write error, but for streaming sinks
-			// we want the importer's error path (ctx cancellation) to
-			// surface naturally rather than aborting mid-snapshot.
-			if err := sink.OnChunk(idx, ev.Chunk.Bytes); err != nil {
-				logger.Error("sink.OnChunk", "idx", idx, "err", err)
+			// Write the verified chunk to disk. Errors are logged and
+			// ignored so a transient disk hiccup doesn't abort the
+			// whole fetch — if the file is missing later, the
+			// downstream import step surfaces it.
+			chunkPath := filepath.Join(snapDir, fmt.Sprintf("chunk_%05d.bin", idx))
+			if err := os.WriteFile(chunkPath, ev.Chunk.Bytes, 0o644); err != nil {
+				logger.Error("write chunk", "idx", idx, "err", err)
 			}
 			completed[idx] = true
 			doneCount++
@@ -1595,10 +1587,6 @@ func loadSeeds(cumPath, addrBookPath string, logger cmtlog.Logger) []peerSeed {
 	return out
 }
 
-// WriteJSONFile is exported for the disk-sink CLI. Internal callers
-// should use writeJSON.
-func WriteJSONFile(path string, v interface{}) error { return writeJSON(path, v) }
-
 func writeJSON(path string, v interface{}) error {
 	f, err := os.Create(path)
 	if err != nil {
@@ -1609,9 +1597,6 @@ func writeJSON(path string, v interface{}) error {
 	enc.SetIndent("", "  ")
 	return enc.Encode(v)
 }
-
-// HumanBytes is exported for the disk-sink CLI's meta.json hooks.
-func HumanBytes(n uint64) string { return humanBytes(n) }
 
 func humanBytes(n uint64) string {
 	const (
