@@ -18,26 +18,15 @@ func GlobalTemplate(defaultChain string) string {
 default_chain = %q
 
 [fetch]
-# Phase 1: discovery.
-discover      = "25s"
-dial_parallel = 32
-
-# Phase 2: candidate selection — probe top-N snapshots in parallel.
-max_candidates = 5
-probe_timeout  = "12s"
-min_peers      = 1
-
-# Phase 3: chunk download.
-per_peer       = 2
-chunk_timeout  = "45s"
-max_fetch      = "30m"
-peer_fails     = 3       # missing/hash-mismatch strikes before banning a peer
+# Per-chunk download tuning. The walking algorithm uses
+# per_height_timeout for snapshot selection; these knobs apply
+# during the actual chunk download.
+per_peer       = 2          # max in-flight chunks per peer
+chunk_timeout  = "45s"      # per-chunk request timeout
+max_fetch      = "30m"      # hard cap on full download
+peer_fails     = 3          # missing/hash-mismatch strikes before banning
 peer_redials   = 3
 redial_backoff = "5s"
-
-# Rescan when the chosen snapshot's peers all fail.
-max_rescans     = 3
-rescan_discover = "15s"
 
 listen      = "tcp://0.0.0.0:0"
 moniker     = "malcom-snapfetch"

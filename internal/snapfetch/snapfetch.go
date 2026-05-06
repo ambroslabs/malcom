@@ -468,7 +468,7 @@ func RunFetch(ctx context.Context, cfg Config, sink Sink) (*Result, error) {
 		return nil, fmt.Errorf("sink.OnChosen: %w", err)
 	}
 
-	// ─── Phase 3: download all chunks ─────────────────────────────────
+	// ─── Download all chunks ──────────────────────────────────────────
 	fetchCtx, fetchCancel := context.WithTimeout(ctx, cfg.MaxFetchTime)
 	bt, derr := download(fetchCtx, sw, ssR, mux.subscribe(),
 		chosen, chunkHashes, goodPeers, addrByNodeID, sink, seeds,
@@ -1065,277 +1065,7 @@ func walkTargets(top, minHeight, interval uint64) []uint64 {
 	return out
 }
 
-// ─── Phase 1 (legacy; replaced by walkBackward, retained for callers) ───
-
-func discover(ctx context.Context, sw *p2p.Switch, evs chan statesync.Event, seeds []peerSeed,
-	parallel int, dur time.Duration, wantCandidates int, logger cmtlog.Logger) map[string]*snapshotOffer {
-
-	dctx, cancel := context.WithTimeout(ctx, dur)
-	defer cancel()
-
-	offers := map[string]*snapshotOffer{}
-	var mu sync.Mutex
-
-	// Early-exit: once we have at least MaxCandidates distinct
-	// snapshot offers AND a minimum amount of time has elapsed (to
-	// let peer diversity build up), cut discovery short. PEX is
-	// growing the connected set in the background, but we don't need
-	// 25s of soaking when 6-second results already gave us a strong
-	// candidate slate.
-	const earlyExitMinWait = 5 * time.Second
-	earlyExitThreshold := wantCandidates
-	if earlyExitThreshold < 1 {
-		earlyExitThreshold = 5
-	}
-	startedAt := time.Now()
-
-	go func() {
-		for {
-			select {
-			case <-dctx.Done():
-				return
-			case ev := <-evs:
-				if ev.Snapshot == nil {
-					continue
-				}
-				k := snapKey(ev.Snapshot)
-				mu.Lock()
-				rec, ok := offers[k]
-				if !ok {
-					rec = &snapshotOffer{
-						Height:   ev.Snapshot.Height,
-						Format:   ev.Snapshot.Format,
-						Chunks:   ev.Snapshot.Chunks,
-						Hash:     ev.Snapshot.Hash,
-						Metadata: ev.Snapshot.Metadata,
-						Peers:    map[string]bool{},
-					}
-					offers[k] = rec
-					if len(offers) >= earlyExitThreshold && time.Since(startedAt) >= earlyExitMinWait {
-						logger.Info("phase 1 early exit",
-							"unique_snapshots", len(offers),
-							"elapsed", time.Since(startedAt).Truncate(time.Millisecond))
-						cancel()
-					}
-				}
-				rec.Peers[ev.PeerID] = true
-				mu.Unlock()
-			}
-		}
-	}()
-
-	queue := make(chan peerSeed, len(seeds)+16)
-	for _, s := range seeds {
-		queue <- s
-	}
-	close(queue)
-
-	var wg sync.WaitGroup
-	for i := 0; i < parallel; i++ {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			for {
-				select {
-				case <-dctx.Done():
-					return
-				case s, ok := <-queue:
-					if !ok {
-						return
-					}
-					na, err := p2p.NewNetAddressString(s.addr)
-					if err != nil {
-						continue
-					}
-					_ = sw.DialPeerWithAddress(na)
-					// Hold ~4s so AddPeer triggers SnapshotsRequest and replies arrive.
-					select {
-					case <-dctx.Done():
-					case <-time.After(4 * time.Second):
-					}
-					if peer := sw.Peers().Get(na.ID); peer != nil {
-						sw.StopPeerGracefully(peer)
-					}
-				}
-			}
-		}()
-	}
-
-	t := time.NewTicker(5 * time.Second)
-	defer t.Stop()
-	go func() {
-		for {
-			select {
-			case <-dctx.Done():
-				return
-			case <-t.C:
-				mu.Lock()
-				logger.Info("phase 1 progress",
-					"unique_snapshots", len(offers),
-					"connected", sw.Peers().Size())
-				mu.Unlock()
-			}
-		}
-	}()
-
-	wg.Wait()
-	<-dctx.Done()
-	return offers
-}
-
-// rankCandidates picks the top-N offers, ordered newest-first with
-// peer count as the tiebreaker. The freshness floor (MinHeight)
-// upstream has already filtered out anything stale, so here we just
-// rank.
-func rankCandidates(offers map[string]*snapshotOffer, force uint64, max int) []*snapshotOffer {
-	cands := make([]*snapshotOffer, 0, len(offers))
-	for _, o := range offers {
-		if force != 0 && o.Height != force {
-			continue
-		}
-		cands = append(cands, o)
-	}
-	sort.Slice(cands, func(i, j int) bool {
-		if cands[i].Height != cands[j].Height {
-			return cands[i].Height > cands[j].Height
-		}
-		return len(cands[i].Peers) > len(cands[j].Peers)
-	})
-	if len(cands) > max {
-		cands = cands[:max]
-	}
-	return cands
-}
-
-// ─── Phase 2: race chunk-0 probes across candidates ─────────────────────
-
-func raceProbe(ctx context.Context, sw *p2p.Switch, ssR *statesync.Reactor,
-	evs chan statesync.Event, candidates []*snapshotOffer, addrByNodeID map[string]string,
-	timeout time.Duration, minGood int, logger cmtlog.Logger) (*snapshotOffer, []p2p.ID) {
-
-	type cand struct {
-		offer *snapshotOffer
-		good  []p2p.ID
-		mu    sync.Mutex
-	}
-	cands := make([]*cand, len(candidates))
-	for i, o := range candidates {
-		cands[i] = &cand{offer: o}
-	}
-
-	want := map[p2p.ID]string{}
-	for _, c := range cands {
-		for pid := range c.offer.Peers {
-			id := p2p.ID(pid)
-			if _, ok := want[id]; ok {
-				continue
-			}
-			if addr, ok := addrByNodeID[pid]; ok {
-				want[id] = addr
-			}
-		}
-	}
-	logger.Info("phase 2: redialing candidate peers", "count", len(want))
-	var redialWG sync.WaitGroup
-	for id, addr := range want {
-		if peer := sw.Peers().Get(id); peer != nil {
-			continue
-		}
-		na, err := p2p.NewNetAddressString(addr)
-		if err != nil {
-			continue
-		}
-		redialWG.Add(1)
-		go func(na *p2p.NetAddress) {
-			defer redialWG.Done()
-			_ = sw.DialPeerWithAddress(na)
-		}(na)
-	}
-	waitDone := make(chan struct{})
-	go func() { redialWG.Wait(); close(waitDone) }()
-	select {
-	case <-waitDone:
-	case <-time.After(12 * time.Second):
-	case <-ctx.Done():
-		return nil, nil
-	}
-
-	dispatched := 0
-	for _, c := range cands {
-		for pid := range c.offer.Peers {
-			peer := sw.Peers().Get(p2p.ID(pid))
-			if peer == nil {
-				continue
-			}
-			if ssR.RequestChunk(peer, c.offer.Height, c.offer.Format, 0) {
-				dispatched++
-			}
-		}
-	}
-	logger.Info("phase 2: chunk-0 probes dispatched",
-		"candidates", len(cands), "connected", sw.Peers().Size(), "requests", dispatched)
-
-	deadline := time.NewTimer(timeout)
-	defer deadline.Stop()
-	for {
-		select {
-		case <-ctx.Done():
-			return nil, nil
-		case <-deadline.C:
-			goto pick
-		case ev := <-evs:
-			if ev.Chunk == nil || ev.Chunk.Index != 0 {
-				continue
-			}
-			if ev.Chunk.Missing || len(ev.Chunk.Bytes) == 0 {
-				continue
-			}
-			for _, c := range cands {
-				if c.offer.Height != ev.Chunk.Height || c.offer.Format != ev.Chunk.Format {
-					continue
-				}
-				c.mu.Lock()
-				already := false
-				for _, p := range c.good {
-					if string(p) == ev.PeerID {
-						already = true
-						break
-					}
-				}
-				if !already {
-					c.good = append(c.good, p2p.ID(ev.PeerID))
-				}
-				c.mu.Unlock()
-				logger.Debug("good peer for candidate",
-					"height", ev.Chunk.Height, "format", ev.Chunk.Format,
-					"peer", ev.PeerID, "chunk_bytes", len(ev.Chunk.Bytes))
-				break
-			}
-		}
-	}
-
-pick:
-	// Always pick the FRESHEST candidate that meets the min-peers
-	// threshold. The cost of "more peers" (better redundancy) is
-	// trivial vs. the catchup cost of state-syncing an older snapshot
-	// — every 1000 older blocks is ~1.5 min of extra blocksync time
-	// on cosmos-hub.
-	sort.Slice(cands, func(i, j int) bool {
-		return cands[i].offer.Height > cands[j].offer.Height
-	})
-	for _, c := range cands {
-		if len(c.good) >= minGood {
-			logger.Info("phase 2 result",
-				"candidates", len(cands),
-				"chosen_height", c.offer.Height,
-				"chosen_good_peers", len(c.good))
-			return c.offer, c.good
-		}
-	}
-	return nil, nil
-}
-
-// ─── Phase 3: chunk download scheduler ──────────────────────────────────
+// ─── Chunk download scheduler ───────────────────────────────────────────
 
 type peerStat struct {
 	inflight      int
@@ -1541,7 +1271,7 @@ func download(ctx context.Context, sw *p2p.Switch, ssR *statesync.Reactor,
 		return dispatched
 	}
 
-	logger.Info("phase 3: starting download",
+	logger.Info("download starting",
 		"chunks", N, "good_peers", len(good),
 		"per_peer_inflight", perPeer, "warm_target", warmTarget)
 
@@ -1715,7 +1445,7 @@ func download(ctx context.Context, sw *p2p.Switch, ssR *statesync.Reactor,
 			startTime = time.Now()
 		}
 	}
-	logger.Info("phase 3: complete",
+	logger.Info("download finished",
 		"chunks", N,
 		"bytes", bytesTotal.Load(),
 		"elapsed", time.Since(startTime))
