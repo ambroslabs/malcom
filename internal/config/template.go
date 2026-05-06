@@ -25,7 +25,7 @@ per_peer       = 2          # max in-flight chunks per peer
 chunk_timeout  = "45s"      # per-chunk request timeout
 max_fetch      = "30m"      # hard cap on full download
 peer_fails     = 3          # missing/hash-mismatch strikes before banning
-peer_redials   = 3
+peer_redials   = 5          # disconnect/redial cycles before benching a flapping peer
 redial_backoff = "5s"
 
 listen          = "tcp://0.0.0.0:0"
@@ -51,15 +51,35 @@ per_height_timeout = "10s"
 # then churn out the unhelpful ones (see churn_grace below).
 # pex_target_peers must be < max_outbound_peers (the gap is
 # headroom for churn cycles).
-max_outbound_peers = 64
-pex_target_peers   = 48
-pex_max_per_wave   = 8
+max_outbound_peers = 128
+pex_target_peers   = 96
+pex_max_per_wave   = 12
 
 # After a peer connects we send SnapshotsRequest immediately. Any
 # peer that hasn't advertised a snapshot in [min_height, max_height]
 # within churn_grace is gracefully disconnected so PEX can dial
 # someone more useful from the addrbook.
-churn_grace = "3s"
+churn_grace = "10s"
+
+# Reject peers on AddPeer whose NodeInfo doesn't advertise the
+# state-sync snapshot channel (0x60). Skips waiting churn_grace for
+# peers we can prove won't help us (relayers, blocksync-only nodes).
+require_state_sync_channel = true
+
+# How long misbehaving peers are barred from PEX rotation via
+# book.MarkBad.
+addrbook_ban_duration = "1h"
+
+# Provisional peer probe budgets — applied to peers that arrived
+# via PEX (not on our seed list) until they serve their first
+# verified chunk.
+provisional_probe_strikes  = 1
+provisional_probe_inflight = 1
+
+# Consecutive PEX dial failures against an addrbook entry before
+# it is deleted from the addrbook (vs the softer MarkBad cycle).
+# PEX gossip will re-add the address if the peer comes back online.
+max_dial_failures = 3
 
 [import]
 # Pebble bulk-load tuning. Defaults sized for an 8 GiB host with 2-4

@@ -97,6 +97,32 @@ type FetchTuning struct {
 	// they respond; too long → dead slots stick around.
 	ChurnGrace duration `toml:"churn_grace"`
 
+	// RequireStateSyncChannel bans-on-AddPeer any peer whose NodeInfo
+	// doesn't advertise the state-sync snapshot channel (0x60). Turns
+	// the slow churn-grace eviction of non-state-sync peers into a
+	// zero-grace bench so connection slots fill faster with useful
+	// candidates.
+	RequireStateSyncChannel bool `toml:"require_state_sync_channel"`
+
+	// AddrBookBanDuration is how long a misbehaving peer is barred
+	// from PEX rotation via book.MarkBad.
+	AddrBookBanDuration duration `toml:"addrbook_ban_duration"`
+
+	// ProvisionalProbeStrikes is the misbehavior strike budget for a
+	// peer that arrived via PEX (not on our seed list) before its
+	// first verified chunk promotes it to "proven".
+	ProvisionalProbeStrikes int `toml:"provisional_probe_strikes"`
+
+	// ProvisionalProbeInflight is the in-flight chunk slot budget for
+	// a still-provisional peer.
+	ProvisionalProbeInflight int `toml:"provisional_probe_inflight"`
+
+	// MaxDialFailures caps consecutive PEX dial failures against an
+	// addrbook entry before it's deleted from the addrbook entirely
+	// (vs the current MarkBad which cycles back in after a TTL).
+	// PEX gossip will re-add the address if the peer comes back online.
+	MaxDialFailures int `toml:"max_dial_failures"`
+
 	Discover      duration `toml:"discover"`
 	DialParallel  int      `toml:"dial_parallel"`
 	MaxCandidates int      `toml:"max_candidates"`
@@ -107,6 +133,9 @@ type FetchTuning struct {
 	ChunkTimeout  duration `toml:"chunk_timeout"`
 	MaxFetch      duration `toml:"max_fetch"`
 	PeerFails     int      `toml:"peer_fails"`
+	// PeerRedials caps the number of consecutive disconnect/redial
+	// cycles before a peer is permanently banned for the run. 0 =
+	// unlimited (legacy behaviour).
 	PeerRedials   int      `toml:"peer_redials"`
 	RedialBackoff duration `toml:"redial_backoff"`
 

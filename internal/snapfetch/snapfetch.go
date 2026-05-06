@@ -54,7 +54,7 @@ type Config struct {
 	ChunkTimeout      time.Duration // default 45s
 	MaxFetchTime      time.Duration // default 30m
 	PeerFailLimit     int           // default 3 (hash-mismatch / missing-chunk strikes before ban)
-	PeerRedialMax     int           // deprecated; retained for back-compat (no longer caps redials)
+	MaxRedials        int           // default 5 (consecutive disconnect/redial cycles before benching). 0 = unlimited.
 	PeerRedialBackoff time.Duration // default 5s — base backoff between redial attempts; doubles on each retry up to MaxRedialBackoff
 
 	// MaxRedialBackoff caps the exponential backoff between redial
@@ -108,6 +108,27 @@ type Config struct {
 	// ChurnGrace is how long a connected peer has to advertise a
 	// useful snapshot before being dropped. See walkBackward.
 	ChurnGrace time.Duration
+
+	// RequireStateSyncChannel bans-on-AddPeer any peer whose NodeInfo
+	// lacks the snapshot channel (0x60). When false, those peers are
+	// caught later via churn-grace.
+	RequireStateSyncChannel bool
+
+	// AddrBookBanDuration is the TTL passed to book.MarkBad when
+	// banning a misbehaving peer. Default 1h.
+	AddrBookBanDuration time.Duration
+
+	// ProvisionalProbeStrikes / ProvisionalProbeInflight bound a
+	// PEX-arrived peer's trial period before it serves its first
+	// verified chunk and gets promoted to "proven".
+	ProvisionalProbeStrikes  int // default 1
+	ProvisionalProbeInflight int // default 1
+
+	// MaxDialFailures caps consecutive PEX dial failures against an
+	// addrbook entry before AutoReactor deletes it from the addrbook.
+	// 0 disables; the address keeps cycling through MarkBad TTLs.
+	MaxDialFailures int
+
 	MaxRescans        int           // default 3
 	RescanDiscoverFor time.Duration // default 15s
 
@@ -152,14 +173,26 @@ func (c *Config) applyDefaults() {
 	if c.PeerFailLimit == 0 {
 		c.PeerFailLimit = 3
 	}
-	if c.PeerRedialMax == 0 {
-		c.PeerRedialMax = 3
+	if c.MaxRedials == 0 {
+		c.MaxRedials = 5
 	}
 	if c.PeerRedialBackoff == 0 {
 		c.PeerRedialBackoff = 5 * time.Second
 	}
 	if c.MaxRedialBackoff == 0 {
 		c.MaxRedialBackoff = 5 * time.Minute
+	}
+	if c.AddrBookBanDuration == 0 {
+		c.AddrBookBanDuration = time.Hour
+	}
+	if c.ProvisionalProbeStrikes == 0 {
+		c.ProvisionalProbeStrikes = 1
+	}
+	if c.ProvisionalProbeInflight == 0 {
+		c.ProvisionalProbeInflight = 1
+	}
+	if c.MaxDialFailures == 0 {
+		c.MaxDialFailures = 3
 	}
 	if c.WarmPeerTarget == 0 {
 		c.WarmPeerTarget = 16
@@ -342,10 +375,12 @@ func RunFetch(ctx context.Context, cfg Config, outRoot string) (*Result, error) 
 	// more aggressive than cometbft's ensurePeers default — we're a
 	// one-shot fetcher, not a long-running node.
 	pexR := localpex.NewAutoReactor(book, localpex.AutoConfig{
-		TargetPeers:  cfg.PEXTargetPeers,
-		MaxPerWave:   cfg.PEXMaxPerWave,
-		DialInterval: 2 * time.Second,
-		BookBias:     50,
+		TargetPeers:        cfg.PEXTargetPeers,
+		MaxPerWave:         cfg.PEXMaxPerWave,
+		DialInterval:       2 * time.Second,
+		BookBias:           50,
+		MaxDialFailures:    cfg.MaxDialFailures,
+		FailureBanDuration: 5 * time.Minute,
 	}, logger.With("module", "pex"))
 
 	sw := p2p.NewSwitch(p2pConfig, transport)
@@ -402,7 +437,7 @@ func RunFetch(ctx context.Context, cfg Config, outRoot string) (*Result, error) 
 	// peer set from the moment we start collecting offers.
 	watchCtx, watchCancel := context.WithCancel(ctx)
 	defer watchCancel()
-	watch := newPeerWatch(sw, book, cfg.MinHeight, cfg.ChurnGrace, flog)
+	watch := newPeerWatch(sw, book, cfg.MinHeight, cfg.ChurnGrace, cfg.AddrBookBanDuration, cfg.RequireStateSyncChannel, flog)
 	go watch.run(watchCtx, mux.subscribe())
 
 	var (
@@ -446,7 +481,8 @@ func RunFetch(ctx context.Context, cfg Config, outRoot string) (*Result, error) 
 	bt, derr := download(fetchCtx, sw, ssR, mux.subscribe(),
 		chosen, chunkHashes, goodPeers, addrByNodeID, snapDir, seeds,
 		cfg.PerPeerLimit, cfg.ChunkTimeout, cfg.PeerFailLimit,
-		cfg.PeerRedialBackoff, cfg.MaxRedialBackoff,
+		cfg.MaxRedials, cfg.PeerRedialBackoff, cfg.MaxRedialBackoff,
+		cfg.ProvisionalProbeStrikes, cfg.ProvisionalProbeInflight,
 		cfg.WarmPeerTarget, cfg.WarmRefreshInterval, watch, flog)
 	fetchCancel()
 	if derr != nil {
@@ -648,27 +684,42 @@ func (m *eventMux) stop() { close(m.close) }
 // minHeight = 0 disables churning (peerWatch still subscribes; just
 // never drops anyone).
 type peerWatch struct {
-	sw        *p2p.Switch
-	book      pexcb.AddrBook
-	minHeight uint64
-	grace     time.Duration
-	log       cmtlog.Logger
+	sw                      *p2p.Switch
+	book                    pexcb.AddrBook
+	minHeight               uint64
+	grace                   time.Duration
+	banDuration             time.Duration
+	requireStateSyncChannel bool
+	log                     cmtlog.Logger
 
-	mu        sync.Mutex
-	firstSeen map[p2p.ID]time.Time
-	useful    map[p2p.ID]bool
+	mu             sync.Mutex
+	firstSeen      map[p2p.ID]time.Time
+	useful         map[p2p.ID]bool
+	externallyBanned map[p2p.ID]bool // signaled by download(); skip in tryRedial
 }
 
-func newPeerWatch(sw *p2p.Switch, book pexcb.AddrBook, minHeight uint64, grace time.Duration, log cmtlog.Logger) *peerWatch {
+func newPeerWatch(sw *p2p.Switch, book pexcb.AddrBook, minHeight uint64, grace, banDuration time.Duration, requireStateSyncChannel bool, log cmtlog.Logger) *peerWatch {
 	return &peerWatch{
-		sw:        sw,
-		book:      book,
-		minHeight: minHeight,
-		grace:     grace,
-		log:       log,
-		firstSeen: map[p2p.ID]time.Time{},
-		useful:    map[p2p.ID]bool{},
+		sw:                      sw,
+		book:                    book,
+		minHeight:               minHeight,
+		grace:                   grace,
+		banDuration:             banDuration,
+		requireStateSyncChannel: requireStateSyncChannel,
+		log:                     log,
+		firstSeen:               map[p2p.ID]time.Time{},
+		useful:                  map[p2p.ID]bool{},
+		externallyBanned:        map[p2p.ID]bool{},
 	}
+}
+
+// isBanned reports whether the peer was banned (by peerWatch's own
+// tick or via download()'s misbehavior path). Used by tryRedial to
+// avoid the legacy "banned-but-still-redialed" loop.
+func (w *peerWatch) isBanned(id p2p.ID) bool {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	return w.externallyBanned[id]
 }
 
 // markUseful records that the named peer offered something inside
@@ -680,17 +731,34 @@ func (w *peerWatch) markUseful(peerID p2p.ID) {
 }
 
 // banPeer is the one-stop shop for "this peer is useless; evict it":
-// disconnect + addrbook-ban. Used by both the periodic churn tick
-// and download()'s misbehavior path.
+// disconnect + addrbook-ban + signal download() so its tryRedial
+// stops dialing this peer for the rest of the run.
 func (w *peerWatch) banPeer(peer p2p.Peer, reason string) {
 	addr := peer.SocketAddr()
 	w.log.Debug("evicting peer", "peer", string(peer.ID()), "reason", reason)
 	w.sw.StopPeerGracefully(peer)
 	if w.book != nil {
-		w.book.MarkBad(addr, time.Hour)
+		w.book.MarkBad(addr, w.banDuration)
 	}
 	w.mu.Lock()
 	delete(w.firstSeen, peer.ID())
+	w.externallyBanned[peer.ID()] = true
+	w.mu.Unlock()
+}
+
+// markBannedByID is the disconnected-peer counterpart to banPeer.
+// Used by download() when MaxRedials is hit — the peer isn't
+// currently connected so we can't StopPeerGracefully, but we still
+// want to addrbook-MarkBad and signal tryRedial to stop trying.
+func (w *peerWatch) markBannedByID(id p2p.ID, addr string, reason string) {
+	w.log.Debug("benching peer (no connection)", "peer", string(id), "reason", reason)
+	if w.book != nil && addr != "" {
+		if na, err := p2p.NewNetAddressString(addr); err == nil {
+			w.book.MarkBad(na, w.banDuration)
+		}
+	}
+	w.mu.Lock()
+	w.externallyBanned[id] = true
 	w.mu.Unlock()
 }
 
@@ -700,6 +768,13 @@ func (w *peerWatch) tick() {
 	}
 	now := time.Now()
 	for _, peer := range w.sw.Peers().List() {
+		// Channel filter: bans peers whose handshake NodeInfo doesn't
+		// advertise the snapshot channel (0x60). Catches relayers and
+		// blocksync-only nodes immediately rather than after grace.
+		if w.requireStateSyncChannel && !peer.NodeInfo().(p2p.DefaultNodeInfo).HasChannel(statesync.SnapshotChannel) {
+			w.banPeer(peer, "no state-sync channel")
+			continue
+		}
 		id := peer.ID()
 		w.mu.Lock()
 		if _, ok := w.firstSeen[id]; !ok {
@@ -1087,7 +1162,8 @@ func download(ctx context.Context, sw *p2p.Switch, ssR *statesync.Reactor,
 	evs chan statesync.Event, target *snapshotOffer, chunkHashes [][]byte,
 	good []p2p.ID, addrByNodeID map[string]string, snapDir string, seeds []peerSeed,
 	perPeer int, chunkTimeout time.Duration, peerFailLimit int,
-	redialBackoff, maxRedialBackoff time.Duration,
+	maxRedials int, redialBackoff, maxRedialBackoff time.Duration,
+	provisionalStrikes, provisionalInflight int,
 	warmTarget int, warmRefreshInterval time.Duration,
 	watch *peerWatch,
 	logger cmtlog.Logger) (uint64, error) {
@@ -1154,6 +1230,12 @@ func download(ctx context.Context, sw *p2p.Switch, ssR *statesync.Reactor,
 		if !ok || st.banned {
 			return
 		}
+		if watch != nil && watch.isBanned(pid) {
+			// peerWatch already evicted this peer (channel filter or
+			// churn-grace). Mirror the bench locally so we stop trying.
+			st.banned = true
+			return
+		}
 		if peer := sw.Peers().Get(pid); peer != nil {
 			return
 		}
@@ -1166,6 +1248,20 @@ func download(ctx context.Context, sw *p2p.Switch, ssR *statesync.Reactor,
 			// PEX rather than the seed list. Drop from stats so a future
 			// scanForNewPeers can re-add them if they reconnect.
 			delete(stats, pid)
+			return
+		}
+		// Cap consecutive disconnect/redial cycles. Note disconnects can
+		// also tick during an in-flight dial (the timeoutTicker fires
+		// tryRedial every 2s; the actual dial no-ops via
+		// ErrCurrentlyDialingOrExistingAddress) — fine for our purposes,
+		// it just makes the cap fire after fewer real dials than the bare
+		// surface math suggests, which is on the right side of "give up".
+		if maxRedials > 0 && st.disconnects >= maxRedials {
+			st.banned = true
+			if watch != nil {
+				watch.markBannedByID(pid, addr, "max-redials hit")
+			}
+			logger.Debug("benching peer (max redials)", "peer", string(pid), "disconnects", st.disconnects)
 			return
 		}
 		na, err := p2p.NewNetAddressString(addr)
@@ -1182,13 +1278,13 @@ func download(ctx context.Context, sw *p2p.Switch, ssR *statesync.Reactor,
 	}
 
 	// pickPeer prefers proven (non-provisional) peers up to perPeer
-	// inflight, then falls back to a single provisional probe slot per
-	// peer. This way a freshly-warm peer is never given more than one
-	// concurrent chunk until it has proven it can serve.
+	// inflight, then falls back to provisionalInflight slots per peer.
+	// This way a freshly-warm peer can't take more than its probe
+	// budget of concurrent chunks until it's proven it can serve.
 	pickPeer := func() p2p.ID {
 		var bestProven, bestProvis p2p.ID
 		bestProvenInflight := perPeer + 1
-		bestProvisInflight := 2 // provisional cap = 1; sentinel = 2
+		bestProvisInflight := provisionalInflight + 1
 		for pid, st := range stats {
 			if st.banned {
 				continue
@@ -1211,7 +1307,7 @@ func download(ctx context.Context, sw *p2p.Switch, ssR *statesync.Reactor,
 		if bestProvenInflight <= perPeer {
 			return bestProven
 		}
-		if bestProvisInflight <= 1 {
+		if bestProvisInflight <= provisionalInflight {
 			return bestProvis
 		}
 		return ""
@@ -1371,11 +1467,12 @@ func download(ctx context.Context, sw *p2p.Switch, ssR *statesync.Reactor,
 				continue
 			}
 
-			// Provisional peers single-strike: any failure on their
-			// probe bans them. Proven peers get peerFailLimit strikes.
+			// Provisional peers get a tighter strike budget on their
+			// probe than proven peers (configurable via
+			// ProvisionalProbeStrikes / PeerFailLimit).
 			banLimit := peerFailLimit
 			if st.provisional {
-				banLimit = 1
+				banLimit = provisionalStrikes
 			}
 
 			if ev.Chunk.Missing || len(ev.Chunk.Bytes) == 0 {

@@ -10,6 +10,7 @@
 package pex
 
 import (
+	"sync"
 	"time"
 
 	"github.com/cometbft/cometbft/libs/log"
@@ -36,6 +37,16 @@ type AutoConfig struct {
 	// BookBias passes to AddrBook.PickAddress: 0..100 percent bias
 	// toward "new" (untried) addresses. cometbft convention.
 	BookBias int
+
+	// MaxDialFailures caps consecutive dial failures against an
+	// addrbook entry before it's RemoveAddress'd from the addrbook
+	// entirely. PEX gossip will re-add it if the peer comes back.
+	// 0 disables (the address keeps cycling through MarkBad TTLs).
+	MaxDialFailures int
+
+	// FailureBanDuration is the TTL passed to book.MarkBad on each
+	// pre-threshold dial failure.
+	FailureBanDuration time.Duration
 }
 
 func (c *AutoConfig) defaults() {
@@ -51,6 +62,9 @@ func (c *AutoConfig) defaults() {
 	if c.BookBias == 0 {
 		c.BookBias = 50
 	}
+	if c.FailureBanDuration == 0 {
+		c.FailureBanDuration = 5 * time.Minute
+	}
 }
 
 type AutoReactor struct {
@@ -60,6 +74,12 @@ type AutoReactor struct {
 	log  log.Logger
 
 	dialCh chan struct{}
+
+	// Per-address consecutive dial-failure counter. Reset on connect.
+	// Once it hits MaxDialFailures we RemoveAddress(addr) so the
+	// addrbook stops accumulating dead entries.
+	failMu sync.Mutex
+	fails  map[string]int // key: NetAddress.String()
 }
 
 // NewAutoReactor returns a PEX reactor wired to a cometbft AddrBook.
@@ -72,6 +92,7 @@ func NewAutoReactor(book pexcb.AddrBook, cfg AutoConfig, logger log.Logger) *Aut
 		cfg:    cfg,
 		log:    logger,
 		dialCh: make(chan struct{}, 1),
+		fails:  map[string]int{},
 	}
 	r.BaseReactor = *p2p.NewBaseReactor("PEX-Auto", r)
 	r.BaseReactor.SetLogger(logger)
@@ -100,10 +121,14 @@ func (r *AutoReactor) OnStart() error {
 
 // AddPeer sends a PexRequest, marks the peer "good" in the addrbook
 // (the addrbook biases future PickAddress calls toward known-good
-// peers, both in this run and after .Save()), and signals the dial
-// loop in case our connected count drops below TargetPeers.
+// peers, both in this run and after .Save()), clears any pending
+// dial-failure count, and signals the dial loop in case our
+// connected count drops below TargetPeers.
 func (r *AutoReactor) AddPeer(peer p2p.Peer) {
 	r.book.MarkGood(peer.ID())
+	r.failMu.Lock()
+	delete(r.fails, peer.SocketAddr().String())
+	r.failMu.Unlock()
 	if !peer.Send(p2p.Envelope{ChannelID: Channel, Message: &tmp2p.PexRequest{}}) {
 		r.log.Debug("PEX: PexRequest send queue full", "peer", peer.ID())
 	}
@@ -199,11 +224,7 @@ func (r *AutoReactor) dialWave() {
 		fired++
 		go func(a *p2p.NetAddress) {
 			if err := sw.DialPeerWithAddress(a); err != nil {
-				r.log.Debug("PEX: dial failed", "addr", a, "err", err)
-				// Short ban so the addrbook stops re-picking this
-				// address during the current run; expires soon
-				// enough that a future run gets to retry fresh.
-				r.book.MarkBad(a, 5*time.Minute)
+				r.onDialFail(a, err)
 			}
 		}(addr)
 	}
@@ -214,4 +235,32 @@ func (r *AutoReactor) kick() {
 	case r.dialCh <- struct{}{}:
 	default:
 	}
+}
+
+// onDialFail bumps the per-address failure counter. Pre-threshold
+// failures get a soft MarkBad with FailureBanDuration TTL so the
+// addrbook stops re-picking the address during the current ban
+// window. Once the counter hits MaxDialFailures, the address is
+// RemoveAddress'd from the addrbook entirely — preventing the
+// on-disk file from accumulating dead entries across runs. PEX
+// gossip will re-add the address if the peer comes back online.
+func (r *AutoReactor) onDialFail(a *p2p.NetAddress, dialErr error) {
+	key := a.String()
+	r.failMu.Lock()
+	r.fails[key]++
+	count := r.fails[key]
+	r.failMu.Unlock()
+
+	r.log.Debug("PEX: dial failed", "addr", a, "err", dialErr, "consecutive_fails", count)
+
+	if r.cfg.MaxDialFailures > 0 && count >= r.cfg.MaxDialFailures {
+		r.book.RemoveAddress(a)
+		r.failMu.Lock()
+		delete(r.fails, key)
+		r.failMu.Unlock()
+		r.log.Debug("PEX: removed address from book (max dial failures)",
+			"addr", a, "fails", count)
+		return
+	}
+	r.book.MarkBad(a, r.cfg.FailureBanDuration)
 }

@@ -31,17 +31,34 @@ func applyFetchDefaults(t *FetchTuning) {
 		t.PerHeightTimeout = duration(10 * time.Second)
 	}
 	if t.MaxOutboundPeers == 0 {
-		t.MaxOutboundPeers = 64
+		t.MaxOutboundPeers = 128
 	}
 	if t.PEXTargetPeers == 0 {
-		t.PEXTargetPeers = 48
+		t.PEXTargetPeers = 96
 	}
 	if t.PEXMaxPerWave == 0 {
-		t.PEXMaxPerWave = 8
+		t.PEXMaxPerWave = 12
 	}
 	if t.ChurnGrace.Duration() == 0 {
-		t.ChurnGrace = duration(3 * time.Second)
+		t.ChurnGrace = duration(10 * time.Second)
 	}
+	if t.AddrBookBanDuration.Duration() == 0 {
+		t.AddrBookBanDuration = duration(time.Hour)
+	}
+	if t.ProvisionalProbeStrikes == 0 {
+		t.ProvisionalProbeStrikes = 1
+	}
+	if t.ProvisionalProbeInflight == 0 {
+		t.ProvisionalProbeInflight = 1
+	}
+	if t.MaxDialFailures == 0 {
+		t.MaxDialFailures = 3
+	}
+	// RequireStateSyncChannel is a bool — the zero value (false) is a
+	// valid user-set value, so we don't override here. The template
+	// sets it true; a config that omits the key gets the Go default
+	// (false), which preserves the legacy "no AddPeer channel filter"
+	// behaviour.
 	if t.Discover.Duration() == 0 {
 		t.Discover = duration(25 * time.Second)
 	}
@@ -70,7 +87,7 @@ func applyFetchDefaults(t *FetchTuning) {
 		t.PeerFails = 3
 	}
 	if t.PeerRedials == 0 {
-		t.PeerRedials = 3
+		t.PeerRedials = 5
 	}
 	if t.RedialBackoff.Duration() == 0 {
 		t.RedialBackoff = duration(5 * time.Second)
