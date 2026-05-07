@@ -20,15 +20,16 @@ import (
 	tmp2p "github.com/cometbft/cometbft/proto/tendermint/p2p"
 )
 
-// DeadPeers is the optional persistent dead-peer set. When non-nil:
+// Banlist is the optional persistent banlist of peer addresses. When
+// non-nil:
 //   - PEX-gossiped addresses matching Has() are dropped before
-//     book.AddAddress so re-gossip can't resurrect a known-dead peer.
+//     book.AddAddress so re-gossip can't resurrect a banned peer.
 //   - Addresses that hit MaxDialFailures are recorded via Add() so the
 //     verdict survives across process restarts.
 //
-// Implemented by *internal/peers/dead.Set; defined as an interface here
-// to keep the pex package free of a hard dependency on it.
-type DeadPeers interface {
+// Implemented by *internal/helpers/banlist.Set; defined as an interface
+// here to keep the pex package free of a hard dependency on it.
+type Banlist interface {
 	Has(addr string) bool
 	Add(addr, reason string)
 }
@@ -53,7 +54,7 @@ type AutoConfig struct {
 
 	// MaxDialFailures caps consecutive dial failures against an
 	// addrbook entry before it's RemoveAddress'd from the addrbook
-	// entirely. When DeadPeers is set, the address is also recorded
+	// entirely. When Banlist is set, the address is also recorded
 	// there so PEX gossip can't reintroduce it on the next run.
 	// 0 disables (the address keeps cycling through MarkBad TTLs).
 	MaxDialFailures int
@@ -62,9 +63,9 @@ type AutoConfig struct {
 	// pre-threshold dial failure.
 	FailureBanDuration time.Duration
 
-	// DeadPeers is the optional cross-run dead-peer tombstone set. nil
-	// disables both gossip filtering and persistent recording.
-	DeadPeers DeadPeers
+	// Banlist is the optional cross-run banlist. nil disables both
+	// gossip filtering and persistent recording.
+	Banlist Banlist
 }
 
 func (c *AutoConfig) defaults() {
@@ -95,7 +96,7 @@ type AutoReactor struct {
 
 	// Per-address consecutive dial-failure counter. Reset on connect.
 	// Once it hits MaxDialFailures we RemoveAddress(addr) so the
-	// addrbook stops accumulating dead entries.
+	// addrbook stops accumulating unreachable entries.
 	failMu sync.Mutex
 	fails  map[string]int // key: NetAddress.String()
 }
@@ -179,13 +180,13 @@ func (r *AutoReactor) handleAddrs(src p2p.Peer, raw []tmp2p.NetAddress) {
 	}
 	srcAddr := src.SocketAddr()
 	added := 0
-	skippedDead := 0
+	skippedBanned := 0
 	for _, a := range addrs {
 		if a == nil || !a.HasID() {
 			continue
 		}
-		if r.cfg.DeadPeers != nil && r.cfg.DeadPeers.Has(a.String()) {
-			skippedDead++
+		if r.cfg.Banlist != nil && r.cfg.Banlist.Has(a.String()) {
+			skippedBanned++
 			continue
 		}
 		if err := r.book.AddAddress(a, srcAddr); err != nil {
@@ -194,9 +195,9 @@ func (r *AutoReactor) handleAddrs(src p2p.Peer, raw []tmp2p.NetAddress) {
 		}
 		added++
 	}
-	if added > 0 || skippedDead > 0 {
+	if added > 0 || skippedBanned > 0 {
 		r.log.Debug("PEX: gossip processed",
-			"from", src.ID(), "added", added, "skipped_dead", skippedDead, "book_size", r.book.Size())
+			"from", src.ID(), "added", added, "skipped_banned", skippedBanned, "book_size", r.book.Size())
 	}
 	if added > 0 {
 		r.kick()
@@ -267,7 +268,7 @@ func (r *AutoReactor) kick() {
 // addrbook stops re-picking the address during the current ban
 // window. Once the counter hits MaxDialFailures, the address is
 // RemoveAddress'd from the addrbook entirely — preventing the
-// on-disk file from accumulating dead entries across runs. PEX
+// on-disk file from accumulating unreachable entries across runs. PEX
 // gossip will re-add the address if the peer comes back online.
 func (r *AutoReactor) onDialFail(a *p2p.NetAddress, dialErr error) {
 	key := a.String()
@@ -280,8 +281,8 @@ func (r *AutoReactor) onDialFail(a *p2p.NetAddress, dialErr error) {
 
 	if r.cfg.MaxDialFailures > 0 && count >= r.cfg.MaxDialFailures {
 		r.book.RemoveAddress(a)
-		if r.cfg.DeadPeers != nil {
-			r.cfg.DeadPeers.Add(key, "max-dial-failures")
+		if r.cfg.Banlist != nil {
+			r.cfg.Banlist.Add(key, "max-dial-failures")
 		}
 		r.failMu.Lock()
 		delete(r.fails, key)

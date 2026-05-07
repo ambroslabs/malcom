@@ -139,10 +139,10 @@ func ChainTemplate(chainID string, info *registry.ChainInfo, genesisPath string)
 	fmt.Fprintln(&b, "# Optional path overrides. Blank = XDG-derived:")
 	fmt.Fprintln(&b, "#   node_key  → $XDG_STATE_HOME/malcom/<chain>/node_key.json")
 	fmt.Fprintln(&b, "#   addrbook  → $XDG_STATE_HOME/malcom/<chain>/addrbook.json")
-	fmt.Fprintln(&b, "#   deadpeers → $XDG_STATE_HOME/malcom/<chain>/deadpeers.json")
+	fmt.Fprintln(&b, "#   banlist   → $XDG_STATE_HOME/malcom/<chain>/banlist.json")
 	fmt.Fprintln(&b, "# node_key = \"\"")
 	fmt.Fprintln(&b, "# addrbook = \"\"")
-	fmt.Fprintln(&b, "# deadpeers = \"\"")
+	fmt.Fprintln(&b, "# banlist = \"\"")
 	fmt.Fprintln(&b)
 
 	// bootstrap_peers populated from chain-registry's seeds + persistent_peers.

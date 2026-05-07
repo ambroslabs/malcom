@@ -1,19 +1,21 @@
-// Package dead maintains a persistent set of peer addresses that have
-// been verified unreachable and should not be redialed across restarts.
+// Package banlist maintains a persistent set of peer addresses that
+// have been verified unreachable and should not be redialed across
+// restarts.
 //
-// The set complements cometbft's addrbook, which has no cross-run memory
-// of dead peers — addrbook.json only persists peers in addrLookup, and
-// MarkBad'd / RemoveAddress'd entries vanish on save. So when PEX
-// re-gossips a permanently-dead address, a fresh process re-learns it's
-// dead from scratch.
+// The set complements cometbft's addrbook, which has no cross-run
+// memory of banned peers — addrbook.json only persists peers in
+// addrLookup, and MarkBad'd / RemoveAddress'd entries vanish on save.
+// So when PEX re-gossips a permanently-unreachable address, a fresh
+// process re-learns it's bad from scratch. This package mimics the in-memory
+// ban behavior cometbft has at runtime, but persistently across runs.
 //
 // Entries are keyed by NetAddress.String() (id@ip:port). A peer that
 // changes IP gets a fresh chance, since the (id, ip:port) tuple no
-// longer matches. Entries auto-prune on Load if older than MaxAge so a
+// longer matches. Entries auto-prune on load if older than MaxAge so a
 // long-offline peer occasionally gets retried in case its operator
 // brought it back. The set is also capped at Cap entries; the oldest
 // (by LastSeenAt) are evicted when over.
-package dead
+package banlist
 
 import (
 	"encoding/json"
@@ -30,10 +32,10 @@ const (
 	DefaultMaxAge = 30 * 24 * time.Hour
 )
 
-// Entry is the on-disk record for one dead peer address.
+// Entry is the on-disk record for one banned peer address.
 type Entry struct {
 	Addr        string    `json:"addr"`
-	FirstDeadAt time.Time `json:"first_dead_at"`
+	FirstSeenAt time.Time `json:"first_seen_at"`
 	LastSeenAt  time.Time `json:"last_seen_at"`
 	Reason      string    `json:"reason"`
 	FailCount   int       `json:"fail_count"`
@@ -43,7 +45,7 @@ type fileShape struct {
 	Entries []Entry `json:"entries"`
 }
 
-// Set is a thread-safe, persistent set of dead-peer addresses. All
+// Set is a thread-safe, persistent banlist of peer addresses. All
 // methods are nil-safe so callers can pass a nil *Set to disable the
 // feature without conditional plumbing.
 type Set struct {
@@ -64,7 +66,7 @@ type Set struct {
 // parent dir on demand, so callers don't need to pre-create it.
 func New(path string) (*Set, error) {
 	if path == "" {
-		return nil, fmt.Errorf("dead-peers path is empty")
+		return nil, fmt.Errorf("banlist path is empty")
 	}
 	s := &Set{
 		path:    path,
@@ -90,11 +92,11 @@ func (s *Set) load() error {
 		if os.IsNotExist(err) {
 			return nil
 		}
-		return fmt.Errorf("read dead-peers file %s: %w", s.path, err)
+		return fmt.Errorf("read banlist file %s: %w", s.path, err)
 	}
 	var f fileShape
 	if err := json.Unmarshal(b, &f); err != nil {
-		return fmt.Errorf("parse dead-peers file %s: %w", s.path, err)
+		return fmt.Errorf("parse banlist file %s: %w", s.path, err)
 	}
 	cutoff := time.Now().Add(-s.maxAge)
 	for _, e := range f.Entries {
@@ -120,7 +122,7 @@ func (s *Set) Save() error {
 	defer s.mu.Unlock()
 
 	if err := os.MkdirAll(filepath.Dir(s.path), 0o755); err != nil {
-		return fmt.Errorf("mkdir dead-peers dir: %w", err)
+		return fmt.Errorf("mkdir banlist dir: %w", err)
 	}
 	entries := make([]Entry, 0, len(s.entries))
 	for _, e := range s.entries {
@@ -131,14 +133,14 @@ func (s *Set) Save() error {
 	})
 	b, err := json.MarshalIndent(fileShape{Entries: entries}, "", "\t")
 	if err != nil {
-		return fmt.Errorf("marshal dead-peers: %w", err)
+		return fmt.Errorf("marshal banlist: %w", err)
 	}
 	tmp := s.path + ".tmp"
 	if err := os.WriteFile(tmp, b, 0o644); err != nil {
-		return fmt.Errorf("write dead-peers tmp: %w", err)
+		return fmt.Errorf("write banlist tmp: %w", err)
 	}
 	if err := os.Rename(tmp, s.path); err != nil {
-		return fmt.Errorf("rename dead-peers tmp: %w", err)
+		return fmt.Errorf("rename banlist tmp: %w", err)
 	}
 	return nil
 }
@@ -154,9 +156,9 @@ func (s *Set) Has(addr string) bool {
 	return ok
 }
 
-// Add records addr as dead. New entries get FirstDeadAt = now; existing
-// entries bump FailCount. LastSeenAt is always set to now and Reason is
-// updated when non-empty.
+// Add records addr as banned. New entries get FirstSeenAt = now;
+// existing entries bump FailCount. LastSeenAt is always set to now
+// and Reason is updated when non-empty.
 func (s *Set) Add(addr, reason string) {
 	if s == nil || addr == "" {
 		return
@@ -167,7 +169,7 @@ func (s *Set) Add(addr, reason string) {
 	now := time.Now()
 	e, ok := s.entries[addr]
 	if !ok {
-		e = Entry{Addr: addr, FirstDeadAt: now}
+		e = Entry{Addr: addr, FirstSeenAt: now}
 	}
 	e.LastSeenAt = now
 	e.FailCount++
