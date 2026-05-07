@@ -56,35 +56,16 @@ func walkBackward(
 	}
 
 	// Single subscription drives both offer collection and chunk-0
-	// reception. New SnapshotsResponse events update the offers map;
+	// reception. New SnapshotsResponse events update the offerSet;
 	// new ChunkResponse events at the current target trigger acceptance.
 	// (`evs` was subscribed earlier, before the dial wave.)
-	offers := map[string]*snapshotOffer{}
-	offerByHeight := map[uint64][]string{}
-
+	//
 	// Churn lives in peerWatch (started by RunFetch). We just collect
 	// offers here; peerWatch sees them via its own subscription.
-
-	addOffer := func(s *statesync.Snapshot, peerID string) {
-		k := snapKey(s)
-		rec, ok := offers[k]
-		if !ok {
-			rec = &snapshotOffer{
-				Height:   s.Height,
-				Format:   s.Format,
-				Chunks:   s.Chunks,
-				Hash:     s.Hash,
-				Metadata: s.Metadata,
-				Peers:    map[string]bool{},
-			}
-			offers[k] = rec
-			offerByHeight[s.Height] = append(offerByHeight[s.Height], k)
-		}
-		rec.Peers[peerID] = true
-	}
+	offers := newOfferSet()
 
 	// Drain any events that arrived during the seed-dial wave into
-	// the offers map BEFORE we start the 3s warmup. Otherwise the
+	// the offerSet BEFORE we start the 3s warmup. Otherwise the
 	// warmup `time.After` blocks the receive loop and offers
 	// accumulate in the channel buffer.
 	drainEvents := func() {
@@ -92,7 +73,7 @@ func walkBackward(
 			select {
 			case ev := <-evs:
 				if ev.Snapshot != nil {
-					addOffer(ev.Snapshot, ev.PeerID)
+					offers.add(ev.Snapshot, ev.PeerID)
 				}
 			default:
 				return
@@ -115,7 +96,7 @@ func walkBackward(
 			goto walkLoop
 		case ev := <-evs:
 			if ev.Snapshot != nil {
-				addOffer(ev.Snapshot, ev.PeerID)
+				offers.add(ev.Snapshot, ev.PeerID)
 			}
 		}
 	}
@@ -133,10 +114,9 @@ walkLoop:
 
 	dispatch := func(target uint64) int {
 		n := 0
-		for _, k := range offerByHeight[target] {
-			offer := offers[k]
-			for pid := range offer.Peers {
-				ak := askKey(pid, k)
+		for _, e := range offers.at(target) {
+			for pid := range e.Offer.Peers {
+				ak := askKey(pid, e.Key)
 				if asked[ak] {
 					continue
 				}
@@ -144,7 +124,7 @@ walkLoop:
 				if peer == nil {
 					continue
 				}
-				if ssR.RequestChunk(peer, offer.Height, offer.Format, 0) {
+				if ssR.RequestChunk(peer, e.Offer.Height, e.Offer.Format, 0) {
 					asked[ak] = true
 					n++
 				}
@@ -170,7 +150,7 @@ walkLoop:
 			"asking_peers", initialAsks,
 			"connected", out,
 			"dialing", dialing,
-			"book_size", offerCount(offers))
+			"book_size", offers.count())
 
 		deadline := time.NewTimer(cfg.PerHeightTimeout)
 		var accepted *snapshotOffer
@@ -190,7 +170,7 @@ walkLoop:
 					return nil, nil, fmt.Errorf("event channel closed")
 				}
 				if ev.Snapshot != nil {
-					addOffer(ev.Snapshot, ev.PeerID)
+					offers.add(ev.Snapshot, ev.PeerID)
 					// Jump-up: a new offer arrived for a height
 					// fresher than our current target. Abort this
 					// iteration; the queue gets the new height
@@ -226,10 +206,9 @@ walkLoop:
 					continue
 				}
 				// Find the offer whose (height, format) matches.
-				for _, k := range offerByHeight[target] {
-					o := offers[k]
-					if o.Format == ev.Chunk.Format {
-						accepted = o
+				for _, e := range offers.at(target) {
+					if e.Offer.Format == ev.Chunk.Format {
+						accepted = e.Offer
 						responder = p2p.ID(ev.PeerID)
 						deadline.Stop()
 						break heightLoop
@@ -276,10 +255,6 @@ walkLoop:
 	return nil, nil, fmt.Errorf("no servable snapshot found in window [%d, %d]",
 		cfg.MinHeight, cfg.MaxHeight)
 }
-
-// offerCount returns the number of distinct snapshot offers we've
-// collected so far (sum across heights). Used for diagnostic logs.
-func offerCount(offers map[string]*snapshotOffer) int { return len(offers) }
 
 // walkTargets returns a descending list of heights from
 // floor(top, interval) down to >= minHeight, stepping by interval.
