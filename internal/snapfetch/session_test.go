@@ -1,7 +1,9 @@
 package snapfetch
 
 import (
+	"crypto/sha256"
 	"encoding/json"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -166,6 +168,73 @@ func TestPrepareSnapshotDirReusesMatchingMetadata(t *testing.T) {
 	}
 	if string(got) != string(mismatched.Metadata) {
 		t.Fatalf("metadata.bin content not updated on mismatch")
+	}
+}
+
+// TestVerifySnapshotHashOK confirms verifySnapshotHash accepts an
+// offer whose Hash matches sha256(concat(chunk bytes)) — the
+// cosmos-sdk wire-level construction for cosmoshub-4 format 3.
+func TestVerifySnapshotHashOK(t *testing.T) {
+	dir := t.TempDir()
+	chunks := [][]byte{
+		[]byte("chunk-zero"),
+		[]byte("chunk-one-payload"),
+		[]byte("chunk-two-much-larger-payload-for-variety"),
+	}
+	h := sha256.New()
+	for i, c := range chunks {
+		path := filepath.Join(dir, fmt.Sprintf("chunk_%05d.bin", i))
+		if err := os.WriteFile(path, c, 0o644); err != nil {
+			t.Fatalf("write chunk %d: %v", i, err)
+		}
+		h.Write(c)
+	}
+	offer := &snapshotOffer{Chunks: uint32(len(chunks)), Hash: h.Sum(nil)}
+	if err := verifySnapshotHash(dir, offer); err != nil {
+		t.Fatalf("verifySnapshotHash: %v", err)
+	}
+}
+
+// TestVerifySnapshotHashMismatch confirms a bogus Hash is rejected.
+// Models the attacker who serves chunks consistent with a forged
+// metadata while advertising the legitimate Hash (or vice versa).
+func TestVerifySnapshotHashMismatch(t *testing.T) {
+	dir := t.TempDir()
+	chunks := [][]byte{[]byte("a"), []byte("b")}
+	for i, c := range chunks {
+		path := filepath.Join(dir, fmt.Sprintf("chunk_%05d.bin", i))
+		if err := os.WriteFile(path, c, 0o644); err != nil {
+			t.Fatalf("write chunk %d: %v", i, err)
+		}
+	}
+	offer := &snapshotOffer{
+		Chunks: uint32(len(chunks)),
+		Hash:   make([]byte, sha256.Size),
+	}
+	err := verifySnapshotHash(dir, offer)
+	if err == nil {
+		t.Fatalf("verifySnapshotHash accepted mismatched hash")
+	}
+	if !strings.Contains(err.Error(), "snapshot hash mismatch") {
+		t.Fatalf("err=%v, want snapshot hash mismatch", err)
+	}
+}
+
+// TestVerifySnapshotHashMissingChunk confirms a missing chunk surfaces
+// as an error rather than silently passing.
+func TestVerifySnapshotHashMissingChunk(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, "chunk_00000.bin"), []byte("x"), 0o644); err != nil {
+		t.Fatalf("write chunk 0: %v", err)
+	}
+	// Claim 2 chunks; only chunk 0 exists on disk.
+	offer := &snapshotOffer{Chunks: 2, Hash: make([]byte, sha256.Size)}
+	err := verifySnapshotHash(dir, offer)
+	if err == nil {
+		t.Fatalf("verifySnapshotHash accepted missing chunk")
+	}
+	if !strings.Contains(err.Error(), "open chunk 1") {
+		t.Fatalf("err=%v, want open chunk 1", err)
 	}
 }
 

@@ -51,6 +51,10 @@ func RunFetch(ctx context.Context, c Config, outRoot string) error {
 		return fmt.Errorf("download failed: %w", err)
 	}
 
+	if err := verifySnapshotHash(snapDir, offer); err != nil {
+		return fmt.Errorf("snapshot hash verify: %w", err)
+	}
+
 	return s.writeMeta(snapDir, offer, good, bytesTotal)
 }
 

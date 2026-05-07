@@ -197,6 +197,9 @@ func Run(args []string) int {
 		fmt.Fprintf(os.Stderr, "snapfetch: %v\n", err)
 		return 1
 	}
+	fmt.Fprintln(os.Stderr,
+		"WARNING: snapshot contents are not authenticated by p2p. "+
+			"Run `malcom verify` against a trusted RPC before using this snapshot in production.")
 	return 0
 }
 
