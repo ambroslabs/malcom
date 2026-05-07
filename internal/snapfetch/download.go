@@ -1,6 +1,7 @@
 package snapfetch
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
@@ -337,7 +338,7 @@ func download(ctx context.Context, sw *p2p.Switch, ssR *statesync.Reactor,
 			}
 
 			h := sha256.Sum256(ev.Chunk.Bytes)
-			if !bytesEq(h[:], chunkHashes[idx]) {
+			if !bytes.Equal(h[:], chunkHashes[idx]) {
 				log.Error("chunk hash mismatch",
 					"peer", string(peer), "idx", idx,
 					"got_sha", hex.EncodeToString(h[:8]),
