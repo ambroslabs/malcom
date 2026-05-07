@@ -20,6 +20,19 @@ import (
 	tmp2p "github.com/cometbft/cometbft/proto/tendermint/p2p"
 )
 
+// DeadPeers is the optional persistent dead-peer set. When non-nil:
+//   - PEX-gossiped addresses matching Has() are dropped before
+//     book.AddAddress so re-gossip can't resurrect a known-dead peer.
+//   - Addresses that hit MaxDialFailures are recorded via Add() so the
+//     verdict survives across process restarts.
+//
+// Implemented by *internal/peers/dead.Set; defined as an interface here
+// to keep the pex package free of a hard dependency on it.
+type DeadPeers interface {
+	Has(addr string) bool
+	Add(addr, reason string)
+}
+
 // AutoConfig tunes the dial loop. Zero values get sensible defaults.
 type AutoConfig struct {
 	// TargetPeers is the connected-outbound count we aim for. The dial
@@ -40,13 +53,18 @@ type AutoConfig struct {
 
 	// MaxDialFailures caps consecutive dial failures against an
 	// addrbook entry before it's RemoveAddress'd from the addrbook
-	// entirely. PEX gossip will re-add it if the peer comes back.
+	// entirely. When DeadPeers is set, the address is also recorded
+	// there so PEX gossip can't reintroduce it on the next run.
 	// 0 disables (the address keeps cycling through MarkBad TTLs).
 	MaxDialFailures int
 
 	// FailureBanDuration is the TTL passed to book.MarkBad on each
 	// pre-threshold dial failure.
 	FailureBanDuration time.Duration
+
+	// DeadPeers is the optional cross-run dead-peer tombstone set. nil
+	// disables both gossip filtering and persistent recording.
+	DeadPeers DeadPeers
 }
 
 func (c *AutoConfig) defaults() {
@@ -161,8 +179,13 @@ func (r *AutoReactor) handleAddrs(src p2p.Peer, raw []tmp2p.NetAddress) {
 	}
 	srcAddr := src.SocketAddr()
 	added := 0
+	skippedDead := 0
 	for _, a := range addrs {
 		if a == nil || !a.HasID() {
+			continue
+		}
+		if r.cfg.DeadPeers != nil && r.cfg.DeadPeers.Has(a.String()) {
+			skippedDead++
 			continue
 		}
 		if err := r.book.AddAddress(a, srcAddr); err != nil {
@@ -171,9 +194,11 @@ func (r *AutoReactor) handleAddrs(src p2p.Peer, raw []tmp2p.NetAddress) {
 		}
 		added++
 	}
+	if added > 0 || skippedDead > 0 {
+		r.log.Debug("PEX: gossip processed",
+			"from", src.ID(), "added", added, "skipped_dead", skippedDead, "book_size", r.book.Size())
+	}
 	if added > 0 {
-		r.log.Debug("PEX: book grew",
-			"from", src.ID(), "added", added, "book_size", r.book.Size())
 		r.kick()
 	}
 }
@@ -255,6 +280,9 @@ func (r *AutoReactor) onDialFail(a *p2p.NetAddress, dialErr error) {
 
 	if r.cfg.MaxDialFailures > 0 && count >= r.cfg.MaxDialFailures {
 		r.book.RemoveAddress(a)
+		if r.cfg.DeadPeers != nil {
+			r.cfg.DeadPeers.Add(key, "max-dial-failures")
+		}
 		r.failMu.Lock()
 		delete(r.fails, key)
 		r.failMu.Unlock()

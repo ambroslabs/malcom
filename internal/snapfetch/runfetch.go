@@ -16,6 +16,7 @@ import (
 	pexcb "github.com/cometbft/cometbft/p2p/pex"
 	"github.com/cometbft/cometbft/version"
 
+	"github.com/zrbecker/cosmos-p2p/internal/peers/dead"
 	localpex "github.com/zrbecker/cosmos-p2p/internal/pex"
 	"github.com/zrbecker/cosmos-p2p/internal/statesync"
 )
@@ -43,6 +44,7 @@ func RunFetch(ctx context.Context, c Config, outRoot string) error {
 	}
 
 	seeds := loadAddrBookSeeds(c.AddrBook, logger)
+	addrbookCount := len(seeds)
 	for _, s := range strings.Split(c.BootstrapPeersCSV, ",") {
 		s = strings.TrimSpace(s)
 		if s != "" {
@@ -107,6 +109,20 @@ func RunFetch(ctx context.Context, c Config, outRoot string) error {
 	book := pexcb.NewAddrBook(bookPath, false /* routabilityStrict */)
 	book.SetLogger(logger.With("module", "addrbook"))
 
+	// Dead-peer set: persistent cross-run tombstone for addresses that
+	// repeatedly fail to dial. Lives next to addrbook.json. Without
+	// this, PEX gossip would re-introduce known-dead peers on every
+	// run, costing a fresh MaxDialFailures cycle per stale gossip.
+	deadPath := filepath.Join(filepath.Dir(bookPath), "deadpeers.json")
+	deadSet := dead.New(deadPath)
+	if err := deadSet.Load(); err != nil {
+		logger.With("module", "snapfetch").Error("load dead-peers failed", "path", deadPath, "err", err)
+	}
+	logger.With("module", "snapfetch").Info("addrbook loaded",
+		"path", bookPath, "size", addrbookCount)
+	logger.With("module", "snapfetch").Info("dead-peers loaded",
+		"path", deadPath, "size", deadSet.Len())
+
 	// PEX reactor: sends PexRequest on every AddPeer, writes received
 	// PexAddrs to the book, and runs a dial loop that grows the
 	// connected-peer set toward TargetPeers in parallel waves. ~30×
@@ -119,6 +135,7 @@ func RunFetch(ctx context.Context, c Config, outRoot string) error {
 		BookBias:           50,
 		MaxDialFailures:    c.MaxDialFailures,
 		FailureBanDuration: 5 * time.Minute,
+		DeadPeers:          deadSet,
 	}, logger.With("module", "pex"))
 
 	sw := p2p.NewSwitch(p2pConfig, transport)
@@ -135,9 +152,21 @@ func RunFetch(ctx context.Context, c Config, outRoot string) error {
 	}
 
 	// Seed the book with our bootstrap_peers (chain-registry entries).
-	// Source = peer's own address (it "told us about itself").
+	// Source = peer's own address (it "told us about itself"). Seeds
+	// loaded from a previous addrbook.json are filtered against the
+	// dead set; user-supplied bootstrap addrs are not (the user
+	// explicitly named them, so they get a fresh chance and any prior
+	// dead-set entry is cleared).
 	seeded := 0
+	skippedDead := 0
 	for _, s := range seeds {
+		if s.source == "addrbook" && deadSet.Has(s.addr) {
+			skippedDead++
+			continue
+		}
+		if s.source == "bootstrap" {
+			deadSet.Remove(s.addr)
+		}
 		na, err := p2p.NewNetAddressString(s.addr)
 		if err != nil {
 			continue
@@ -147,7 +176,7 @@ func RunFetch(ctx context.Context, c Config, outRoot string) error {
 		}
 	}
 	logger.With("module", "snapfetch").Info("addrbook ready",
-		"path", bookPath, "seeded", seeded)
+		"path", bookPath, "seeded", seeded, "skipped_dead", skippedDead)
 
 	if err := sw.Start(); err != nil {
 		return fmt.Errorf("switch.Start: %w", err)
@@ -163,6 +192,15 @@ func RunFetch(ctx context.Context, c Config, outRoot string) error {
 		_ = sw.Stop()
 	}()
 	defer book.Save()
+	defer func() {
+		if err := deadSet.Save(); err != nil {
+			logger.With("module", "snapfetch").Error("save dead-peers failed",
+				"path", deadPath, "err", err)
+			return
+		}
+		logger.With("module", "snapfetch").Info("dead-peers saved",
+			"path", deadPath, "size", deadSet.Len())
+	}()
 
 	flog := logger.With("module", "snapfetch")
 	mux := newEventMux(ctx, ssR.Out)
