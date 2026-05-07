@@ -274,7 +274,7 @@ func (s *fetchSession) prepareSnapshotDir(outRoot string, offer *snapshotOffer) 
 	if err := os.MkdirAll(snapDir, 0o755); err != nil {
 		return "", nil, fmt.Errorf("mkdir snapshot dir: %w", err)
 	}
-	if err := os.WriteFile(filepath.Join(snapDir, "metadata.bin"), offer.Metadata, 0o644); err != nil {
+	if err := writeFileAtomic(filepath.Join(snapDir, "metadata.bin"), offer.Metadata, 0o644); err != nil {
 		return "", nil, fmt.Errorf("write metadata.bin: %w", err)
 	}
 	return snapDir, chunkHashes, nil
@@ -317,11 +317,20 @@ func (s *fetchSession) writeMeta(snapDir string, offer *snapshotOffer, good []p2
 		BytesTotal:      bytesTotal,
 		BytesTotalHuman: humanBytes(bytesTotal),
 	}
-	if err := writeJSON(filepath.Join(snapDir, "meta.json"), meta); err != nil {
+	if err := writeJSONAtomic(filepath.Join(snapDir, "meta.json"), meta); err != nil {
 		return fmt.Errorf("write meta.json: %w", err)
 	}
-	if err := os.WriteFile(filepath.Join(snapDir, ".complete"), nil, 0o644); err != nil {
+	// Make every prior rename in snapDir (chunks, metadata.bin, meta.json)
+	// durable before .complete lands, so a crash can never leave the
+	// sentinel present alongside a torn predecessor.
+	if err := fsyncDir(snapDir); err != nil {
+		return fmt.Errorf("fsync snapshot dir: %w", err)
+	}
+	if err := writeFileAtomic(filepath.Join(snapDir, ".complete"), nil, 0o644); err != nil {
 		return fmt.Errorf("mark complete: %w", err)
+	}
+	if err := fsyncDir(snapDir); err != nil {
+		return fmt.Errorf("fsync snapshot dir after .complete: %w", err)
 	}
 	s.log.Info("snapshot saved", "dir", snapDir)
 	s.log.Info("download complete",

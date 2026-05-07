@@ -58,8 +58,11 @@ func InspectAndEnrich(dir string, logger cmtlog.Logger) error {
 	if err != nil {
 		return err
 	}
-	if err := os.WriteFile(mp, append(enriched, '\n'), 0o644); err != nil {
+	if err := writeFileAtomic(mp, append(enriched, '\n'), 0o644); err != nil {
 		return err
+	}
+	if err := fsyncDir(dir); err != nil {
+		return fmt.Errorf("fsync snapshot dir: %w", err)
 	}
 	if logger != nil {
 		logger.Info("inspect complete",

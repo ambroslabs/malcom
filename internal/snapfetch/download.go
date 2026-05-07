@@ -6,7 +6,6 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"fmt"
-	"os"
 	"path/filepath"
 	"sync/atomic"
 	"time"
@@ -414,9 +413,12 @@ func (s *chunkScheduler) onChunk(ev statesync.Event) {
 
 	// Write the verified chunk to disk. Errors are logged and ignored
 	// so a transient disk hiccup doesn't abort the whole fetch — if
-	// the file is missing later, the import step surfaces it.
+	// the file is missing later, the import step surfaces it. The
+	// write is atomic (tmp + fsync + rename) so a crash mid-write
+	// can't leave a half-written chunk_NNNNN.bin in the dir; the
+	// snapDir itself is fsynced once at finalize time in writeMeta.
 	chunkPath := filepath.Join(s.snapDir, fmt.Sprintf("chunk_%05d.bin", idx))
-	if err := os.WriteFile(chunkPath, ev.Chunk.Bytes, 0o644); err != nil {
+	if err := writeFileAtomic(chunkPath, ev.Chunk.Bytes, 0o644); err != nil {
 		s.log.Error("write chunk", "idx", idx, "err", err)
 	}
 	s.completed[idx] = true
