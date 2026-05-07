@@ -53,10 +53,19 @@ type Banlist interface {
 	Add(addr, reason string)
 }
 
+// managerSwitch is the subset of *p2p.Switch the Manager uses.
+// Defined as an interface so tests can supply a fake.
+type managerSwitch interface {
+	Peers() p2p.IPeerSet
+	NumPeers() (outbound, inbound, dialing int)
+	IsDialingOrExistingAddress(*p2p.NetAddress) bool
+	DialPeerWithAddress(*p2p.NetAddress) error
+}
+
 // Config holds Manager dependencies and tuning. All durations have
 // sensible defaults if zero.
 type Config struct {
-	Switch  *p2p.Switch
+	Switch  managerSwitch
 	Book    pexcb.AddrBook // PickAddress source + MarkBad target
 	Banlist Banlist        // optional cross-run record on MaxDialFailures
 	Pool    []addrbook.PeerAddr
@@ -295,7 +304,7 @@ func (m *Manager) tick() {
 
 // dialFromPool walks the shuffled static pool with a cursor, firing
 // up to `need` dials. Skips banned, pinned, and already-connected.
-func (m *Manager) dialFromPool(sw *p2p.Switch, need int) int {
+func (m *Manager) dialFromPool(sw managerSwitch, need int) int {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
@@ -328,7 +337,7 @@ func (m *Manager) dialFromPool(sw *p2p.Switch, need int) int {
 
 // dialFromBook draws up to `need` addresses from the cometbft addrbook
 // via PickAddress. Skips banned, pinned, and already-connected.
-func (m *Manager) dialFromBook(sw *p2p.Switch, need int) int {
+func (m *Manager) dialFromBook(sw managerSwitch, need int) int {
 	book := m.cfg.Book
 	fired := 0
 	// Cap iterations: PickAddress can return duplicates if the book

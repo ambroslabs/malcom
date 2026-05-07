@@ -91,11 +91,30 @@ type inflightEntry struct {
 //     with one in-flight slot; first verified chunk promotes them.
 //   - Misbehavior bans go through peerWatch.banPeer (disconnect +
 //     addrbook MarkBad) AND mgr.Ban (manager stops redialing).
+// schedulerSwitch is the subset of *p2p.Switch chunkScheduler needs.
+// Defined as an interface so tests can supply a fake.
+type schedulerSwitch interface {
+	Peers() p2p.IPeerSet
+	NumPeers() (outbound, inbound, dialing int)
+}
+
+// schedulerReactor is the subset of *statesync.Reactor chunkScheduler needs.
+type schedulerReactor interface {
+	RequestChunk(peer p2p.Peer, height uint64, format, index uint32) bool
+}
+
+// schedulerManager is the subset of *connect.Manager chunkScheduler needs.
+type schedulerManager interface {
+	Pin(pid p2p.ID, addr string)
+	Ban(pid p2p.ID, reason string)
+	IsBanned(pid p2p.ID) bool
+}
+
 type chunkScheduler struct {
 	// dependencies
-	sw    *p2p.Switch
-	ssR   *statesync.Reactor
-	mgr   *connect.Manager
+	sw    schedulerSwitch
+	ssR   schedulerReactor
+	mgr   schedulerManager
 	watch *peerWatch
 	log   cmtlog.Logger
 

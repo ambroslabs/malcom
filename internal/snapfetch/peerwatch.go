@@ -9,7 +9,6 @@ import (
 	"github.com/cometbft/cometbft/p2p"
 	pexcb "github.com/cometbft/cometbft/p2p/pex"
 
-	"github.com/zrbecker/cosmos-p2p/internal/connect"
 	"github.com/zrbecker/cosmos-p2p/internal/logctx"
 	"github.com/zrbecker/cosmos-p2p/internal/statesync"
 )
@@ -23,10 +22,23 @@ import (
 //
 // minHeight = 0 disables churning (peerWatch still subscribes; just
 // never drops anyone).
+
+// watchSwitch is the subset of *p2p.Switch peerWatch needs.
+// Defined as an interface so tests can supply a fake.
+type watchSwitch interface {
+	Peers() p2p.IPeerSet
+	StopPeerGracefully(p2p.Peer)
+}
+
+// watchManager is the subset of *connect.Manager peerWatch needs.
+type watchManager interface {
+	Ban(pid p2p.ID, reason string)
+}
+
 type peerWatch struct {
-	sw                      *p2p.Switch
+	sw                      watchSwitch
 	book                    pexcb.AddrBook
-	mgr                     *connect.Manager // notified on every eviction so it stops redialing
+	mgr                     watchManager // notified on every eviction so it stops redialing
 	minHeight               uint64
 	grace                   time.Duration
 	banDuration             time.Duration
@@ -45,7 +57,7 @@ type peerWatch struct {
 	banned map[p2p.ID]bool
 }
 
-func newPeerWatch(ctx context.Context, sw *p2p.Switch, book pexcb.AddrBook, mgr *connect.Manager, minHeight uint64, grace, banDuration time.Duration, requireStateSyncChannel bool) *peerWatch {
+func newPeerWatch(ctx context.Context, sw watchSwitch, book pexcb.AddrBook, mgr watchManager, minHeight uint64, grace, banDuration time.Duration, requireStateSyncChannel bool) *peerWatch {
 	return &peerWatch{
 		sw:                      sw,
 		book:                    book,
