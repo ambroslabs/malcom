@@ -198,7 +198,7 @@ func newFetchSession(ctx context.Context, c Config) (*fetchSession, func(), erro
 	watchCtx, watchCancel := context.WithCancel(ctx)
 	watch := newPeerWatch(watchCtx, sw, book, mgr,
 		c.MinHeight, c.ChurnGrace, c.AddrBookBanDuration, c.RequireStateSyncChannel)
-	go watch.run(watchCtx, mux.subscribe())
+	go watch.run(watchCtx, mux.subscribeCtrl())
 
 	s := &fetchSession{
 		cfg:       c,
