@@ -267,6 +267,30 @@ func TestPeerWatchMinHeightZeroDisablesChurning(t *testing.T) {
 	}
 }
 
+// If a Removed event was dropped (reactor.Out full), firstSeen would
+// leak forever. tick() must reconcile against sw.Peers() and clear
+// entries whose peer is gone.
+func TestPeerWatchTickReclaimsFirstSeenForGonePeers(t *testing.T) {
+	b := newPeerWatchScenario(t)
+	w := b.build(100, time.Hour, false) // long grace so eviction-by-grace can't fire
+
+	peer := newFakePeer("peer-A", "1.1.1.1", 26656)
+	b.sw.peerSet.Add(peer)
+	w.onConnect(peer.ID())
+
+	// Simulate a missed Removed event: peer leaves the set without
+	// onDisconnect being called.
+	b.sw.peerSet.Remove(peer.ID())
+
+	w.tick()
+
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	if _, ok := w.firstSeen[peer.ID()]; ok {
+		t.Fatalf("firstSeen still has entry for disconnected peer; tick didn't reconcile")
+	}
+}
+
 func TestPeerWatchIsBannedAfterEviction(t *testing.T) {
 	b := newPeerWatchScenario(t)
 	w := b.build(100, 0, false)

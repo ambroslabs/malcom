@@ -11,17 +11,18 @@ import (
 func TestEventMuxFanOutToAllSubscribers(t *testing.T) {
 	t.Parallel()
 
-	in := make(chan statesync.Event, 8)
-	mux := newEventMux(context.Background(), in)
+	inCtrl := make(chan statesync.Event, 8)
+	inChunk := make(chan statesync.Event, 8)
+	mux := newEventMux(context.Background(), inCtrl, inChunk)
 	defer mux.stop()
 
-	// Subscribe before sending: the channel send on `in` synchronizes
+	// Subscribe before sending: the channel send on `inCtrl` synchronizes
 	// with the mux loop's receive, so any subscribers registered before
 	// the send are guaranteed visible when the event is dispatched.
 	a := mux.subscribe()
 	b := mux.subscribe()
 
-	in <- statesync.Event{PeerID: "p1", Connected: true}
+	inCtrl <- statesync.Event{PeerID: "p1", Connected: true}
 
 	timeout := time.After(time.Second)
 	for _, sub := range []<-chan statesync.Event{a, b} {
@@ -36,11 +37,33 @@ func TestEventMuxFanOutToAllSubscribers(t *testing.T) {
 	}
 }
 
+func TestEventMuxFansOutChunkChannel(t *testing.T) {
+	t.Parallel()
+
+	inCtrl := make(chan statesync.Event, 4)
+	inChunk := make(chan statesync.Event, 4)
+	mux := newEventMux(context.Background(), inCtrl, inChunk)
+	defer mux.stop()
+
+	sub := mux.subscribe()
+	inChunk <- statesync.Event{PeerID: "p1", Chunk: &statesync.ChunkInfo{Index: 7}}
+
+	select {
+	case ev := <-sub:
+		if ev.Chunk == nil || ev.Chunk.Index != 7 {
+			t.Fatalf("subscriber got %+v, want chunk idx=7", ev)
+		}
+	case <-time.After(time.Second):
+		t.Fatalf("subscriber didn't receive chunk event within timeout")
+	}
+}
+
 func TestEventMuxDropsOnSlowSubscriber(t *testing.T) {
 	t.Parallel()
 
-	in := make(chan statesync.Event, 8)
-	mux := newEventMux(context.Background(), in)
+	inCtrl := make(chan statesync.Event, 8)
+	inChunk := make(chan statesync.Event, 8)
+	mux := newEventMux(context.Background(), inCtrl, inChunk)
 	defer mux.stop()
 
 	// Slow subscriber: never reads. Buffer is 256.
@@ -54,7 +77,7 @@ func TestEventMuxDropsOnSlowSubscriber(t *testing.T) {
 	const n = 300
 	go func() {
 		for i := 0; i < n; i++ {
-			in <- statesync.Event{PeerID: "p"}
+			inCtrl <- statesync.Event{PeerID: "p"}
 		}
 	}()
 
@@ -72,21 +95,67 @@ func TestEventMuxDropsOnSlowSubscriber(t *testing.T) {
 	}
 }
 
+// Chunk-channel pressure must not starve control events through the
+// mux. With chunks and control events on separate inputs the mux's
+// select sees both as eligible and round-robins; control events are
+// guaranteed to reach subscribers even while chunks back up.
+func TestEventMuxControlNotStarvedByChunks(t *testing.T) {
+	t.Parallel()
+
+	inCtrl := make(chan statesync.Event, 4)
+	inChunk := make(chan statesync.Event, 4)
+	mux := newEventMux(context.Background(), inCtrl, inChunk)
+	defer mux.stop()
+
+	sub := mux.subscribe()
+
+	// Stream chunks continuously to keep inChunk hot.
+	stop := make(chan struct{})
+	go func() {
+		for {
+			select {
+			case <-stop:
+				return
+			case inChunk <- statesync.Event{PeerID: "c", Chunk: &statesync.ChunkInfo{}}:
+			}
+		}
+	}()
+	defer close(stop)
+
+	inCtrl <- statesync.Event{PeerID: "p", Connected: true}
+
+	deadline := time.After(time.Second)
+	for {
+		select {
+		case ev := <-sub:
+			if ev.Connected && ev.PeerID == "p" {
+				return
+			}
+		case <-deadline:
+			t.Fatalf("control event never delivered while chunk channel was hot")
+		}
+	}
+}
+
 func TestEventMuxStopHaltsDispatch(t *testing.T) {
 	t.Parallel()
 
-	in := make(chan statesync.Event, 4)
-	mux := newEventMux(context.Background(), in)
+	inCtrl := make(chan statesync.Event, 4)
+	inChunk := make(chan statesync.Event, 4)
+	mux := newEventMux(context.Background(), inCtrl, inChunk)
 	sub := mux.subscribe()
 
 	mux.stop()
 	// Idempotent: calling stop twice must be safe.
 	mux.stop()
+	// Give the mux goroutine a chance to observe ctx.Done() before we
+	// send on inCtrl. Without this, the goroutine's select may still
+	// see both ctx.Done() and inCtrl as eligible and randomly pick the
+	// receive, dispatching the event after stop.
+	time.Sleep(50 * time.Millisecond)
 
-	// After stop, events sent on `in` must not reach subscribers.
-	// We can't guarantee the goroutine has exited synchronously, so
-	// allow a brief window then assert no event arrived.
-	in <- statesync.Event{PeerID: "after-stop"}
+	// After stop, events sent on `inCtrl` must not reach subscribers.
+	inCtrl <- statesync.Event{PeerID: "after-stop"}
 	select {
 	case ev := <-sub:
 		t.Fatalf("subscriber received event after stop: %+v", ev)
@@ -98,13 +167,19 @@ func TestEventMuxParentContextCancelStops(t *testing.T) {
 	t.Parallel()
 
 	ctx, cancel := context.WithCancel(context.Background())
-	in := make(chan statesync.Event, 4)
-	mux := newEventMux(ctx, in)
+	inCtrl := make(chan statesync.Event, 4)
+	inChunk := make(chan statesync.Event, 4)
+	mux := newEventMux(ctx, inCtrl, inChunk)
 	sub := mux.subscribe()
 
 	cancel()
+	// Give the mux goroutine a chance to observe ctx.Done() before we
+	// send on inCtrl. Without this, the goroutine's select may still
+	// see both ctx.Done() and inCtrl as eligible and randomly pick the
+	// receive, dispatching the event after cancel.
+	time.Sleep(50 * time.Millisecond)
 
-	in <- statesync.Event{PeerID: "after-cancel"}
+	inCtrl <- statesync.Event{PeerID: "after-cancel"}
 	select {
 	case ev := <-sub:
 		t.Fatalf("subscriber received event after parent ctx cancel: %+v", ev)

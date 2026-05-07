@@ -66,25 +66,43 @@ type Event struct {
 // Reactor probes peers for snapshots. AddPeer fires a SnapshotsRequest;
 // inbound SnapshotsResponse is forwarded on Out. ChunkRequest can be
 // dispatched explicitly via RequestChunk.
+//
+// Out and OutChunks are deliberately separate channels. Chunk payloads
+// are up to chunkMsgSize (16 MiB); muxing them with cheap control
+// events on a single 256-capacity channel let a chunk burst push
+// Connected/Removed/Snapshot events out and pin gigabytes of payload
+// resident behind a slow consumer. Splitting bounds chunk-side memory
+// independently and guarantees control events never queue behind chunks.
 type Reactor struct {
 	p2p.BaseReactor
-	logger log.Logger
-	Out    chan Event
+	logger    log.Logger
+	Out       chan Event // Connected, Removed, Snapshot — small payloads
+	OutChunks chan Event // Chunk — up to 16 MiB each, smaller buffer
 
-	mu        sync.Mutex
-	bytesRecv int64
-	bytesSent int64
+	mu         sync.Mutex
+	bytesRecv  int64
+	bytesSent  int64
+	dropsCtrl  int64
+	dropsChunk int64
 
 	// AskOnAdd, when true, sends SnapshotsRequest to every peer on AddPeer.
 	// Defaults to true.
 	AskOnAdd bool
 }
 
+// outChunksCapacity bounds how many 16 MiB chunk payloads can sit
+// resident in the reactor's outgoing buffer. 8 → up to ~128 MiB worst
+// case. The mux loop drains both channels promptly, so this only
+// absorbs short bursts; bigger values mostly pay in latent memory
+// rather than throughput.
+const outChunksCapacity = 8
+
 func NewReactor(logger log.Logger) *Reactor {
 	r := &Reactor{
-		logger:   logger,
-		Out:      make(chan Event, 256),
-		AskOnAdd: true,
+		logger:    logger,
+		Out:       make(chan Event, 256),
+		OutChunks: make(chan Event, outChunksCapacity),
+		AskOnAdd:  true,
 	}
 	r.BaseReactor = *p2p.NewBaseReactor("statesync-probe", r)
 	r.BaseReactor.SetLogger(logger)
@@ -126,6 +144,9 @@ func (r *Reactor) AddPeer(peer p2p.Peer) {
 	select {
 	case r.Out <- Event{PeerID: peerID, Connected: true}:
 	default:
+		r.mu.Lock()
+		r.dropsCtrl++
+		r.mu.Unlock()
 		r.logger.Error("connect Out channel full; dropping", "peer", peerID)
 	}
 	if !r.AskOnAdd {
@@ -149,6 +170,9 @@ func (r *Reactor) RemovePeer(peer p2p.Peer, reason interface{}) {
 	select {
 	case r.Out <- Event{PeerID: peerID, Removed: true}:
 	default:
+		r.mu.Lock()
+		r.dropsCtrl++
+		r.mu.Unlock()
 		r.logger.Error("disconnect Out channel full; dropping", "peer", peerID)
 	}
 }
@@ -187,6 +211,9 @@ func (r *Reactor) Receive(env p2p.Envelope) {
 			},
 		}:
 		default:
+			r.mu.Lock()
+			r.dropsCtrl++
+			r.mu.Unlock()
 			r.logger.Error("snapshot Out channel full; dropping", "peer", peerID)
 		}
 
@@ -203,9 +230,12 @@ func (r *Reactor) Receive(env p2p.Envelope) {
 			copy(ci.Bytes, m.Chunk)
 		}
 		select {
-		case r.Out <- Event{PeerID: peerID, Chunk: ci}:
+		case r.OutChunks <- Event{PeerID: peerID, Chunk: ci}:
 		default:
-			r.logger.Error("chunk Out channel full; dropping", "peer", peerID)
+			r.mu.Lock()
+			r.dropsChunk++
+			r.mu.Unlock()
+			r.logger.Error("chunk OutChunks channel full; dropping", "peer", peerID)
 		}
 
 	case *ssproto.SnapshotsRequest, *ssproto.ChunkRequest:
@@ -223,4 +253,13 @@ func (r *Reactor) Bytes() (recv, sent int64) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	return r.bytesRecv, r.bytesSent
+}
+
+// Drops returns the number of events dropped because the relevant
+// outgoing channel was full at send time. ctrl covers Connected,
+// Removed, and Snapshot events; chunk covers ChunkResponse events.
+func (r *Reactor) Drops() (ctrl, chunk int64) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.dropsCtrl, r.dropsChunk
 }

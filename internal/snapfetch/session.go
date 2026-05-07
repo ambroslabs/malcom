@@ -188,7 +188,7 @@ func newFetchSession(ctx context.Context, c Config) (*fetchSession, func(), erro
 		return nil, nil, fmt.Errorf("switch.Start: %w", err)
 	}
 
-	mux := newEventMux(ctx, ssR.Out)
+	mux := newEventMux(ctx, ssR.Out, ssR.OutChunks)
 
 	// peerWatch: long-lived churn loop. Spans walk + download — drops
 	// peers that don't advertise anything in our freshness window, and

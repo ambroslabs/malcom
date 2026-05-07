@@ -270,7 +270,8 @@ func (s *chunkScheduler) peerCounts() (alive, connected int) {
 }
 
 // onTimeoutTick handles the 2s ticker: expire timed-out in-flight
-// chunks, mirror manager bans into stats, then redispatch.
+// chunks, mirror manager bans into stats, reconcile against the
+// current peer set, then redispatch.
 func (s *chunkScheduler) onTimeoutTick(now time.Time) {
 	for idx, info := range s.inflight {
 		if now.Sub(info.sent) <= s.chunkTimeout {
@@ -299,6 +300,12 @@ func (s *chunkScheduler) onTimeoutTick(now time.Time) {
 		if s.mgr != nil && s.mgr.IsBanned(pid) {
 			st.banned = true
 		}
+	}
+	// Reconcile: fold any currently-connected peers we haven't seen
+	// into stats as provisional. Recovers from a Connected event that
+	// never reached us (reactor.Out was full at AddPeer time).
+	for _, p := range s.sw.Peers().List() {
+		s.addProvisional(p)
 	}
 	s.dispatch()
 }

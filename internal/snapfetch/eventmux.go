@@ -7,38 +7,47 @@ import (
 	"github.com/zrbecker/cosmos-p2p/internal/statesync"
 )
 
-// statesync.Reactor has one Out channel; we want multiple consumers
-// across phases. eventMux fans out events to all current subscribers.
-// Subscribers drop events if their inbox is full.
+// statesync.Reactor publishes on two channels — Out (control + snapshot)
+// and OutChunks (16 MiB chunk payloads). eventMux selects across both
+// and fans out the merged stream to all current subscribers, so
+// downstream consumers stay on a single inbox. Per-subscriber inboxes
+// drop events when full.
 type eventMux struct {
-	in     <-chan statesync.Event
-	mu     sync.Mutex
-	subs   []chan<- statesync.Event
-	cancel context.CancelFunc
+	inCtrl  <-chan statesync.Event
+	inChunk <-chan statesync.Event
+	mu      sync.Mutex
+	subs    []chan<- statesync.Event
+	cancel  context.CancelFunc
 }
 
-func newEventMux(ctx context.Context, in <-chan statesync.Event) *eventMux {
+func newEventMux(ctx context.Context, inCtrl, inChunk <-chan statesync.Event) *eventMux {
 	ctx, cancel := context.WithCancel(ctx)
-	m := &eventMux{in: in, cancel: cancel}
+	m := &eventMux{inCtrl: inCtrl, inChunk: inChunk, cancel: cancel}
 	go func() {
 		for {
 			select {
 			case <-ctx.Done():
 				return
-			case ev := <-in:
-				m.mu.Lock()
-				subs := append([]chan<- statesync.Event(nil), m.subs...)
-				m.mu.Unlock()
-				for _, s := range subs {
-					select {
-					case s <- ev:
-					default:
-					}
-				}
+			case ev := <-inCtrl:
+				m.fanout(ev)
+			case ev := <-inChunk:
+				m.fanout(ev)
 			}
 		}
 	}()
 	return m
+}
+
+func (m *eventMux) fanout(ev statesync.Event) {
+	m.mu.Lock()
+	subs := append([]chan<- statesync.Event(nil), m.subs...)
+	m.mu.Unlock()
+	for _, s := range subs {
+		select {
+		case s <- ev:
+		default:
+		}
+	}
 }
 
 func (m *eventMux) subscribe() <-chan statesync.Event {

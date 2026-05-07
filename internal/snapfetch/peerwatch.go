@@ -155,6 +155,10 @@ func (w *peerWatch) onDisconnect(id p2p.ID) {
 // connected past their grace window without offering anything useful.
 // Channel-filter eviction is deferred from onConnect to here so peers
 // have ≥1 tick to send a PexAddrs reply before we disconnect them.
+//
+// Also reconciles firstSeen against the current peer set so a missed
+// Removed event (reactor.Out was full at RemovePeer time) doesn't
+// leak entries forever.
 func (w *peerWatch) tick() {
 	if w.minHeight == 0 {
 		return
@@ -167,6 +171,13 @@ func (w *peerWatch) tick() {
 	}
 	pending := make([]evict, 0)
 	for id, first := range w.firstSeen {
+		// Reconcile: peer is no longer connected. A Removed event we
+		// never saw would have cleared this; do it now so the map
+		// can't grow unbounded across a long run.
+		if w.sw.Peers().Get(id) == nil {
+			delete(w.firstSeen, id)
+			continue
+		}
 		if w.useful[id] {
 			continue
 		}
