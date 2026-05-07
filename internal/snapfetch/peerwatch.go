@@ -137,7 +137,7 @@ func (w *peerWatch) tick() {
 // run is the watcher's main loop. Subscribes to evs (the caller
 // supplies the mux subscription so subscriber lifecycle matches
 // peerWatch's). Returns when ctx is cancelled.
-func (w *peerWatch) run(ctx context.Context, evs chan statesync.Event) {
+func (w *peerWatch) run(ctx context.Context, evs <-chan statesync.Event) {
 	t := time.NewTicker(1 * time.Second)
 	defer t.Stop()
 	for {

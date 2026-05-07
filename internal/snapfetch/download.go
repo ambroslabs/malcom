@@ -45,7 +45,7 @@ type peerStat struct {
 //     verified chunk promotes them to a full-budget good peer; a hash
 //     mismatch single-strikes them out.
 func download(ctx context.Context, sw *p2p.Switch, ssR *statesync.Reactor,
-	evs chan statesync.Event, target *snapshotOffer, chunkHashes [][]byte,
+	evs <-chan statesync.Event, target *snapshotOffer, chunkHashes [][]byte,
 	good []p2p.ID, snapDir string, peerAddrs []addrbook.PeerAddr,
 	perPeer int, chunkTimeout time.Duration, peerFailLimit int,
 	maxRedials int, redialBackoff, maxRedialBackoff time.Duration,

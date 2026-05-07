@@ -11,24 +11,23 @@ import (
 // across phases. eventMux fans out events to all current subscribers.
 // Subscribers drop events if their inbox is full.
 type eventMux struct {
-	in    <-chan statesync.Event
-	mu    sync.Mutex
-	subs  []chan statesync.Event
-	close chan struct{}
+	in     <-chan statesync.Event
+	mu     sync.Mutex
+	subs   []chan<- statesync.Event
+	cancel context.CancelFunc
 }
 
 func newEventMux(ctx context.Context, in <-chan statesync.Event) *eventMux {
-	m := &eventMux{in: in, close: make(chan struct{})}
+	ctx, cancel := context.WithCancel(ctx)
+	m := &eventMux{in: in, cancel: cancel}
 	go func() {
 		for {
 			select {
 			case <-ctx.Done():
 				return
-			case <-m.close:
-				return
 			case ev := <-in:
 				m.mu.Lock()
-				subs := append([]chan statesync.Event(nil), m.subs...)
+				subs := append([]chan<- statesync.Event(nil), m.subs...)
 				m.mu.Unlock()
 				for _, s := range subs {
 					select {
@@ -42,7 +41,7 @@ func newEventMux(ctx context.Context, in <-chan statesync.Event) *eventMux {
 	return m
 }
 
-func (m *eventMux) subscribe() chan statesync.Event {
+func (m *eventMux) subscribe() <-chan statesync.Event {
 	c := make(chan statesync.Event, 256)
 	m.mu.Lock()
 	m.subs = append(m.subs, c)
@@ -50,4 +49,4 @@ func (m *eventMux) subscribe() chan statesync.Event {
 	return c
 }
 
-func (m *eventMux) stop() { close(m.close) }
+func (m *eventMux) stop() { m.cancel() }
