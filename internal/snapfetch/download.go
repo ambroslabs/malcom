@@ -7,25 +7,21 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
-	"strings"
 	"sync/atomic"
 	"time"
 
 	"github.com/cometbft/cometbft/p2p"
 
-	"github.com/zrbecker/cosmos-p2p/internal/helpers/addrbook"
+	"github.com/zrbecker/cosmos-p2p/internal/connect"
 	"github.com/zrbecker/cosmos-p2p/internal/logctx"
 	"github.com/zrbecker/cosmos-p2p/internal/statesync"
 )
 
 type peerStat struct {
-	inflight      int
-	failures      int  // missing=true or hash-mismatch responses (real misbehaviour)
-	disconnects   int  // socket-level drops (transient) — never used to ban directly
-	banned        bool // permanently benched (only set on PeerFailLimit failures)
-	provisional   bool // true until peer responds with first verified chunk; provisional peers get one in-flight slot and a single-strike ban budget
-	lastDialAt    time.Time
-	nextDialAfter time.Time // earliest time a redial may be attempted; computed via exponential backoff over disconnects
+	inflight    int
+	failures    int  // missing=true or hash-mismatch responses (real misbehaviour)
+	banned      bool // permanently benched (PeerFailLimit hit, or peerWatch eviction)
+	provisional bool // true until peer responds with first verified chunk; provisional peers get one in-flight slot and a single-strike ban budget
 }
 
 // download is the phase-3 chunk scheduler. It dispatches chunks across
@@ -34,43 +30,32 @@ type peerStat struct {
 // transferred (sum of verified chunk lengths).
 //
 // Resilience features:
-//   - Exponential-backoff redial (no ban-on-disconnect). Only
-//     hash-mismatch / missing-chunk strikes ban a peer; transient socket
-//     drops just defer the next dial attempt.
-//   - Background peer-pool refresher. While the connected peer count is
-//     below WarmPeerTarget, dials peer addrs in the background so
-//     newly-broken good peers can be replaced.
+//   - Pinned peers. Every peer entering stats is Pinned with the
+//     connect.Manager so the manager keeps redialing on disconnect
+//     (with exponential backoff) without download owning the dial code.
 //   - Provisional peer promotion. Connected non-good peers are added to
 //     stats with provisional=true and given one in-flight slot. The first
 //     verified chunk promotes them to a full-budget good peer; a hash
 //     mismatch single-strikes them out.
+//   - Misbehavior bans go through peerWatch.banPeer (disconnect +
+//     addrbook MarkBad) AND mgr.Ban (manager stops redialing).
 func download(ctx context.Context, sw *p2p.Switch, ssR *statesync.Reactor,
 	evs <-chan statesync.Event, target *snapshotOffer, chunkHashes [][]byte,
-	good []p2p.ID, snapDir string, peerAddrs []addrbook.PeerAddr,
+	good []p2p.ID, snapDir string,
 	perPeer int, chunkTimeout time.Duration, peerFailLimit int,
-	maxRedials int, redialBackoff, maxRedialBackoff time.Duration,
 	provisionalStrikes, provisionalInflight int,
-	warmTarget int, warmRefreshInterval time.Duration,
-	watch *peerWatch) (uint64, error) {
+	watch *peerWatch, mgr *connect.Manager) (uint64, error) {
 
 	log := logctx.From(ctx)
 
-	// Map peer node-ID → full dial address ("nodeID@host:port"). Used by
-	// tryRedial below to dial a peer we previously connected to but
-	// dropped — sw.Peers().Get returns nil once disconnected, so we
-	// can't recover the address from the Switch.
-	addrByNodeID := map[string]string{}
-	for _, p := range peerAddrs {
-		parts := strings.SplitN(p.Addr, "@", 2)
-		if len(parts) == 2 {
-			addrByNodeID[parts[0]] = p.Addr
-		}
-	}
-
 	// banAndDrop disconnects + addrbook-bans a misbehaving peer so
-	// PEX can dial a replacement (banned peers occupying connection
-	// slots was previously starving fresh dials at TargetPeers cap).
+	// PEX can dial a replacement, and tells the manager to stop
+	// redialing. peerWatch.banPeer handles the first two; mgr.Ban
+	// the third.
 	banAndDrop := func(pid p2p.ID, reason string) {
+		if mgr != nil {
+			mgr.Ban(pid, reason)
+		}
 		if watch == nil {
 			return
 		}
@@ -104,77 +89,6 @@ func download(ctx context.Context, sw *p2p.Switch, ssR *statesync.Reactor,
 	// exactly on a tick (10s gives 10, 20, 30, …). Non-multiples
 	// round up: 15s would fire at 16, 32, …
 	progressEvery := 10 * time.Second
-
-	// computeRedialDelay returns redialBackoff * 2^(disconnects-1), capped
-	// at maxRedialBackoff. With redialBackoff=5s and cap=5m, sequence is
-	// 5s, 10s, 20s, 40s, 80s, 160s, 300s, 300s, 300s, ... — keeps trying
-	// indefinitely so a peer that comes back online eventually rejoins.
-	computeRedialDelay := func(disconnects int) time.Duration {
-		if disconnects <= 1 {
-			return redialBackoff
-		}
-		shift := disconnects - 1
-		if shift > 10 {
-			shift = 10
-		}
-		d := redialBackoff << uint(shift)
-		if d <= 0 || d > maxRedialBackoff {
-			return maxRedialBackoff
-		}
-		return d
-	}
-
-	tryRedial := func(pid p2p.ID) {
-		st, ok := stats[pid]
-		if !ok || st.banned {
-			return
-		}
-		if watch != nil && watch.isBanned(pid) {
-			// peerWatch already evicted this peer (channel filter or
-			// churn-grace). Mirror the bench locally so we stop trying.
-			st.banned = true
-			return
-		}
-		if peer := sw.Peers().Get(pid); peer != nil {
-			return
-		}
-		if !st.nextDialAfter.IsZero() && time.Now().Before(st.nextDialAfter) {
-			return
-		}
-		addr, ok := addrByNodeID[string(pid)]
-		if !ok {
-			// Unknown address — only happens for peers that joined via
-			// PEX rather than the seed list. Drop from stats so a future
-			// scanForNewPeers can re-add them if they reconnect.
-			delete(stats, pid)
-			return
-		}
-		// Cap consecutive disconnect/redial cycles. Note disconnects can
-		// also tick during an in-flight dial (the timeoutTicker fires
-		// tryRedial every 2s; the actual dial no-ops via
-		// ErrCurrentlyDialingOrExistingAddress) — fine for our purposes,
-		// it just makes the cap fire after fewer real dials than the bare
-		// surface math suggests, which is on the right side of "give up".
-		if maxRedials > 0 && st.disconnects >= maxRedials {
-			st.banned = true
-			if watch != nil {
-				watch.markBannedByID(pid, addr, "max-redials hit")
-			}
-			log.Debug("benching peer (max redials)", "peer", string(pid), "disconnects", st.disconnects)
-			return
-		}
-		na, err := p2p.NewNetAddressString(addr)
-		if err != nil {
-			st.banned = true
-			return
-		}
-		st.disconnects++
-		st.lastDialAt = time.Now()
-		st.nextDialAfter = st.lastDialAt.Add(computeRedialDelay(st.disconnects))
-		go func(na *p2p.NetAddress) {
-			_ = sw.DialPeerWithAddress(na)
-		}(na)
-	}
 
 	// pickPeer prefers proven (non-provisional) peers up to perPeer
 	// inflight, then falls back to provisionalInflight slots per peer.
@@ -214,8 +128,9 @@ func download(ctx context.Context, sw *p2p.Switch, ssR *statesync.Reactor,
 
 	// scanForNewPeers walks sw.Peers() and registers any connected,
 	// not-yet-tracked peer in stats as provisional. This is how peers
-	// arriving via the keepWarm dialer (or PEX) get drawn into the
-	// scheduler without a heavyweight rescan.
+	// arriving via PEX (or the connect.Manager) get drawn into the
+	// scheduler without a heavyweight rescan. New peers are also
+	// Pinned with the manager so it redials them on disconnect.
 	scanForNewPeers := func() {
 		for _, p := range sw.Peers().List() {
 			pid := p.ID()
@@ -223,6 +138,9 @@ func download(ctx context.Context, sw *p2p.Switch, ssR *statesync.Reactor,
 				continue
 			}
 			stats[pid] = &peerStat{provisional: true}
+			if mgr != nil {
+				mgr.Pin(pid, p.SocketAddr().String())
+			}
 			log.Debug("provisional peer added", "peer", string(pid))
 		}
 	}
@@ -256,19 +174,21 @@ func download(ctx context.Context, sw *p2p.Switch, ssR *statesync.Reactor,
 		return dispatched
 	}
 
+	// Pin good peers up front so the manager redials them if any
+	// drop during the run.
+	if mgr != nil {
+		for _, pid := range good {
+			if peer := sw.Peers().Get(pid); peer != nil {
+				mgr.Pin(pid, peer.SocketAddr().String())
+			}
+		}
+	}
+
 	log.Info("download starting",
 		"chunks", N, "good_peers", len(good),
-		"per_peer_inflight", perPeer, "warm_target", warmTarget)
+		"per_peer_inflight", perPeer)
 
 	dispatch()
-
-	// Background peer-pool refresher. Keeps the connected peer count
-	// hovering near warmTarget by dialing peer addrs (shuffled)
-	// whenever we drop below the threshold. scanForNewPeers in the
-	// main loop picks up the resulting connections as provisional peers.
-	if len(peerAddrs) > 0 && warmTarget > 0 {
-		go runKeepWarm(ctx, sw, peerAddrs, warmTarget, warmRefreshInterval)
-	}
 
 	timeoutTicker := time.NewTicker(2 * time.Second)
 	defer timeoutTicker.Stop()
@@ -318,12 +238,14 @@ func download(ctx context.Context, sw *p2p.Switch, ssR *statesync.Reactor,
 					pending[idx] = true
 				}
 			}
+			// Mirror peerWatch / manager bans into stats so pickPeer
+			// stops considering them. (Manager handles all redialing.)
 			for pid, st := range stats {
 				if st.banned {
 					continue
 				}
-				if sw.Peers().Get(pid) == nil {
-					tryRedial(pid)
+				if mgr != nil && mgr.IsBanned(pid) {
+					st.banned = true
 				}
 			}
 			scanForNewPeers()
@@ -402,15 +324,11 @@ func download(ctx context.Context, sw *p2p.Switch, ssR *statesync.Reactor,
 				continue
 			}
 
-			// Verified chunk — promote a provisional peer to proven, and
-			// reset the disconnect/redial backoff so a peer that came
-			// back from a long outage gets a clean slate.
+			// Verified chunk — promote a provisional peer to proven.
 			if st.provisional {
 				st.provisional = false
 				log.Info("peer promoted from provisional", "peer", string(peer))
 			}
-			st.disconnects = 0
-			st.nextDialAfter = time.Time{}
 
 			// Write the verified chunk to disk. Errors are logged and
 			// ignored so a transient disk hiccup doesn't abort the

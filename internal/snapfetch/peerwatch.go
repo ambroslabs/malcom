@@ -9,6 +9,7 @@ import (
 	"github.com/cometbft/cometbft/p2p"
 	pexcb "github.com/cometbft/cometbft/p2p/pex"
 
+	"github.com/zrbecker/cosmos-p2p/internal/connect"
 	"github.com/zrbecker/cosmos-p2p/internal/logctx"
 	"github.com/zrbecker/cosmos-p2p/internal/statesync"
 )
@@ -25,6 +26,7 @@ import (
 type peerWatch struct {
 	sw                      *p2p.Switch
 	book                    pexcb.AddrBook
+	mgr                     *connect.Manager // notified on every eviction so it stops redialing
 	minHeight               uint64
 	grace                   time.Duration
 	banDuration             time.Duration
@@ -43,10 +45,11 @@ type peerWatch struct {
 	banned map[p2p.ID]bool
 }
 
-func newPeerWatch(ctx context.Context, sw *p2p.Switch, book pexcb.AddrBook, minHeight uint64, grace, banDuration time.Duration, requireStateSyncChannel bool) *peerWatch {
+func newPeerWatch(ctx context.Context, sw *p2p.Switch, book pexcb.AddrBook, mgr *connect.Manager, minHeight uint64, grace, banDuration time.Duration, requireStateSyncChannel bool) *peerWatch {
 	return &peerWatch{
 		sw:                      sw,
 		book:                    book,
+		mgr:                     mgr,
 		minHeight:               minHeight,
 		grace:                   grace,
 		banDuration:             banDuration,
@@ -86,6 +89,9 @@ func (w *peerWatch) banPeer(peer p2p.Peer, reason string) {
 	if w.book != nil {
 		w.book.MarkBad(addr, w.banDuration)
 	}
+	if w.mgr != nil {
+		w.mgr.Ban(peer.ID(), reason)
+	}
 	w.mu.Lock()
 	delete(w.firstSeen, peer.ID())
 	w.banned[peer.ID()] = true
@@ -102,6 +108,9 @@ func (w *peerWatch) markBannedByID(id p2p.ID, addr string, reason string) {
 		if na, err := p2p.NewNetAddressString(addr); err == nil {
 			w.book.MarkBad(na, w.banDuration)
 		}
+	}
+	if w.mgr != nil {
+		w.mgr.Ban(id, reason)
 	}
 	w.mu.Lock()
 	w.banned[id] = true

@@ -8,7 +8,6 @@ import (
 
 	"github.com/cometbft/cometbft/p2p"
 
-	"github.com/zrbecker/cosmos-p2p/internal/helpers/addrbook"
 	"github.com/zrbecker/cosmos-p2p/internal/logctx"
 	"github.com/zrbecker/cosmos-p2p/internal/statesync"
 )
@@ -30,35 +29,16 @@ func walkBackward(
 	sw *p2p.Switch,
 	ssR *statesync.Reactor,
 	mux *eventMux,
-	peerAddrs []addrbook.PeerAddr,
 	cfg Config,
 ) (*snapshotOffer, []p2p.ID, error) {
 	log := logctx.From(ctx)
 
-	// Subscribe to events BEFORE dialing so any SnapshotsResponse
-	// arriving during the kickstart-dial wave + warmup is captured
-	// (the mux drops events when there are no subscribers).
+	// Subscribe to events BEFORE the warmup window so any
+	// SnapshotsResponse arriving during it is captured (the mux drops
+	// events when there are no subscribers). The connect.Manager has
+	// been dialing peers since runfetch's setup; by now there should
+	// be peers connected or in-flight.
 	evs := mux.subscribe()
-
-	// Kickstart: fire-and-forget dials to a capped subset of our peer
-	// addrs. We don't wait for results — each unreachable peer can
-	// take 30s+ to time out, and with PEX-accumulated addrbooks of
-	// thousands of entries a synchronous wait would stall fetch for
-	// tens of minutes. PEX's auto-dial loop (2s tick over the
-	// addrbook) handles the rest.
-	const kickstartCap = 64
-	{
-		addrs := make([]string, 0, kickstartCap)
-		for i, s := range peerAddrs {
-			if i >= kickstartCap {
-				break
-			}
-			addrs = append(addrs, s.Addr)
-		}
-		if err := sw.DialPeersAsync(addrs); err != nil {
-			log.Error("kickstart dial", "err", err)
-		}
-	}
 
 	// Target list.
 	var targets []uint64

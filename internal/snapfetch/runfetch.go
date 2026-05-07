@@ -15,6 +15,7 @@ import (
 	"github.com/cometbft/cometbft/p2p/conn"
 	"github.com/cometbft/cometbft/version"
 
+	"github.com/zrbecker/cosmos-p2p/internal/connect"
 	"github.com/zrbecker/cosmos-p2p/internal/helpers/addrbook"
 	"github.com/zrbecker/cosmos-p2p/internal/helpers/banlist"
 	"github.com/zrbecker/cosmos-p2p/internal/helpers/nodekey"
@@ -149,6 +150,23 @@ func RunFetch(ctx context.Context, c Config, outRoot string) error {
 	if err := sw.Start(); err != nil {
 		return fmt.Errorf("switch.Start: %w", err)
 	}
+
+	// connect.Manager owns all outbound dialing for the run: warm-fill
+	// from the static pool (replaces the old runKeepWarm goroutine) and
+	// pinned-redial for peers that download/peerWatch care about
+	// (replaces the old download.tryRedial loop).
+	mgr := connect.New(ctx, connect.Config{
+		Switch:      sw,
+		Book:        book,
+		Pool:        peerAddrs,
+		WarmTarget:  c.WarmPeerTarget,
+		RefreshTick: c.WarmRefreshInterval,
+		Backoff:     c.PeerRedialBackoff,
+		MaxBackoff:  c.MaxRedialBackoff,
+		MaxRedials:  c.MaxRedials,
+		BanDuration: c.AddrBookBanDuration,
+	})
+	defer mgr.Stop()
 	// Defers run LIFO. book.Save first (fast, JSON dump), then sw.Stop
 	// — but skip sw.Stop on ctx cancel: cometbft's clean peer-disconnect
 	// can take 5-10s with many peers, and the OS reaps the TCP sockets
@@ -178,7 +196,7 @@ func RunFetch(ctx context.Context, c Config, outRoot string) error {
 	// peer set from the moment we start collecting offers.
 	watchCtx, watchCancel := context.WithCancel(ctx)
 	defer watchCancel()
-	watch := newPeerWatch(watchCtx, sw, book, c.MinHeight, c.ChurnGrace, c.AddrBookBanDuration, c.RequireStateSyncChannel)
+	watch := newPeerWatch(watchCtx, sw, book, mgr, c.MinHeight, c.ChurnGrace, c.AddrBookBanDuration, c.RequireStateSyncChannel)
 	go watch.run(watchCtx, mux.subscribe())
 
 	var (
@@ -191,7 +209,7 @@ func RunFetch(ctx context.Context, c Config, outRoot string) error {
 	// Walk: dial peer addrs, warm up, then probe target heights in
 	// descending order until one peer serves chunk-0. No rescan
 	// loop — if the walk exhausts the freshness window, error out.
-	chosen, goodPeers, err = walkBackward(ctx, sw, ssR, mux, peerAddrs, c)
+	chosen, goodPeers, err = walkBackward(ctx, sw, ssR, mux, c)
 	if err != nil {
 		return err
 	}
@@ -219,11 +237,10 @@ func RunFetch(ctx context.Context, c Config, outRoot string) error {
 	// ─── Download all chunks ──────────────────────────────────────────
 	fetchCtx, fetchCancel := context.WithTimeout(ctx, c.MaxFetchTime)
 	bt, derr := download(fetchCtx, sw, ssR, mux.subscribe(),
-		chosen, chunkHashes, goodPeers, snapDir, peerAddrs,
+		chosen, chunkHashes, goodPeers, snapDir,
 		c.PerPeerLimit, c.ChunkTimeout, c.PeerFailLimit,
-		c.MaxRedials, c.PeerRedialBackoff, c.MaxRedialBackoff,
 		c.ProvisionalProbeStrikes, c.ProvisionalProbeInflight,
-		c.WarmPeerTarget, c.WarmRefreshInterval, watch)
+		watch, mgr)
 	fetchCancel()
 	if derr != nil {
 		return fmt.Errorf("download failed: %w", derr)
