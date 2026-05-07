@@ -324,10 +324,17 @@ func (s *fetchSession) download(ctx context.Context, offer *snapshotOffer, good 
 // (height, format, hash) key, so a peer racing first with forged
 // metadata + matching forged chunks passes per-chunk and only fails
 // the aggregate check here.
-func verifySnapshotHash(snapDir string, offer *snapshotOffer) error {
+//
+// ctx is checked between chunks so Ctrl+C interrupts the trailing
+// pass instead of waiting for it to finish; per-chunk reads are
+// non-cancellable but bounded (~100 ms each on the cold path).
+func verifySnapshotHash(ctx context.Context, snapDir string, offer *snapshotOffer) error {
 	h := sha256.New()
 	buf := make([]byte, 1<<20)
 	for i := uint32(0); i < offer.Chunks; i++ {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
 		path := filepath.Join(snapDir, fmt.Sprintf("chunk_%05d.bin", i))
 		f, err := os.Open(path)
 		if err != nil {

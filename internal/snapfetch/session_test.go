@@ -1,8 +1,10 @@
 package snapfetch
 
 import (
+	"context"
 	"crypto/sha256"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -190,7 +192,7 @@ func TestVerifySnapshotHashOK(t *testing.T) {
 		h.Write(c)
 	}
 	offer := &snapshotOffer{Chunks: uint32(len(chunks)), Hash: h.Sum(nil)}
-	if err := verifySnapshotHash(dir, offer); err != nil {
+	if err := verifySnapshotHash(context.Background(), dir, offer); err != nil {
 		t.Fatalf("verifySnapshotHash: %v", err)
 	}
 }
@@ -211,7 +213,7 @@ func TestVerifySnapshotHashMismatch(t *testing.T) {
 		Chunks: uint32(len(chunks)),
 		Hash:   make([]byte, sha256.Size),
 	}
-	err := verifySnapshotHash(dir, offer)
+	err := verifySnapshotHash(context.Background(), dir, offer)
 	if err == nil {
 		t.Fatalf("verifySnapshotHash accepted mismatched hash")
 	}
@@ -229,12 +231,29 @@ func TestVerifySnapshotHashMissingChunk(t *testing.T) {
 	}
 	// Claim 2 chunks; only chunk 0 exists on disk.
 	offer := &snapshotOffer{Chunks: 2, Hash: make([]byte, sha256.Size)}
-	err := verifySnapshotHash(dir, offer)
+	err := verifySnapshotHash(context.Background(), dir, offer)
 	if err == nil {
 		t.Fatalf("verifySnapshotHash accepted missing chunk")
 	}
 	if !strings.Contains(err.Error(), "open chunk 1") {
 		t.Fatalf("err=%v, want open chunk 1", err)
+	}
+}
+
+// TestVerifySnapshotHashContextCancelled confirms a pre-cancelled ctx
+// short-circuits the verify pass before any chunk is read, returning
+// context.Canceled rather than a hash-mismatch from the empty stream.
+func TestVerifySnapshotHashContextCancelled(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, "chunk_00000.bin"), []byte("a"), 0o644); err != nil {
+		t.Fatalf("write chunk 0: %v", err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	offer := &snapshotOffer{Chunks: 1, Hash: make([]byte, sha256.Size)}
+	err := verifySnapshotHash(ctx, dir, offer)
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("err=%v, want context.Canceled", err)
 	}
 }
 
