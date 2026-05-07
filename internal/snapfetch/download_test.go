@@ -2,6 +2,7 @@ package snapfetch
 
 import (
 	"crypto/sha256"
+	"fmt"
 	"os"
 	"path/filepath"
 	"testing"
@@ -388,6 +389,177 @@ func TestChunkSchedulerPickPeerSkipsBanned(t *testing.T) {
 		if pid := s.pickPeer(); pid != good.ID() {
 			t.Fatalf("pickPeer=%q, want %q (banned should never be picked)", pid, good.ID())
 		}
+	}
+}
+
+// resumeScheduler builds a multi-chunk scheduler with distinct
+// per-chunk bytes/hashes, suitable for resume tests. Returns the
+// scheduler and the per-chunk byte slices indexed by chunk number.
+func resumeScheduler(t *testing.T, n uint32) (*chunkScheduler, [][]byte) {
+	t.Helper()
+	b := newScenario(t)
+	b.target.Chunks = n
+	bodies := make([][]byte, n)
+	hashes := make([][]byte, n)
+	for i := uint32(0); i < n; i++ {
+		body := []byte(fmt.Sprintf("chunk-%d-bytes", i))
+		bodies[i] = body
+		h := sha256.Sum256(body)
+		hashes[i] = h[:]
+	}
+	s := b.build()
+	s.chunkHashes = hashes
+	s.pending = make([]bool, n)
+	for i := range s.pending {
+		s.pending[i] = true
+	}
+	s.completed = make([]bool, n)
+	return s, bodies
+}
+
+func writeChunk(t *testing.T, dir string, idx uint32, body []byte) {
+	t.Helper()
+	path := filepath.Join(dir, fmt.Sprintf("chunk_%05d.bin", idx))
+	if err := os.WriteFile(path, body, 0o644); err != nil {
+		t.Fatalf("write chunk_%05d.bin: %v", idx, err)
+	}
+}
+
+func TestChunkSchedulerResumeAllValidChunksSkipsDispatch(t *testing.T) {
+	s, bodies := resumeScheduler(t, 3)
+
+	var totalBytes uint64
+	for i, body := range bodies {
+		writeChunk(t, s.snapDir, uint32(i), body)
+		totalBytes += uint64(len(body))
+	}
+
+	resumed, removed := s.resumeFromDisk()
+	if resumed != 3 || removed != 0 {
+		t.Fatalf("resumeFromDisk = (%d,%d), want (3,0)", resumed, removed)
+	}
+	for i := uint32(0); i < 3; i++ {
+		if !s.completed[i] {
+			t.Fatalf("completed[%d] not set after resume", i)
+		}
+		if s.pending[i] {
+			t.Fatalf("pending[%d] still set after resume", i)
+		}
+	}
+	if s.doneCount != 3 {
+		t.Fatalf("doneCount=%d, want 3", s.doneCount)
+	}
+	if got := s.bytesTotal.Load(); got != totalBytes {
+		t.Fatalf("bytesTotal=%d, want %d", got, totalBytes)
+	}
+
+	// With everything completed, dispatch must not fire any RequestChunk.
+	if d := s.dispatch(); d != 0 {
+		t.Fatalf("dispatch=%d after full resume, want 0", d)
+	}
+}
+
+func TestChunkSchedulerResumeRemovesMismatchedChunk(t *testing.T) {
+	s, _ := resumeScheduler(t, 1)
+
+	// Wrong bytes — hash will not match s.chunkHashes[0].
+	writeChunk(t, s.snapDir, 0, []byte("WRONG"))
+	path := filepath.Join(s.snapDir, "chunk_00000.bin")
+
+	resumed, removed := s.resumeFromDisk()
+	if resumed != 0 || removed != 1 {
+		t.Fatalf("resumeFromDisk = (%d,%d), want (0,1)", resumed, removed)
+	}
+	if _, err := os.Stat(path); !os.IsNotExist(err) {
+		t.Fatalf("mismatched chunk not removed: stat err = %v", err)
+	}
+	if s.completed[0] {
+		t.Fatalf("completed[0] set despite mismatch")
+	}
+	if !s.pending[0] {
+		t.Fatalf("pending[0] cleared despite mismatch")
+	}
+	if s.doneCount != 0 {
+		t.Fatalf("doneCount=%d, want 0", s.doneCount)
+	}
+	if got := s.bytesTotal.Load(); got != 0 {
+		t.Fatalf("bytesTotal=%d, want 0", got)
+	}
+}
+
+func TestChunkSchedulerResumePartialMix(t *testing.T) {
+	s, bodies := resumeScheduler(t, 4)
+
+	// idx 0,2 valid; idx 1 mismatched; idx 3 missing.
+	writeChunk(t, s.snapDir, 0, bodies[0])
+	writeChunk(t, s.snapDir, 1, []byte("WRONG"))
+	writeChunk(t, s.snapDir, 2, bodies[2])
+
+	resumed, removed := s.resumeFromDisk()
+	if resumed != 2 || removed != 1 {
+		t.Fatalf("resumeFromDisk = (%d,%d), want (2,1)", resumed, removed)
+	}
+	if !s.completed[0] || !s.completed[2] {
+		t.Fatalf("valid chunks not marked completed: %v", s.completed)
+	}
+	if s.completed[1] || s.completed[3] {
+		t.Fatalf("non-valid chunks wrongly marked completed: %v", s.completed)
+	}
+	if !s.pending[1] || !s.pending[3] {
+		t.Fatalf("non-valid chunks not pending: %v", s.pending)
+	}
+	if s.doneCount != 2 {
+		t.Fatalf("doneCount=%d, want 2", s.doneCount)
+	}
+	wantBytes := uint64(len(bodies[0]) + len(bodies[2]))
+	if got := s.bytesTotal.Load(); got != wantBytes {
+		t.Fatalf("bytesTotal=%d, want %d", got, wantBytes)
+	}
+	// Mismatched file removed; missing one stays missing.
+	if _, err := os.Stat(filepath.Join(s.snapDir, "chunk_00001.bin")); !os.IsNotExist(err) {
+		t.Fatalf("mismatched chunk_00001 not removed: stat err = %v", err)
+	}
+}
+
+func TestChunkSchedulerResumeRemovesOrphanChunks(t *testing.T) {
+	s, bodies := resumeScheduler(t, 3)
+
+	// In-range valid chunk: kept.
+	writeChunk(t, s.snapDir, 0, bodies[0])
+	// Out-of-range orphans from a prior run that picked a 6-chunk
+	// offer: must be removed so disk usage tracks the current offer.
+	writeChunk(t, s.snapDir, 4, []byte("orphan-4"))
+	writeChunk(t, s.snapDir, 5, []byte("orphan-5"))
+
+	resumed, removed := s.resumeFromDisk()
+	if resumed != 1 || removed != 2 {
+		t.Fatalf("resumeFromDisk = (%d,%d), want (1,2)", resumed, removed)
+	}
+	for _, idx := range []uint32{4, 5} {
+		path := filepath.Join(s.snapDir, fmt.Sprintf("chunk_%05d.bin", idx))
+		if _, err := os.Stat(path); !os.IsNotExist(err) {
+			t.Fatalf("orphan chunk %d not removed: stat err = %v", idx, err)
+		}
+	}
+	if !s.completed[0] {
+		t.Fatalf("in-range valid chunk wrongly cleared")
+	}
+}
+
+func TestChunkSchedulerResumeSweepsStaleTmpFiles(t *testing.T) {
+	s, _ := resumeScheduler(t, 2)
+
+	tmp := filepath.Join(s.snapDir, "chunk_00000.bin.tmp")
+	if err := os.WriteFile(tmp, []byte("partial-write"), 0o644); err != nil {
+		t.Fatalf("seed tmp: %v", err)
+	}
+
+	resumed, removed := s.resumeFromDisk()
+	if resumed != 0 || removed != 1 {
+		t.Fatalf("resumeFromDisk = (%d,%d), want (0,1)", resumed, removed)
+	}
+	if _, err := os.Stat(tmp); !os.IsNotExist(err) {
+		t.Fatalf("stale tmp not removed: stat err = %v", err)
 	}
 }
 
