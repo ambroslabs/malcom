@@ -56,7 +56,7 @@ func RunFetch(ctx context.Context, c Config, outRoot string) error {
 		s.log.Info("snapshot hash verify skipped — run `malcom verify` against a trusted RPC to authenticate contents",
 			"flag", "-no-verify-hash")
 	} else {
-		s.log.Info("verifying snapshot hash", "chunks", offer.Chunks)
+		s.log.Info("verifying snapshot hash", "chunks", offer.Chunks, "skip_with", "-no-verify-hash")
 		if err := verifySnapshotHash(snapDir, offer); err != nil {
 			return fmt.Errorf("snapshot hash verify: %w", err)
 		}
