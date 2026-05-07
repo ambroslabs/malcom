@@ -54,29 +54,34 @@ type Set struct {
 	entries map[string]Entry
 }
 
-// New returns an empty Set bound to path. Errors on empty path. Call
-// Load to populate from disk; Save writes the current state back
-// atomically (Save MkdirAll's the parent dir on demand, so callers
-// don't need to pre-create it).
+// New returns a Set bound to path, populated from disk if the file
+// exists. A missing file is fine — returns an empty set (we'll write
+// one on Save). Errors on empty path or unreadable/malformed file:
+// callers should treat those as configuration errors and surface them
+// rather than silently rebuild from scratch.
+//
+// Save writes the current state back atomically and MkdirAll's the
+// parent dir on demand, so callers don't need to pre-create it.
 func New(path string) (*Set, error) {
 	if path == "" {
 		return nil, fmt.Errorf("dead-peers path is empty")
 	}
-	return &Set{
+	s := &Set{
 		path:    path,
 		cap:     DefaultCap,
 		maxAge:  DefaultMaxAge,
 		entries: map[string]Entry{},
-	}, nil
+	}
+	if err := s.load(); err != nil {
+		return nil, err
+	}
+	return s, nil
 }
 
-// Load reads path into memory, dropping entries older than MaxAge and
+// load reads path into memory, dropping entries older than MaxAge and
 // enforcing Cap. Returns nil (and leaves the set empty) if the file
 // does not exist.
-func (s *Set) Load() error {
-	if s == nil {
-		return nil
-	}
+func (s *Set) load() error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 

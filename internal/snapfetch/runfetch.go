@@ -101,9 +101,6 @@ func RunFetch(ctx context.Context, c Config, outRoot string) error {
 	if err != nil {
 		return fmt.Errorf("dead-peers: %w", err)
 	}
-	if err := deadSet.Load(); err != nil {
-		log.Error("load dead-peers failed", "path", c.DeadPeers, "err", err)
-	}
 	log.Info("addrbook loaded", "path", c.AddrBook, "size", addrbookCount)
 	log.Info("dead-peers loaded", "path", c.DeadPeers, "size", deadSet.Len())
 
