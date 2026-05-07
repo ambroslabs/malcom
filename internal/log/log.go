@@ -47,7 +47,7 @@ type logger struct {
 
 // With returns a derived logger with kv prepended to every subsequent
 // log line. Cometbft uses this heavily (e.g., logger.With("module",
-// "snapfetch")).
+// "fetch")).
 func (l *logger) With(kv ...any) cmtlog.Logger {
 	combined := make([]any, 0, len(l.keyvals)+len(kv))
 	combined = append(combined, l.keyvals...)

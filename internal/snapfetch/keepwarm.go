@@ -5,8 +5,9 @@ import (
 	"math/rand"
 	"time"
 
-	cmtlog "github.com/cometbft/cometbft/libs/log"
 	"github.com/cometbft/cometbft/p2p"
+
+	"github.com/zrbecker/cosmos-p2p/internal/logctx"
 )
 
 // runKeepWarm dials peer addrs in the background while the connected
@@ -19,11 +20,12 @@ import (
 // of the list, and a cursor advances through the shuffled slice with
 // wraparound — over a long bench, every addr eventually gets a try.
 func runKeepWarm(ctx context.Context, sw *p2p.Switch, peerAddrs []peerAddr,
-	warmTarget int, refresh time.Duration, logger cmtlog.Logger) {
+	warmTarget int, refresh time.Duration) {
 
 	if len(peerAddrs) == 0 {
 		return
 	}
+	log := logctx.From(ctx)
 	const dialBatch = 4
 
 	shuffled := make([]peerAddr, len(peerAddrs))
@@ -64,7 +66,7 @@ func runKeepWarm(ctx context.Context, sw *p2p.Switch, peerAddrs []peerAddr,
 			}(na)
 		}
 		if dialed > 0 {
-			logger.Debug("keep-warm refresh",
+			log.Debug("keep-warm refresh",
 				"connected", connected, "target", warmTarget, "dialed", dialed)
 		}
 	}

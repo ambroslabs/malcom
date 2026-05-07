@@ -10,9 +10,9 @@ import (
 	"sync/atomic"
 	"time"
 
-	cmtlog "github.com/cometbft/cometbft/libs/log"
 	"github.com/cometbft/cometbft/p2p"
 
+	"github.com/zrbecker/cosmos-p2p/internal/logctx"
 	"github.com/zrbecker/cosmos-p2p/internal/statesync"
 )
 
@@ -49,8 +49,9 @@ func download(ctx context.Context, sw *p2p.Switch, ssR *statesync.Reactor,
 	maxRedials int, redialBackoff, maxRedialBackoff time.Duration,
 	provisionalStrikes, provisionalInflight int,
 	warmTarget int, warmRefreshInterval time.Duration,
-	watch *peerWatch,
-	logger cmtlog.Logger) (uint64, error) {
+	watch *peerWatch) (uint64, error) {
+
+	log := logctx.From(ctx)
 
 	// banAndDrop disconnects + addrbook-bans a misbehaving peer so
 	// PEX can dial a replacement (banned peers occupying connection
@@ -145,7 +146,7 @@ func download(ctx context.Context, sw *p2p.Switch, ssR *statesync.Reactor,
 			if watch != nil {
 				watch.markBannedByID(pid, addr, "max-redials hit")
 			}
-			logger.Debug("benching peer (max redials)", "peer", string(pid), "disconnects", st.disconnects)
+			log.Debug("benching peer (max redials)", "peer", string(pid), "disconnects", st.disconnects)
 			return
 		}
 		na, err := p2p.NewNetAddressString(addr)
@@ -208,7 +209,7 @@ func download(ctx context.Context, sw *p2p.Switch, ssR *statesync.Reactor,
 				continue
 			}
 			stats[pid] = &peerStat{provisional: true}
-			logger.Debug("provisional peer added", "peer", string(pid))
+			log.Debug("provisional peer added", "peer", string(pid))
 		}
 	}
 
@@ -241,7 +242,7 @@ func download(ctx context.Context, sw *p2p.Switch, ssR *statesync.Reactor,
 		return dispatched
 	}
 
-	logger.Info("download starting",
+	log.Info("download starting",
 		"chunks", N, "good_peers", len(good),
 		"per_peer_inflight", perPeer, "warm_target", warmTarget)
 
@@ -252,7 +253,7 @@ func download(ctx context.Context, sw *p2p.Switch, ssR *statesync.Reactor,
 	// whenever we drop below the threshold. scanForNewPeers in the
 	// main loop picks up the resulting connections as provisional peers.
 	if len(peerAddrs) > 0 && warmTarget > 0 {
-		go runKeepWarm(ctx, sw, peerAddrs, warmTarget, warmRefreshInterval, logger)
+		go runKeepWarm(ctx, sw, peerAddrs, warmTarget, warmRefreshInterval)
 	}
 
 	timeoutTicker := time.NewTicker(2 * time.Second)
@@ -294,7 +295,7 @@ func download(ctx context.Context, sw *p2p.Switch, ssR *statesync.Reactor,
 						// connection is suspect.
 						if st.provisional {
 							st.banned = true
-							logger.Debug("benching provisional peer (probe timeout)",
+							log.Debug("benching provisional peer (probe timeout)",
 								"peer", string(info.peer))
 							banAndDrop(info.peer, "probe timeout")
 						}
@@ -316,7 +317,7 @@ func download(ctx context.Context, sw *p2p.Switch, ssR *statesync.Reactor,
 
 			if now.Sub(lastProgress) >= progressEvery {
 				rate := float64(doneCount) / now.Sub(startTime).Seconds()
-				logger.Info("download progress",
+				log.Info("download progress",
 					"chunks", fmt.Sprintf("%d/%d", doneCount, N),
 					"MB", bytesTotal.Load()>>20,
 					"chunks_per_s", fmt.Sprintf("%.1f", rate),
@@ -363,7 +364,7 @@ func download(ctx context.Context, sw *p2p.Switch, ssR *statesync.Reactor,
 				st.failures++
 				if st.failures >= banLimit {
 					st.banned = true
-					logger.Debug("benching peer", "peer", string(peer), "failures", st.failures, "provisional", st.provisional)
+					log.Debug("benching peer", "peer", string(peer), "failures", st.failures, "provisional", st.provisional)
 					banAndDrop(peer, "missing/empty chunk")
 				}
 				pending[idx] = true
@@ -373,7 +374,7 @@ func download(ctx context.Context, sw *p2p.Switch, ssR *statesync.Reactor,
 
 			h := sha256.Sum256(ev.Chunk.Bytes)
 			if !bytesEq(h[:], chunkHashes[idx]) {
-				logger.Error("chunk hash mismatch",
+				log.Error("chunk hash mismatch",
 					"peer", string(peer), "idx", idx,
 					"got_sha", hex.EncodeToString(h[:8]),
 					"want_sha", hex.EncodeToString(chunkHashes[idx][:8]))
@@ -392,7 +393,7 @@ func download(ctx context.Context, sw *p2p.Switch, ssR *statesync.Reactor,
 			// back from a long outage gets a clean slate.
 			if st.provisional {
 				st.provisional = false
-				logger.Info("peer promoted from provisional", "peer", string(peer))
+				log.Info("peer promoted from provisional", "peer", string(peer))
 			}
 			st.disconnects = 0
 			st.nextDialAfter = time.Time{}
@@ -403,7 +404,7 @@ func download(ctx context.Context, sw *p2p.Switch, ssR *statesync.Reactor,
 			// downstream import step surfaces it.
 			chunkPath := filepath.Join(snapDir, fmt.Sprintf("chunk_%05d.bin", idx))
 			if err := os.WriteFile(chunkPath, ev.Chunk.Bytes, 0o644); err != nil {
-				logger.Error("write chunk", "idx", idx, "err", err)
+				log.Error("write chunk", "idx", idx, "err", err)
 			}
 			completed[idx] = true
 			doneCount++
@@ -412,11 +413,11 @@ func download(ctx context.Context, sw *p2p.Switch, ssR *statesync.Reactor,
 		}
 
 		if !hadEvent && time.Since(startTime) > 30*time.Second {
-			logger.Error("no chunk replies in 30s; check peers", "alive_peers", alive)
+			log.Error("no chunk replies in 30s; check peers", "alive_peers", alive)
 			startTime = time.Now()
 		}
 	}
-	logger.Info("download finished",
+	log.Info("download finished",
 		"chunks", N,
 		"bytes", bytesTotal.Load(),
 		"elapsed", time.Since(startTime))

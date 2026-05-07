@@ -6,9 +6,9 @@ import (
 	"fmt"
 	"time"
 
-	cmtlog "github.com/cometbft/cometbft/libs/log"
 	"github.com/cometbft/cometbft/p2p"
 
+	"github.com/zrbecker/cosmos-p2p/internal/logctx"
 	"github.com/zrbecker/cosmos-p2p/internal/statesync"
 )
 
@@ -32,9 +32,9 @@ func walkBackward(
 	peerAddrs []peerAddr,
 	cfg Config,
 	addrByNodeID map[string]string,
-	logger cmtlog.Logger,
 ) (*snapshotOffer, []p2p.ID, error) {
 	_ = addrByNodeID
+	log := logctx.From(ctx)
 
 	// Subscribe to events BEFORE dialing so any SnapshotsResponse
 	// arriving during the kickstart-dial wave + warmup is captured
@@ -57,7 +57,7 @@ func walkBackward(
 			addrs = append(addrs, s.addr)
 		}
 		if err := sw.DialPeersAsync(addrs); err != nil {
-			logger.Error("kickstart dial", "err", err)
+			log.Error("kickstart dial", "err", err)
 		}
 	}
 
@@ -186,7 +186,7 @@ walkLoop:
 
 		initialAsks := dispatch(target)
 		out, _, dialing := sw.NumPeers()
-		logger.Info("searching for snapshot",
+		log.Info("searching for snapshot",
 			"height", target,
 			"asking_peers", initialAsks,
 			"connected", out,
@@ -222,7 +222,7 @@ walkLoop:
 						ev.Snapshot.Height > target &&
 						(cfg.MinHeight == 0 || ev.Snapshot.Height >= cfg.MinHeight) &&
 						!failed[ev.Snapshot.Height] {
-						logger.Info("found higher snapshot from new peer; jumping",
+						log.Info("found higher snapshot from new peer; jumping",
 							"from_height", target,
 							"to_height", ev.Snapshot.Height,
 							"peer", ev.PeerID)
@@ -260,7 +260,7 @@ walkLoop:
 		}
 
 		if accepted != nil {
-			logger.Info("downloading snapshot",
+			log.Info("downloading snapshot",
 				"height", accepted.Height, "format", accepted.Format,
 				"chunks", accepted.Chunks,
 				"hash", hex.EncodeToString(accepted.Hash)[:16],
@@ -290,7 +290,7 @@ walkLoop:
 		if len(queue) > 0 {
 			next = queue[0]
 		}
-		logger.Info("no served offer; walking back",
+		log.Info("no served offer; walking back",
 			"height", target, "next", next)
 	}
 

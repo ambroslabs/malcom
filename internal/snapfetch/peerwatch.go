@@ -9,6 +9,7 @@ import (
 	"github.com/cometbft/cometbft/p2p"
 	pexcb "github.com/cometbft/cometbft/p2p/pex"
 
+	"github.com/zrbecker/cosmos-p2p/internal/logctx"
 	"github.com/zrbecker/cosmos-p2p/internal/statesync"
 )
 
@@ -28,7 +29,7 @@ type peerWatch struct {
 	grace                   time.Duration
 	banDuration             time.Duration
 	requireStateSyncChannel bool
-	log                     cmtlog.Logger
+	log                     cmtlog.Logger // snapshot of logctx.From(ctx) at construction
 
 	mu               sync.Mutex
 	firstSeen        map[p2p.ID]time.Time
@@ -36,7 +37,7 @@ type peerWatch struct {
 	externallyBanned map[p2p.ID]bool // signaled by download(); skip in tryRedial
 }
 
-func newPeerWatch(sw *p2p.Switch, book pexcb.AddrBook, minHeight uint64, grace, banDuration time.Duration, requireStateSyncChannel bool, log cmtlog.Logger) *peerWatch {
+func newPeerWatch(ctx context.Context, sw *p2p.Switch, book pexcb.AddrBook, minHeight uint64, grace, banDuration time.Duration, requireStateSyncChannel bool) *peerWatch {
 	return &peerWatch{
 		sw:                      sw,
 		book:                    book,
@@ -44,7 +45,7 @@ func newPeerWatch(sw *p2p.Switch, book pexcb.AddrBook, minHeight uint64, grace, 
 		grace:                   grace,
 		banDuration:             banDuration,
 		requireStateSyncChannel: requireStateSyncChannel,
-		log:                     log,
+		log:                     logctx.From(ctx),
 		firstSeen:               map[p2p.ID]time.Time{},
 		useful:                  map[p2p.ID]bool{},
 		externallyBanned:        map[p2p.ID]bool{},

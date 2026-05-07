@@ -5,8 +5,6 @@ import (
 	"fmt"
 	"time"
 
-	cmtlog "github.com/cometbft/cometbft/libs/log"
-
 	"github.com/zrbecker/cosmos-p2p/internal/statesync"
 )
 
@@ -106,11 +104,6 @@ type Config struct {
 
 	MaxRescans        int           // default 3
 	RescanDiscoverFor time.Duration // default 15s
-
-	// Logger is optional; if nil, a no-op logger is used. The CLI passes
-	// a pre-filtered cmtlog.Logger here so debug/info filtering is the
-	// caller's concern.
-	Logger cmtlog.Logger
 }
 
 // applyDefaults fills in zero-valued fields with defaults. Mutates cfg.
@@ -198,9 +191,6 @@ func (c *Config) applyDefaults() {
 	}
 	if c.ChurnGrace == 0 {
 		c.ChurnGrace = 3 * time.Second
-	}
-	if c.Logger == nil {
-		c.Logger = cmtlog.NewNopLogger()
 	}
 }
 

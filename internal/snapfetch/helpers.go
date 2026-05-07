@@ -1,14 +1,14 @@
 package snapfetch
 
 import (
+	"context"
 	"encoding/binary"
 	"encoding/json"
 	"fmt"
 	"os"
 
-	cmtlog "github.com/cometbft/cometbft/libs/log"
-
 	"github.com/zrbecker/cosmos-p2p/internal/addrbook"
+	"github.com/zrbecker/cosmos-p2p/internal/logctx"
 )
 
 func bytesEq(a, b []byte) bool {
@@ -53,13 +53,13 @@ func parseChunkHashes(metadata []byte) ([][]byte, error) {
 	return out, nil
 }
 
-func loadAddrbookPeers(addrBookPath string, logger cmtlog.Logger) []peerAddr {
+func loadAddrbookPeers(ctx context.Context, addrBookPath string) []peerAddr {
 	if addrBookPath == "" {
 		return nil
 	}
 	items, err := addrbook.Load(addrBookPath)
 	if err != nil {
-		logger.Error("load addrbook failed", "err", err)
+		logctx.From(ctx).Error("load addrbook failed", "err", err)
 		return nil
 	}
 	out := make([]peerAddr, 0, len(items))

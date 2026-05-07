@@ -17,6 +17,7 @@ import (
 	"github.com/cometbft/cometbft/version"
 
 	"github.com/zrbecker/cosmos-p2p/internal/helpers/nodekey"
+	"github.com/zrbecker/cosmos-p2p/internal/logctx"
 	"github.com/zrbecker/cosmos-p2p/internal/peers/dead"
 	localpex "github.com/zrbecker/cosmos-p2p/internal/pex"
 	"github.com/zrbecker/cosmos-p2p/internal/statesync"
@@ -32,14 +33,15 @@ import (
 // and the user can inspect / remove them.
 func RunFetch(ctx context.Context, c Config, outRoot string) error {
 	c.applyDefaults()
-	logger := c.Logger
+	ctx = logctx.WithFields(ctx, "module", "fetch")
+	log := logctx.From(ctx)
 
 	nodeKey, err := nodekey.LoadOrGen(c.NodeKeyPath)
 	if err != nil {
 		return fmt.Errorf("node key: %w", err)
 	}
 
-	peerAddrs := loadAddrbookPeers(c.AddrBook, logger)
+	peerAddrs := loadAddrbookPeers(ctx, c.AddrBook)
 	addrbookCount := len(peerAddrs)
 	for _, s := range strings.Split(c.BootstrapPeersCSV, ",") {
 		s = strings.TrimSpace(s)
@@ -57,7 +59,7 @@ func RunFetch(ctx context.Context, c Config, outRoot string) error {
 			addrByNodeID[parts[0]] = s.addr
 		}
 	}
-	logger.With("module", "snapfetch").Info("starting",
+	log.Info("starting",
 		"node_id", string(nodeKey.ID()), "peer_addrs", len(peerAddrs))
 
 	listenAddr, err := p2p.NewNetAddressString(p2p.IDAddressString(nodeKey.ID(), c.Listen))
@@ -89,7 +91,7 @@ func RunFetch(ctx context.Context, c Config, outRoot string) error {
 	if err := transport.Listen(*listenAddr); err != nil {
 		return fmt.Errorf("transport.Listen: %w", err)
 	}
-	ssR := statesync.NewReactor(logger.With("module", "statesync"))
+	ssR := statesync.NewReactor(log.With("module", "statesync"))
 	ssR.KeepBytes = true
 
 	// AddrBook holds peer addresses learned via PEX (and seeded with
@@ -103,7 +105,7 @@ func RunFetch(ctx context.Context, c Config, outRoot string) error {
 		return fmt.Errorf("mkdir addrbook dir: %w", err)
 	}
 	book := pexcb.NewAddrBook(bookPath, false /* routabilityStrict */)
-	book.SetLogger(logger.With("module", "addrbook"))
+	book.SetLogger(log.With("module", "addrbook"))
 
 	// Dead-peer set: persistent cross-run tombstone for addresses that
 	// repeatedly fail to dial. Lives next to addrbook.json. Without
@@ -112,12 +114,10 @@ func RunFetch(ctx context.Context, c Config, outRoot string) error {
 	deadPath := filepath.Join(filepath.Dir(bookPath), "deadpeers.json")
 	deadSet := dead.New(deadPath)
 	if err := deadSet.Load(); err != nil {
-		logger.With("module", "snapfetch").Error("load dead-peers failed", "path", deadPath, "err", err)
+		log.Error("load dead-peers failed", "path", deadPath, "err", err)
 	}
-	logger.With("module", "snapfetch").Info("addrbook loaded",
-		"path", bookPath, "size", addrbookCount)
-	logger.With("module", "snapfetch").Info("dead-peers loaded",
-		"path", deadPath, "size", deadSet.Len())
+	log.Info("addrbook loaded", "path", bookPath, "size", addrbookCount)
+	log.Info("dead-peers loaded", "path", deadPath, "size", deadSet.Len())
 
 	// PEX reactor: sends PexRequest on every AddPeer, writes received
 	// PexAddrs to the book, and runs a dial loop that grows the
@@ -132,10 +132,10 @@ func RunFetch(ctx context.Context, c Config, outRoot string) error {
 		MaxDialFailures:    c.MaxDialFailures,
 		FailureBanDuration: 5 * time.Minute,
 		DeadPeers:          deadSet,
-	}, logger.With("module", "pex"))
+	}, log.With("module", "pex"))
 
 	sw := p2p.NewSwitch(p2pConfig, transport)
-	sw.SetLogger(logger.With("module", "p2p"))
+	sw.SetLogger(log.With("module", "p2p"))
 	sw.SetNodeKey(nodeKey)
 	sw.SetNodeInfo(nodeInfo)
 	sw.SetAddrBook(book)
@@ -172,8 +172,7 @@ func RunFetch(ctx context.Context, c Config, outRoot string) error {
 			added++
 		}
 	}
-	logger.With("module", "snapfetch").Info("addrbook ready",
-		"path", bookPath, "added", added, "skipped_dead", skippedDead)
+	log.Info("addrbook ready", "path", bookPath, "added", added, "skipped_dead", skippedDead)
 
 	if err := sw.Start(); err != nil {
 		return fmt.Errorf("switch.Start: %w", err)
@@ -191,15 +190,12 @@ func RunFetch(ctx context.Context, c Config, outRoot string) error {
 	defer book.Save()
 	defer func() {
 		if err := deadSet.Save(); err != nil {
-			logger.With("module", "snapfetch").Error("save dead-peers failed",
-				"path", deadPath, "err", err)
+			log.Error("save dead-peers failed", "path", deadPath, "err", err)
 			return
 		}
-		logger.With("module", "snapfetch").Info("dead-peers saved",
-			"path", deadPath, "size", deadSet.Len())
+		log.Info("dead-peers saved", "path", deadPath, "size", deadSet.Len())
 	}()
 
-	flog := logger.With("module", "snapfetch")
 	mux := newEventMux(ctx, ssR.Out)
 	defer mux.stop()
 
@@ -210,7 +206,7 @@ func RunFetch(ctx context.Context, c Config, outRoot string) error {
 	// peer set from the moment we start collecting offers.
 	watchCtx, watchCancel := context.WithCancel(ctx)
 	defer watchCancel()
-	watch := newPeerWatch(sw, book, c.MinHeight, c.ChurnGrace, c.AddrBookBanDuration, c.RequireStateSyncChannel, flog)
+	watch := newPeerWatch(watchCtx, sw, book, c.MinHeight, c.ChurnGrace, c.AddrBookBanDuration, c.RequireStateSyncChannel)
 	go watch.run(watchCtx, mux.subscribe())
 
 	var (
@@ -224,7 +220,7 @@ func RunFetch(ctx context.Context, c Config, outRoot string) error {
 	// descending order until one peer serves chunk-0. No rescan
 	// loop — if the walk exhausts the freshness window, error out.
 	chosen, goodPeers, err = walkBackward(ctx, sw, ssR, mux, peerAddrs,
-		c, addrByNodeID, flog)
+		c, addrByNodeID)
 	if err != nil {
 		return err
 	}
@@ -256,7 +252,7 @@ func RunFetch(ctx context.Context, c Config, outRoot string) error {
 		c.PerPeerLimit, c.ChunkTimeout, c.PeerFailLimit,
 		c.MaxRedials, c.PeerRedialBackoff, c.MaxRedialBackoff,
 		c.ProvisionalProbeStrikes, c.ProvisionalProbeInflight,
-		c.WarmPeerTarget, c.WarmRefreshInterval, watch, flog)
+		c.WarmPeerTarget, c.WarmRefreshInterval, watch)
 	fetchCancel()
 	if derr != nil {
 		return fmt.Errorf("download failed: %w", derr)
@@ -292,8 +288,8 @@ func RunFetch(ctx context.Context, c Config, outRoot string) error {
 	if err := os.WriteFile(filepath.Join(snapDir, ".complete"), nil, 0o644); err != nil {
 		return fmt.Errorf("mark complete: %w", err)
 	}
-	flog.Info("snapshot saved", "dir", snapDir)
-	flog.Info("download complete",
+	log.Info("snapshot saved", "dir", snapDir)
+	log.Info("download complete",
 		"height", chosen.Height, "format", chosen.Format,
 		"chunks", chosen.Chunks, "bytes", humanBytes(bytesTotal))
 

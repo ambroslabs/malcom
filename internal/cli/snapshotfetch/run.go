@@ -30,6 +30,7 @@ import (
 
 	"github.com/zrbecker/cosmos-p2p/internal/config"
 	malcomlog "github.com/zrbecker/cosmos-p2p/internal/log"
+	"github.com/zrbecker/cosmos-p2p/internal/logctx"
 	"github.com/zrbecker/cosmos-p2p/internal/snapfetch"
 )
 
@@ -82,14 +83,14 @@ func Run(args []string) int {
 		logger = cmtlog.NewFilter(logger, cmtlog.AllowDebug())
 	} else {
 		logger = cmtlog.NewFilter(logger,
+			cmtlog.AllowInfoWith("module", "fetch-cli"),
 			cmtlog.AllowInfoWith("module", "fetch"),
-			cmtlog.AllowInfoWith("module", "snapfetch"),
 			cmtlog.AllowErrorWith("module", "addrbook"),
 			// pex / p2p / mconnection silenced by default
 		)
 	}
 
-	fetchLog := logger.With("module", "fetch")
+	fetchLog := logger.With("module", "fetch-cli")
 
 	// Resolve maxHeight. Three paths:
 	//   - -target-height set: skip lookup entirely (we lock to that one height).
@@ -173,7 +174,6 @@ func Run(args []string) int {
 		MaxDialFailures:          ch.Fetch.MaxDialFailures,
 		MaxRescans:               ch.Fetch.MaxRescans,
 		RescanDiscoverFor:        ch.Fetch.RescanDiscover.Duration(),
-		Logger:                   logger,
 	}
 
 	fetchLog.Info("config", "path", cfg.Path())
@@ -183,6 +183,7 @@ func Run(args []string) int {
 
 	rootCtx, cancel := context.WithCancel(context.Background())
 	defer cancel()
+	rootCtx = logctx.With(rootCtx, logger)
 	sigCh := make(chan os.Signal, 1)
 	signal.Notify(sigCh, os.Interrupt, syscall.SIGTERM)
 	go func() {
