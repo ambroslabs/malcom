@@ -46,8 +46,12 @@ func (st *peerStat) failureLimit(proven, provisional int) int {
 }
 
 // recordFailure increments failures and bans if the limit is reached.
-// Returns true on transition to banned (caller does banAndDrop).
+// Returns true on transition to banned (caller does banAndDrop). Calls
+// after the peer is already banned are a no-op and return false.
 func (st *peerStat) recordFailure(limit int) bool {
+	if st.banned {
+		return false
+	}
 	st.failures++
 	if st.failures >= limit {
 		st.banned = true

@@ -18,17 +18,26 @@ func TestPeerStatRecordFailureBansAtThreshold(t *testing.T) {
 	}
 }
 
-func TestPeerStatRecordFailureStaysBanned(t *testing.T) {
+func TestPeerStatRecordFailureOnlyTransitionsOnce(t *testing.T) {
 	st := &peerStat{}
-	for i := 0; i < 5; i++ {
-		st.recordFailure(2)
+	st.recordFailure(2)
+	if banned := st.recordFailure(2); !banned {
+		t.Fatalf("recordFailure at threshold returned false, want true (transition)")
 	}
 	if !st.banned {
-		t.Fatalf("not banned after 5 calls with limit 2")
+		t.Fatalf("banned not set after threshold")
 	}
-	// Calling again past threshold should still report true (still banned).
-	if banned := st.recordFailure(2); !banned {
-		t.Fatalf("recordFailure past threshold returned false")
+	// Post-transition calls must report false; otherwise callers would
+	// re-invoke banAndDrop on an already-banned peer.
+	if banned := st.recordFailure(2); banned {
+		t.Fatalf("recordFailure after ban returned true, want false")
+	}
+	// failures must not keep climbing once banned.
+	failuresAtBan := st.failures
+	st.recordFailure(2)
+	st.recordFailure(2)
+	if st.failures != failuresAtBan {
+		t.Fatalf("failures kept incrementing after ban: got %d, want %d", st.failures, failuresAtBan)
 	}
 }
 
