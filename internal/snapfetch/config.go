@@ -100,6 +100,13 @@ type Config struct {
 
 	MaxRescans        int           // default 3
 	RescanDiscoverFor time.Duration // default 15s
+
+	// SkipVerifyHash disables the post-download recomputation of
+	// SHA256(chunk_0 || ... || chunk_{N-1}) against offer.Hash.
+	// Per-chunk hashes are still verified against metadata.chunk_hashes
+	// during download regardless. Skipping is reasonable when the
+	// operator follows up with `malcom verify` against a trusted RPC.
+	SkipVerifyHash bool
 }
 
 // applyDefaults fills in zero-valued fields with defaults. Mutates cfg.

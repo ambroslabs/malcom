@@ -314,17 +314,16 @@ func (s *fetchSession) download(ctx context.Context, offer *snapshotOffer, good 
 }
 
 // verifySnapshotHash recomputes the wire-level snapshot hash from the
-// chunk files on disk and compares it to offer.Hash. The cosmos-sdk
+// chunk files on disk and compares it to offer.Hash. cosmos-sdk's
 // snapshotter sets Snapshot.Hash = SHA256(chunk_0 || ... || chunk_{N-1})
-// while serving the snapshot, so a mismatch means the (Hash, Metadata)
-// tuple advertised by peers can't be reconciled against the bytes we
-// downloaded — i.e. a peer forged one half of the offer. Per-chunk
-// integrity against metadata.chunk_hashes is already enforced inside
-// download; this is the additional structural tie back to Hash.
+// during snapshot creation in store/snapshots/store.go's Save.
 //
-// Reads each chunk file in order and streams it through one
-// sha256.New(). Errors propagate so RunFetch can abort before
-// writeMeta marks the dir complete.
+// Complements the per-chunk verify in download.onChunk, which proves
+// chunks match metadata.chunk_hashes. Per-chunk alone leaves a gap:
+// offerSet.add caches the first peer's metadata for each
+// (height, format, hash) key, so a peer racing first with forged
+// metadata + matching forged chunks passes per-chunk and only fails
+// the aggregate check here.
 func verifySnapshotHash(snapDir string, offer *snapshotOffer) error {
 	h := sha256.New()
 	buf := make([]byte, 1<<20)

@@ -42,6 +42,7 @@ func Run(args []string) int {
 	targetHeight := fs.Uint64("target-height", 0, "lock to this exact height; otherwise pick the best candidate")
 	maxHeightFlag := fs.Uint64("max-height", 0, "upper bound for snapshot selection; skips the RPC /status lookup (useful when RPCs are stale or unreachable). Defaults to the chain's current height.")
 	maxAge := fs.Uint64("max-age", 0, fmt.Sprintf("freshness floor in blocks (default %d; override in config.fetch.max_age_blocks)", config.DefaultMaxAgeBlocks))
+	noVerifyHash := fs.Bool("no-verify-hash", false, "skip the post-download SHA256(chunks) == offer.Hash check; per-chunk hashes are still verified against metadata. Run `malcom verify` afterwards if you skip.")
 	debug := fs.Bool("debug", false, "verbose snapfetch logging")
 	if err := fs.Parse(args); err != nil {
 		return 2
@@ -175,6 +176,7 @@ func Run(args []string) int {
 		MaxDialFailures:          ch.Fetch.MaxDialFailures,
 		MaxRescans:               ch.Fetch.MaxRescans,
 		RescanDiscoverFor:        ch.Fetch.RescanDiscover.Duration(),
+		SkipVerifyHash:           *noVerifyHash,
 	}
 
 	fetchLog.Info("config", "path", cfg.Path())
@@ -197,9 +199,7 @@ func Run(args []string) int {
 		fmt.Fprintf(os.Stderr, "snapfetch: %v\n", err)
 		return 1
 	}
-	fmt.Fprintln(os.Stderr,
-		"WARNING: snapshot contents are not authenticated by p2p. "+
-			"Run `malcom verify` against a trusted RPC before using this snapshot in production.")
+	fetchLog.Info("WARNING: snapshot contents are not authenticated by p2p — run `malcom verify` against a trusted RPC before using this snapshot in production")
 	return 0
 }
 
