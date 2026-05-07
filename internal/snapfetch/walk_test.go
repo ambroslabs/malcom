@@ -21,11 +21,31 @@ func TestWalkTargetsFloorsToInterval(t *testing.T) {
 	}
 }
 
-func TestWalkTargetsMinHeightZeroWalksToOne(t *testing.T) {
+func TestWalkTargetsMinHeightZeroStopsAtInterval(t *testing.T) {
 	got := walkTargets(2000, 0, 1000)
 	want := []uint64{2000, 1000}
 	if !reflect.DeepEqual(got, want) {
 		t.Fatalf("walkTargets(2000, 0, 1000)=%v, want %v", got, want)
+	}
+}
+
+func TestWalkTargetsTopBelowIntervalMinZero(t *testing.T) {
+	if got := walkTargets(500, 0, 1000); got != nil {
+		t.Fatalf("walkTargets(500, 0, 1000)=%v, want nil", got)
+	}
+}
+
+func TestWalkTargetsFlooredStartEqualsMin(t *testing.T) {
+	got := walkTargets(10500, 10000, 1000)
+	want := []uint64{10000}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("walkTargets(10500, 10000, 1000)=%v, want %v", got, want)
+	}
+}
+
+func TestWalkTargetsFlooredStartBelowMin(t *testing.T) {
+	if got := walkTargets(10500, 10001, 1000); got != nil {
+		t.Fatalf("walkTargets(10500, 10001, 1000)=%v, want nil", got)
 	}
 }
 
