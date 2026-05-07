@@ -13,7 +13,6 @@
 /cosmos-snapshot-diff
 /cosmos-snapshot-inspect
 /cosmos-statesync-bench
-/cosmos-statesync-probe
 
 /bin/
 /build/

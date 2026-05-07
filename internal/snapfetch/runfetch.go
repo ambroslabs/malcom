@@ -84,7 +84,6 @@ func RunFetch(ctx context.Context, c Config, outRoot string) error {
 		return fmt.Errorf("transport.Listen: %w", err)
 	}
 	ssR := statesync.NewReactor(log.With("module", "statesync"))
-	ssR.KeepBytes = true
 
 	// AddrBook holds peer addresses learned via PEX (and seeded with
 	// our bootstrap_peers list at startup). cometbft's implementation —

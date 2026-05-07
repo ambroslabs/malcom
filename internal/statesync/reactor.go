@@ -37,9 +37,8 @@ type Snapshot struct {
 	Metadata []byte `json:"metadata,omitempty"`
 }
 
-// ChunkInfo summarises a ChunkResponse. When KeepBytes is true on the
-// reactor, Bytes carries the full chunk payload; otherwise it is nil and
-// only Size is populated (cheap probe mode).
+// ChunkInfo summarises a ChunkResponse, including the full chunk
+// payload in Bytes (consumers verify hashes and write to disk).
 type ChunkInfo struct {
 	Height  uint64
 	Format  uint32
@@ -71,9 +70,6 @@ type Reactor struct {
 	// AskOnAdd, when true, sends SnapshotsRequest to every peer on AddPeer.
 	// Defaults to true.
 	AskOnAdd bool
-	// KeepBytes, when true, copies the full chunk payload into ChunkInfo.Bytes.
-	// Probe mode (default false) only records lengths to keep memory low.
-	KeepBytes bool
 }
 
 func NewReactor(logger log.Logger) *Reactor {
@@ -168,7 +164,7 @@ func (r *Reactor) Receive(env p2p.Envelope) {
 			Height: m.Height, Format: m.Format, Index: m.Index,
 			Size: len(m.Chunk), Missing: m.Missing,
 		}
-		if r.KeepBytes && len(m.Chunk) > 0 {
+		if len(m.Chunk) > 0 {
 			ci.Bytes = make([]byte, len(m.Chunk))
 			copy(ci.Bytes, m.Chunk)
 		}
