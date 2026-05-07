@@ -168,7 +168,7 @@ func TestPeerWatchOnConnectRecordsFirstSeen(t *testing.T) {
 	}
 }
 
-func TestPeerWatchOnConnectRequireChannelMissingBans(t *testing.T) {
+func TestPeerWatchTickRequireChannelMissingBans(t *testing.T) {
 	b := newPeerWatchScenario(t)
 	w := b.build(100, time.Second, true) // requireStateSyncChannel = true
 
@@ -177,9 +177,14 @@ func TestPeerWatchOnConnectRequireChannelMissingBans(t *testing.T) {
 	b.sw.peerSet.Add(peerNoSnap)
 
 	w.onConnect(peerNoSnap.ID())
+	if b.sw.wasStopped(peerNoSnap.ID()) {
+		t.Fatalf("peer Stopped on connect; channel filter must defer to tick so PEX has time to reply")
+	}
+
+	w.tick()
 
 	if !b.sw.wasStopped(peerNoSnap.ID()) {
-		t.Fatalf("peer without state-sync channel not Stopped")
+		t.Fatalf("peer without state-sync channel not Stopped on tick")
 	}
 	if b.mgr.banReason(peerNoSnap.ID()) != "no state-sync channel" {
 		t.Fatalf("manager.Ban reason=%q, want 'no state-sync channel'",

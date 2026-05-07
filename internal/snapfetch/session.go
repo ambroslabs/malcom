@@ -52,7 +52,6 @@ type fetchSession struct {
 // runs the same shutdown sequence as a successful run.
 func newFetchSession(ctx context.Context, c Config) (*fetchSession, func(), error) {
 	c.applyDefaults()
-	ctx = logctx.WithFields(ctx, "module", "fetch")
 	log := logctx.From(ctx)
 
 	nodeKey, err := nodekey.LoadOrGen(c.NodeKeyPath)
@@ -139,24 +138,11 @@ func newFetchSession(ctx context.Context, c Config) (*fetchSession, func(), erro
 	log.Info("addrbook ready", "path", c.AddrBook,
 		"added", res.Added, "skipped_banned", res.SkippedBanned)
 
-	// PEX reactor: sends PexRequest on every AddPeer and writes
-	// banlist-filtered PexAddrs into the book. Dialing is owned by
-	// connect.Manager (constructed below) — this reactor is gossip-only.
-	pexR := localpex.NewAutoReactor(book, localpex.AutoConfig{
-		Banlist: bans,
-	}, log.With("module", "pex"))
-
 	sw := p2p.NewSwitch(buildP2PConfig(c.MaxOutboundPeers), transport)
 	sw.SetLogger(log.With("module", "p2p"))
 	sw.SetNodeKey(nodeKey)
 	sw.SetNodeInfo(nodeInfo)
 	sw.SetAddrBook(book)
-	sw.AddReactor("PEX", pexR)
-	sw.AddReactor("STATESYNC", ssR)
-
-	if err := sw.Start(); err != nil {
-		return nil, nil, fmt.Errorf("switch.Start: %w", err)
-	}
 
 	// connect.Manager owns all outbound dialing for the run:
 	//   - warm-fill from the static pool, then from the cometbft
@@ -166,6 +152,9 @@ func newFetchSession(ctx context.Context, c Config) (*fetchSession, func(), erro
 	//     (replaces download.tryRedial);
 	//   - per-addr dial-failure tracking with book.RemoveAddress +
 	//     banlist.Add on threshold (replaces PEX's onDialFail).
+	// Constructed before the PEX reactor so we can hand it in as the
+	// gossip Kicker — every non-empty PexAddrs triggers an immediate
+	// dial wave instead of waiting for the next RefreshTick.
 	mgr := connect.New(ctx, connect.Config{
 		Switch:          sw,
 		Book:            book,
@@ -181,6 +170,23 @@ func newFetchSession(ctx context.Context, c Config) (*fetchSession, func(), erro
 		MaxDialFailures: c.MaxDialFailures,
 		BanDuration:     c.AddrBookBanDuration,
 	})
+
+	// PEX reactor: sends PexRequest on every AddPeer and writes
+	// banlist-filtered PexAddrs into the book. Dialing is owned by
+	// connect.Manager — this reactor is gossip-only, but it kicks
+	// the manager after each gossip so freshly-learned addrs get
+	// dialed before the next 5s tick.
+	pexR := localpex.NewAutoReactor(book, localpex.AutoConfig{
+		Banlist: bans,
+		Kicker:  mgr,
+	}, log.With("module", "pex"))
+
+	sw.AddReactor("PEX", pexR)
+	sw.AddReactor("STATESYNC", ssR)
+
+	if err := sw.Start(); err != nil {
+		return nil, nil, fmt.Errorf("switch.Start: %w", err)
+	}
 
 	mux := newEventMux(ctx, ssR.Out)
 
@@ -254,7 +260,7 @@ func buildPeerAddrs(ctx context.Context, c Config) ([]addrbook.PeerAddr, error) 
 // has been warming up. Returns the chosen offer + a starter "good
 // peers" list (chunk-0 responder + everyone the offer was advertised by).
 func (s *fetchSession) walk(ctx context.Context) (*snapshotOffer, []p2p.ID, error) {
-	return walkBackward(ctx, s.sw, s.ssR, s.mux, s.cfg)
+	return walkBackward(ctx, s.sw, s.ssR, s.mux, s.peerAddrs, s.cfg)
 }
 
 // prepareSnapshotDir parses chunk hashes from the chosen offer's

@@ -129,17 +129,12 @@ func (w *peerWatch) markBannedByID(id p2p.ID, addr string, reason string) {
 	w.mu.Unlock()
 }
 
-// onConnect handles a Connected event. Applies the channel filter
-// immediately, otherwise records firstSeen.
+// onConnect handles a Connected event by recording firstSeen. The
+// channel filter is applied on the next tick, not here, so PEX-only
+// seeds get a window to reply to AutoReactor's PexRequest before we
+// disconnect them — without that window the addrbook never enriches
+// past the static bootstrap list.
 func (w *peerWatch) onConnect(id p2p.ID) {
-	if w.requireStateSyncChannel {
-		if peer := w.sw.Peers().Get(id); peer != nil {
-			if !peer.NodeInfo().(p2p.DefaultNodeInfo).HasChannel(statesync.SnapshotChannel) {
-				w.banPeer(peer, "no state-sync channel")
-				return
-			}
-		}
-	}
 	w.mu.Lock()
 	if _, ok := w.firstSeen[id]; !ok {
 		w.firstSeen[id] = time.Now()
@@ -155,29 +150,43 @@ func (w *peerWatch) onDisconnect(id p2p.ID) {
 	w.mu.Unlock()
 }
 
-// tick is the grace-expiry sweep. Iterates only peers we already
-// know about (firstSeen entries), not the full sw.Peers().List(),
-// since Connected events populate firstSeen for us.
+// tick sweeps firstSeen entries for two eviction reasons: peers that
+// don't advertise the snapshot channel, and peers that have been
+// connected past their grace window without offering anything useful.
+// Channel-filter eviction is deferred from onConnect to here so peers
+// have ≥1 tick to send a PexAddrs reply before we disconnect them.
 func (w *peerWatch) tick() {
 	if w.minHeight == 0 {
 		return
 	}
 	now := time.Now()
 	w.mu.Lock()
-	expired := make([]p2p.ID, 0)
+	type evict struct {
+		id     p2p.ID
+		reason string
+	}
+	pending := make([]evict, 0)
 	for id, first := range w.firstSeen {
 		if w.useful[id] {
 			continue
 		}
+		if w.requireStateSyncChannel {
+			if peer := w.sw.Peers().Get(id); peer != nil {
+				if !peer.NodeInfo().(p2p.DefaultNodeInfo).HasChannel(statesync.SnapshotChannel) {
+					pending = append(pending, evict{id, "no state-sync channel"})
+					continue
+				}
+			}
+		}
 		if now.Sub(first) < w.grace {
 			continue
 		}
-		expired = append(expired, id)
+		pending = append(pending, evict{id, "no useful offer in window"})
 	}
 	w.mu.Unlock()
-	for _, id := range expired {
-		if peer := w.sw.Peers().Get(id); peer != nil {
-			w.banPeer(peer, "no useful offer in window")
+	for _, e := range pending {
+		if peer := w.sw.Peers().Get(e.id); peer != nil {
+			w.banPeer(peer, e.reason)
 		}
 	}
 }

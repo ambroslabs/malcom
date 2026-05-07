@@ -28,10 +28,21 @@ type Banlist interface {
 	Has(addr string) bool
 }
 
-// AutoConfig holds the gossip-filter dependency.
+// Kicker is the optional dialer signal. Implemented by
+// *internal/connect.Manager. After every non-empty PEX gossip we call
+// Kick() so freshly-learned addrs get dialed before the next refresh
+// tick fires — without this, gossip-discovered peers wait up to
+// RefreshTick (5s) before they're reachable.
+type Kicker interface {
+	Kick()
+}
+
+// AutoConfig holds optional dependencies.
 type AutoConfig struct {
-	// Banlist is the optional cross-run banlist for filtering gossip.
+	// Banlist filters gossip before it lands in the addrbook.
 	Banlist Banlist
+	// Kicker, if non-nil, is signalled after each non-empty gossip.
+	Kicker Kicker
 }
 
 type AutoReactor struct {
@@ -121,5 +132,8 @@ func (r *AutoReactor) handleAddrs(src p2p.Peer, raw []tmp2p.NetAddress) {
 	if added > 0 || skippedBanned > 0 {
 		r.log.Debug("PEX: gossip processed",
 			"from", src.ID(), "added", added, "skipped_banned", skippedBanned, "book_size", r.book.Size())
+	}
+	if added > 0 && r.cfg.Kicker != nil {
+		r.cfg.Kicker.Kick()
 	}
 }
