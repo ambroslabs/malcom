@@ -117,36 +117,56 @@ func (w *peerWatch) markBannedByID(id p2p.ID, addr string, reason string) {
 	w.mu.Unlock()
 }
 
+// onConnect handles a Connected event. Applies the channel filter
+// immediately, otherwise records firstSeen.
+func (w *peerWatch) onConnect(id p2p.ID) {
+	if w.requireStateSyncChannel {
+		if peer := w.sw.Peers().Get(id); peer != nil {
+			if !peer.NodeInfo().(p2p.DefaultNodeInfo).HasChannel(statesync.SnapshotChannel) {
+				w.banPeer(peer, "no state-sync channel")
+				return
+			}
+		}
+	}
+	w.mu.Lock()
+	if _, ok := w.firstSeen[id]; !ok {
+		w.firstSeen[id] = time.Now()
+	}
+	w.mu.Unlock()
+}
+
+// onDisconnect handles a Removed event. Clears firstSeen so a
+// reconnect gets a fresh grace window.
+func (w *peerWatch) onDisconnect(id p2p.ID) {
+	w.mu.Lock()
+	delete(w.firstSeen, id)
+	w.mu.Unlock()
+}
+
+// tick is the grace-expiry sweep. Iterates only peers we already
+// know about (firstSeen entries), not the full sw.Peers().List(),
+// since Connected events populate firstSeen for us.
 func (w *peerWatch) tick() {
 	if w.minHeight == 0 {
 		return
 	}
 	now := time.Now()
-	for _, peer := range w.sw.Peers().List() {
-		// Channel filter: bans peers whose handshake NodeInfo doesn't
-		// advertise the snapshot channel (0x60). Catches relayers and
-		// blocksync-only nodes immediately rather than after grace.
-		if w.requireStateSyncChannel && !peer.NodeInfo().(p2p.DefaultNodeInfo).HasChannel(statesync.SnapshotChannel) {
-			w.banPeer(peer, "no state-sync channel")
-			continue
-		}
-		id := peer.ID()
-		w.mu.Lock()
-		if _, ok := w.firstSeen[id]; !ok {
-			w.firstSeen[id] = now
-			w.mu.Unlock()
-			continue
-		}
+	w.mu.Lock()
+	expired := make([]p2p.ID, 0)
+	for id, first := range w.firstSeen {
 		if w.useful[id] {
-			w.mu.Unlock()
 			continue
 		}
-		first := w.firstSeen[id]
-		w.mu.Unlock()
 		if now.Sub(first) < w.grace {
 			continue
 		}
-		w.banPeer(peer, "no useful offer in window")
+		expired = append(expired, id)
+	}
+	w.mu.Unlock()
+	for _, id := range expired {
+		if peer := w.sw.Peers().Get(id); peer != nil {
+			w.banPeer(peer, "no useful offer in window")
+		}
 	}
 }
 
@@ -166,11 +186,15 @@ func (w *peerWatch) run(ctx context.Context, evs <-chan statesync.Event) {
 			if !ok {
 				return
 			}
-			if ev.Snapshot == nil {
-				continue
-			}
-			if w.minHeight == 0 || ev.Snapshot.Height >= w.minHeight {
-				w.markUseful(p2p.ID(ev.PeerID))
+			switch {
+			case ev.Connected:
+				w.onConnect(p2p.ID(ev.PeerID))
+			case ev.Removed:
+				w.onDisconnect(p2p.ID(ev.PeerID))
+			case ev.Snapshot != nil:
+				if w.minHeight == 0 || ev.Snapshot.Height >= w.minHeight {
+					w.markUseful(p2p.ID(ev.PeerID))
+				}
 			}
 		}
 	}

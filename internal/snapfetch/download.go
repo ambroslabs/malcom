@@ -126,23 +126,18 @@ func download(ctx context.Context, sw *p2p.Switch, ssR *statesync.Reactor,
 		return ""
 	}
 
-	// scanForNewPeers walks sw.Peers() and registers any connected,
-	// not-yet-tracked peer in stats as provisional. This is how peers
-	// arriving via PEX (or the connect.Manager) get drawn into the
-	// scheduler without a heavyweight rescan. New peers are also
-	// Pinned with the manager so it redials them on disconnect.
-	scanForNewPeers := func() {
-		for _, p := range sw.Peers().List() {
-			pid := p.ID()
-			if _, ok := stats[pid]; ok {
-				continue
-			}
-			stats[pid] = &peerStat{provisional: true}
-			if mgr != nil {
-				mgr.Pin(pid, p.SocketAddr().String())
-			}
-			log.Debug("provisional peer added", "peer", string(pid))
+	// addProvisional registers a freshly-connected peer in stats as
+	// provisional and Pins it with the manager. Idempotent.
+	addProvisional := func(peer p2p.Peer) {
+		pid := peer.ID()
+		if _, ok := stats[pid]; ok {
+			return
 		}
+		stats[pid] = &peerStat{provisional: true}
+		if mgr != nil {
+			mgr.Pin(pid, peer.SocketAddr().String())
+		}
+		log.Debug("provisional peer added", "peer", string(pid))
 	}
 
 	dispatch := func() int {
@@ -184,9 +179,18 @@ func download(ctx context.Context, sw *p2p.Switch, ssR *statesync.Reactor,
 		}
 	}
 
+	// Initial scan: Connected events only flow forward, but peers may
+	// already be connected before we subscribed to the mux (the manager
+	// has been dialing since runfetch setup, walk consumed events its
+	// own subscription). Walk sw.Peers().List() once to seed stats for
+	// non-good already-connected peers.
+	for _, p := range sw.Peers().List() {
+		addProvisional(p)
+	}
+
 	log.Info("download starting",
 		"chunks", N, "good_peers", len(good),
-		"per_peer_inflight", perPeer)
+		"per_peer_inflight", perPeer, "tracked", len(stats))
 
 	dispatch()
 
@@ -248,7 +252,6 @@ func download(ctx context.Context, sw *p2p.Switch, ssR *statesync.Reactor,
 					st.banned = true
 				}
 			}
-			scanForNewPeers()
 			dispatch()
 
 			if now.Sub(lastProgress) >= progressEvery {
@@ -263,6 +266,31 @@ func download(ctx context.Context, sw *p2p.Switch, ssR *statesync.Reactor,
 			}
 
 		case ev := <-evs:
+			if ev.Connected {
+				peer := p2p.ID(ev.PeerID)
+				if p := sw.Peers().Get(peer); p != nil {
+					addProvisional(p)
+				}
+				dispatch()
+				continue
+			}
+			if ev.Removed {
+				peer := p2p.ID(ev.PeerID)
+				// Drop in-flight assignments for this peer so they
+				// get retried on the next dispatch. Manager handles
+				// redialing; we just clean up our state.
+				for idx, info := range inflight {
+					if info.peer == peer {
+						delete(inflight, idx)
+						pending[idx] = true
+					}
+				}
+				if st, ok := stats[peer]; ok {
+					st.inflight = 0
+				}
+				dispatch()
+				continue
+			}
 			if ev.Chunk == nil {
 				continue
 			}

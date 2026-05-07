@@ -48,11 +48,19 @@ type ChunkInfo struct {
 	Missing bool
 }
 
-// Event is the union surfaced via Out: either a snapshot offer or a chunk reply.
+// Event is the union surfaced via Out:
+//   - Snapshot != nil  → a SnapshotsResponse arrived
+//   - Chunk != nil     → a ChunkResponse arrived
+//   - Connected        → AddPeer fired (peer just connected)
+//   - Removed          → RemovePeer fired (peer just disconnected)
+//
+// Exactly one of these is set per event.
 type Event struct {
-	PeerID   string
-	Snapshot *Snapshot
-	Chunk    *ChunkInfo
+	PeerID    string
+	Snapshot  *Snapshot
+	Chunk     *ChunkInfo
+	Connected bool
+	Removed   bool
 }
 
 // Reactor probes peers for snapshots. AddPeer fires a SnapshotsRequest;
@@ -105,6 +113,14 @@ func (r *Reactor) GetChannels() []*conn.ChannelDescriptor {
 }
 
 func (r *Reactor) AddPeer(peer p2p.Peer) {
+	peerID := string(peer.ID())
+	// Publish a Connected event so consumers (download, peerWatch)
+	// can react without polling sw.Peers().List().
+	select {
+	case r.Out <- Event{PeerID: peerID, Connected: true}:
+	default:
+		r.logger.Error("connect Out channel full; dropping", "peer", peerID)
+	}
 	if !r.AskOnAdd {
 		return
 	}
@@ -116,6 +132,17 @@ func (r *Reactor) AddPeer(peer p2p.Peer) {
 		r.logger.Debug("SnapshotsRequest sent", "peer", peer.ID())
 	} else {
 		r.logger.Error("SnapshotsRequest send queue full", "peer", peer.ID())
+	}
+}
+
+// RemovePeer publishes a Removed event so consumers can clean up
+// per-peer state (drop in-flight assignments, drop firstSeen, etc.).
+func (r *Reactor) RemovePeer(peer p2p.Peer, reason interface{}) {
+	peerID := string(peer.ID())
+	select {
+	case r.Out <- Event{PeerID: peerID, Removed: true}:
+	default:
+		r.logger.Error("disconnect Out channel full; dropping", "peer", peerID)
 	}
 }
 
