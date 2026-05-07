@@ -6,6 +6,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"fmt"
+	"os"
 	"path/filepath"
 	"sync/atomic"
 	"time"
@@ -213,10 +214,47 @@ func (s *chunkScheduler) init(good []p2p.ID) {
 	for _, p := range s.sw.Peers().List() {
 		s.addProvisional(p)
 	}
+	resumed, removed := s.resumeFromDisk()
 	s.log.Info("download starting",
 		"chunks", s.target.Chunks, "good_peers", len(good),
-		"per_peer_inflight", s.perPeer, "tracked", len(s.stats))
+		"per_peer_inflight", s.perPeer, "tracked", len(s.stats),
+		"resumed", resumed, "removed_stale", removed)
 	s.dispatch()
+}
+
+// resumeFromDisk scans snapDir for chunk_<idx>.bin files left over by
+// a prior partial fetch. Each file is SHA256-verified against the
+// chosen offer's chunk_hashes — matches are pre-marked completed so
+// the dispatcher skips them; mismatches are removed so they get
+// re-fetched. Returns (resumed, removed) for logging.
+//
+// Reuses the same verification logic as onChunk; the only difference
+// is the bytes are read from disk instead of arriving in a
+// ChunkResponse. Called from init() before the first dispatch.
+func (s *chunkScheduler) resumeFromDisk() (resumed, removed int) {
+	for i := uint32(0); i < s.target.Chunks; i++ {
+		path := filepath.Join(s.snapDir, fmt.Sprintf("chunk_%05d.bin", i))
+		data, err := os.ReadFile(path)
+		if err != nil {
+			continue
+		}
+		h := sha256.Sum256(data)
+		if bytes.Equal(h[:], s.chunkHashes[i]) {
+			s.completed[i] = true
+			s.pending[i] = false
+			s.bytesTotal.Add(uint64(len(data)))
+			s.doneCount++
+			resumed++
+			continue
+		}
+		if rmErr := os.Remove(path); rmErr != nil {
+			s.log.Error("resume: remove stale chunk",
+				"idx", i, "err", rmErr)
+			continue
+		}
+		removed++
+	}
+	return
 }
 
 // run is the main event loop. Returns when all chunks are received

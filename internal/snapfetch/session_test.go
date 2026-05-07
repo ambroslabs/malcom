@@ -5,6 +5,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"syscall"
 	"testing"
 
 	cmtlog "github.com/cometbft/cometbft/libs/log"
@@ -100,4 +101,79 @@ func TestPrepareSnapshotDirAtomicMetadata(t *testing.T) {
 	if _, err := os.Stat(filepath.Join(dir, "metadata.bin.tmp")); !os.IsNotExist(err) {
 		t.Fatalf("metadata.bin.tmp leaked: stat err = %v", err)
 	}
+}
+
+// TestPrepareSnapshotDirReusesMatchingMetadata ensures we don't
+// gratuitously rewrite metadata.bin when a prior partial fetch already
+// left an identical file in place. We detect "did not rewrite" via
+// inode equality, which writeFileAtomic's tmp+rename would change.
+func TestPrepareSnapshotDirReusesMatchingMetadata(t *testing.T) {
+	root := t.TempDir()
+	s := &fetchSession{log: cmtlog.NewNopLogger(), cfg: Config{ChainID: "testchain"}}
+
+	metadata := []byte{0x0A, 0x04, 0x01, 0x02, 0x03, 0x04}
+	offer := &snapshotOffer{
+		Height: 42, Format: 1, Chunks: 1,
+		Hash: []byte("h"), Metadata: metadata, Peers: map[string]bool{},
+	}
+
+	// First call: writes metadata.bin from scratch.
+	dir, _, err := s.prepareSnapshotDir(root, offer)
+	if err != nil {
+		t.Fatalf("first prepareSnapshotDir: %v", err)
+	}
+	mdPath := filepath.Join(dir, "metadata.bin")
+	beforeStat, err := os.Stat(mdPath)
+	if err != nil {
+		t.Fatalf("stat metadata.bin: %v", err)
+	}
+	beforeIno := statIno(t, beforeStat)
+
+	// Second call with same offer must reuse the file (no rename, so
+	// inode is preserved).
+	if _, _, err := s.prepareSnapshotDir(root, offer); err != nil {
+		t.Fatalf("second prepareSnapshotDir: %v", err)
+	}
+	afterStat, err := os.Stat(mdPath)
+	if err != nil {
+		t.Fatalf("stat metadata.bin after reuse: %v", err)
+	}
+	if statIno(t, afterStat) != beforeIno {
+		t.Fatalf("metadata.bin inode changed (%d → %d) — reuse path rewrote a matching file",
+			beforeIno, statIno(t, afterStat))
+	}
+
+	// Third call with a different offer must rewrite (new inode).
+	mismatched := &snapshotOffer{
+		Height: 42, Format: 1, Chunks: 1,
+		Hash:     []byte("h"),
+		Metadata: []byte{0x0A, 0x04, 0xAA, 0xBB, 0xCC, 0xDD},
+		Peers:    map[string]bool{},
+	}
+	if _, _, err := s.prepareSnapshotDir(root, mismatched); err != nil {
+		t.Fatalf("third prepareSnapshotDir: %v", err)
+	}
+	rewrittenStat, err := os.Stat(mdPath)
+	if err != nil {
+		t.Fatalf("stat metadata.bin after rewrite: %v", err)
+	}
+	if statIno(t, rewrittenStat) == beforeIno {
+		t.Fatalf("metadata.bin inode unchanged on mismatch — content was not rewritten")
+	}
+	got, err := os.ReadFile(mdPath)
+	if err != nil {
+		t.Fatalf("read metadata.bin: %v", err)
+	}
+	if string(got) != string(mismatched.Metadata) {
+		t.Fatalf("metadata.bin content not updated on mismatch")
+	}
+}
+
+func statIno(t *testing.T, fi os.FileInfo) uint64 {
+	t.Helper()
+	st, ok := fi.Sys().(*syscall.Stat_t)
+	if !ok {
+		t.Skip("inode comparison unavailable on this platform")
+	}
+	return st.Ino
 }

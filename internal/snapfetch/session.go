@@ -1,6 +1,7 @@
 package snapfetch
 
 import (
+	"bytes"
 	"context"
 	"encoding/hex"
 	"fmt"
@@ -285,8 +286,16 @@ func (s *fetchSession) prepareSnapshotDir(outRoot string, offer *snapshotOffer) 
 	if err := fsyncDir(outRoot); err != nil {
 		return "", nil, fmt.Errorf("fsync outRoot: %w", err)
 	}
-	if err := writeFileAtomic(filepath.Join(snapDir, "metadata.bin"), offer.Metadata, 0o644); err != nil {
-		return "", nil, fmt.Errorf("write metadata.bin: %w", err)
+	// Reuse a matching metadata.bin from a prior partial fetch: if the
+	// on-disk content already equals offer.Metadata byte-for-byte, the
+	// rewrite would be a no-op (and would needlessly rotate the file's
+	// mtime and inode). A mismatch — or a missing file — falls back to
+	// the atomic rewrite path.
+	mdPath := filepath.Join(snapDir, "metadata.bin")
+	if existing, err := os.ReadFile(mdPath); err != nil || !bytes.Equal(existing, offer.Metadata) {
+		if err := writeFileAtomic(mdPath, offer.Metadata, 0o644); err != nil {
+			return "", nil, fmt.Errorf("write metadata.bin: %w", err)
+		}
 	}
 	return snapDir, chunkHashes, nil
 }
