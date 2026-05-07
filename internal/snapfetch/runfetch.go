@@ -16,6 +16,7 @@ import (
 	pexcb "github.com/cometbft/cometbft/p2p/pex"
 	"github.com/cometbft/cometbft/version"
 
+	"github.com/zrbecker/cosmos-p2p/internal/helpers/nodekey"
 	"github.com/zrbecker/cosmos-p2p/internal/peers/dead"
 	localpex "github.com/zrbecker/cosmos-p2p/internal/pex"
 	"github.com/zrbecker/cosmos-p2p/internal/statesync"
@@ -33,12 +34,7 @@ func RunFetch(ctx context.Context, c Config, outRoot string) error {
 	c.applyDefaults()
 	logger := c.Logger
 
-	if c.NodeKeyPath != "" {
-		if err := os.MkdirAll(filepath.Dir(c.NodeKeyPath), 0o700); err != nil {
-			return fmt.Errorf("mkdir node-key dir: %w", err)
-		}
-	}
-	nodeKey, err := p2p.LoadOrGenNodeKey(c.NodeKeyPath)
+	nodeKey, err := nodekey.LoadOrGen(c.NodeKeyPath)
 	if err != nil {
 		return fmt.Errorf("node key: %w", err)
 	}

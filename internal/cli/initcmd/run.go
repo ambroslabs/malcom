@@ -28,9 +28,8 @@ import (
 	"os"
 	"path/filepath"
 
-	"github.com/cometbft/cometbft/p2p"
-
 	"github.com/zrbecker/cosmos-p2p/internal/config"
+	"github.com/zrbecker/cosmos-p2p/internal/helpers/nodekey"
 	"github.com/zrbecker/cosmos-p2p/internal/registry"
 )
 
@@ -148,7 +147,7 @@ func Run(args []string) int {
 		if _, err := os.Stat(nodeKeyPath); err == nil {
 			fmt.Printf("[init] %s: node key exists at %s — keeping\n", chain, nodeKeyPath)
 		} else {
-			if _, err := p2p.LoadOrGenNodeKey(nodeKeyPath); err != nil {
+			if _, err := nodekey.LoadOrGen(nodeKeyPath); err != nil {
 				fmt.Fprintf(os.Stderr, "%s: generate node key: %v\n", chain, err)
 				rc = 1
 			} else {
