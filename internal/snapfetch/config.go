@@ -15,7 +15,8 @@ type Config struct {
 	NodeKeyPath       string
 	Listen            string // default "tcp://0.0.0.0:0"
 	Moniker           string // default "cosmos-p2p-snapfetch"
-	AddrBook          string // path to cometbft PEX-managed addrbook
+	AddrBook          string // path to cometbft PEX-managed addrbook (required)
+	DeadPeers         string // path to cross-run dead-peer set (required)
 	BootstrapPeers []string
 
 	DiscoverFor       time.Duration // default 25s

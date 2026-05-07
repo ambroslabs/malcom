@@ -146,6 +146,7 @@ func Run(args []string) int {
 		Listen:            ch.Fetch.Listen,
 		Moniker:           ch.Fetch.Moniker,
 		AddrBook:          ch.AddrBook,
+		DeadPeers:         ch.DeadPeers,
 		BootstrapPeers:    ch.Fetch.BootstrapPeers,
 		DiscoverFor:       ch.Fetch.Discover.Duration(),
 		DialParallel:      ch.Fetch.DialParallel,

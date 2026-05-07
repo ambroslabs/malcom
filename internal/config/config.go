@@ -45,8 +45,9 @@ type Chain struct {
 	RPCs    []string `toml:"rpcs"`
 
 	// Small persistent state. Blank = use XDG-derived default.
-	NodeKey  string `toml:"node_key"`
-	AddrBook string `toml:"addrbook"`
+	NodeKey   string `toml:"node_key"`
+	AddrBook  string `toml:"addrbook"`
+	DeadPeers string `toml:"deadpeers"`
 
 	Fetch     FetchTuning     `toml:"fetch"`
 	Import    ImportTuning    `toml:"import"`
@@ -278,11 +279,18 @@ func fillXDGDefaults(ch *Chain) error {
 		ch.NodeKey = filepath.Join(d, ch.ChainID, "node_key.json")
 	}
 	if ch.AddrBook == "" {
-		d, err := CacheDir()
+		d, err := StateDir()
 		if err != nil {
 			return err
 		}
 		ch.AddrBook = filepath.Join(d, ch.ChainID, "addrbook.json")
+	}
+	if ch.DeadPeers == "" {
+		d, err := StateDir()
+		if err != nil {
+			return err
+		}
+		ch.DeadPeers = filepath.Join(d, ch.ChainID, "deadpeers.json")
 	}
 	return nil
 }

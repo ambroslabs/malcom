@@ -88,27 +88,31 @@ func RunFetch(ctx context.Context, c Config, outRoot string) error {
 	// AddrBook holds peer addresses learned via PEX (and seeded with
 	// our bootstrap_peers list at startup). cometbft's implementation —
 	// JSON-persistent, bucket-balanced, freshness-tracked.
-	bookPath := c.AddrBook
-	if bookPath == "" {
-		bookPath = filepath.Join(filepath.Dir(c.NodeKeyPath), "addrbook.json")
+	if c.AddrBook == "" {
+		return fmt.Errorf("AddrBook path is empty")
 	}
-	if err := os.MkdirAll(filepath.Dir(bookPath), 0o755); err != nil {
+	if err := os.MkdirAll(filepath.Dir(c.AddrBook), 0o755); err != nil {
 		return fmt.Errorf("mkdir addrbook dir: %w", err)
 	}
-	book := pexcb.NewAddrBook(bookPath, false /* routabilityStrict */)
+	book := pexcb.NewAddrBook(c.AddrBook, false /* routabilityStrict */)
 	book.SetLogger(log.With("module", "addrbook"))
 
 	// Dead-peer set: persistent cross-run tombstone for addresses that
-	// repeatedly fail to dial. Lives next to addrbook.json. Without
-	// this, PEX gossip would re-introduce known-dead peers on every
-	// run, costing a fresh MaxDialFailures cycle per stale gossip.
-	deadPath := filepath.Join(filepath.Dir(bookPath), "deadpeers.json")
-	deadSet := dead.New(deadPath)
-	if err := deadSet.Load(); err != nil {
-		log.Error("load dead-peers failed", "path", deadPath, "err", err)
+	// repeatedly fail to dial. Without this, PEX gossip would
+	// re-introduce known-dead peers on every run, costing a fresh
+	// MaxDialFailures cycle per stale gossip.
+	if c.DeadPeers == "" {
+		return fmt.Errorf("DeadPeers path is empty")
 	}
-	log.Info("addrbook loaded", "path", bookPath, "size", addrbookCount)
-	log.Info("dead-peers loaded", "path", deadPath, "size", deadSet.Len())
+	if err := os.MkdirAll(filepath.Dir(c.DeadPeers), 0o755); err != nil {
+		return fmt.Errorf("mkdir dead-peers dir: %w", err)
+	}
+	deadSet := dead.New(c.DeadPeers)
+	if err := deadSet.Load(); err != nil {
+		log.Error("load dead-peers failed", "path", c.DeadPeers, "err", err)
+	}
+	log.Info("addrbook loaded", "path", c.AddrBook, "size", addrbookCount)
+	log.Info("dead-peers loaded", "path", c.DeadPeers, "size", deadSet.Len())
 
 	// PEX reactor: sends PexRequest on every AddPeer, writes received
 	// PexAddrs to the book, and runs a dial loop that grows the
@@ -163,7 +167,7 @@ func RunFetch(ctx context.Context, c Config, outRoot string) error {
 			added++
 		}
 	}
-	log.Info("addrbook ready", "path", bookPath, "added", added, "skipped_dead", skippedDead)
+	log.Info("addrbook ready", "path", c.AddrBook, "added", added, "skipped_dead", skippedDead)
 
 	if err := sw.Start(); err != nil {
 		return fmt.Errorf("switch.Start: %w", err)
@@ -181,10 +185,10 @@ func RunFetch(ctx context.Context, c Config, outRoot string) error {
 	defer book.Save()
 	defer func() {
 		if err := deadSet.Save(); err != nil {
-			log.Error("save dead-peers failed", "path", deadPath, "err", err)
+			log.Error("save dead-peers failed", "path", c.DeadPeers, "err", err)
 			return
 		}
-		log.Info("dead-peers saved", "path", deadPath, "size", deadSet.Len())
+		log.Info("dead-peers saved", "path", c.DeadPeers, "size", deadSet.Len())
 	}()
 
 	mux := newEventMux(ctx, ssR.Out)

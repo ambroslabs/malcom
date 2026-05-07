@@ -7,8 +7,9 @@
 //	$XDG_CONFIG_HOME/malcom/config.toml          shared defaults
 //	$XDG_CONFIG_HOME/malcom/chains/<id>.toml     per-chain identity (per supported chain)
 //	$XDG_STATE_HOME/malcom/<id>/node_key.json    cometbft p2p ed25519 identity
-//	$XDG_STATE_HOME/malcom/<id>/                 state dir
-//	$XDG_CACHE_HOME/malcom/<id>/                 peer DB + addrbook cache
+//	$XDG_STATE_HOME/malcom/<id>/addrbook.json    PEX-managed peer database (built up across runs)
+//	$XDG_STATE_HOME/malcom/<id>/deadpeers.json   cross-run dead-peer tombstones
+//	$XDG_CACHE_HOME/malcom/<id>/                 ephemeral cache (block snapshots, etc.)
 //	$XDG_DATA_HOME/malcom/<id>/                  data dir (genesis lands here lazily)
 //
 // Unless -offline is passed, init populates each chain's RPC and peer
