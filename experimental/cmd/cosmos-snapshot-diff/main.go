@@ -48,7 +48,7 @@ func main() {
 }
 
 func usage() {
-	fmt.Fprintln(os.Stderr, `cosmos-snapshot-diff — diff two snapshots.
+	fmt.Fprint(os.Stderr, `cosmos-snapshot-diff — diff two snapshots.
 
 Usage:
   cosmos-snapshot-diff leaves     -base <dir> -target <dir> -o <out.diff>

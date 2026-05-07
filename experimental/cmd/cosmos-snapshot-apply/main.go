@@ -42,7 +42,7 @@ func main() {
 }
 
 func usage() {
-	fmt.Fprintln(os.Stderr, `cosmos-snapshot-apply — apply a diff to a base snapshot, or verify two snapshots.
+	fmt.Fprint(os.Stderr, `cosmos-snapshot-apply — apply a diff to a base snapshot, or verify two snapshots.
 
 Usage:
   cosmos-snapshot-apply apply      -base <dir> -diff <file> -out <dir>      (CSDF leaf-only diff)

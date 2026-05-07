@@ -1,7 +1,6 @@
 package connect
 
 import (
-	"context"
 	"net"
 	"sync"
 	"testing"
@@ -99,10 +98,9 @@ func (s *fakePeerSet) Size() int {
 type fakeSwitch struct {
 	peerSet *fakePeerSet
 
-	mu       sync.Mutex
-	dials    []*p2p.NetAddress
-	dialErr  error // returned by DialPeerWithAddress
-	dialing  bool  // returned by IsDialingOrExistingAddress
+	mu      sync.Mutex
+	dials   []*p2p.NetAddress
+	dialErr error // returned by DialPeerWithAddress
 }
 
 func newFakeSwitch() *fakeSwitch {
@@ -114,9 +112,7 @@ func (s *fakeSwitch) NumPeers() (int, int, int) {
 	return s.peerSet.Size(), 0, 0
 }
 func (s *fakeSwitch) IsDialingOrExistingAddress(*p2p.NetAddress) bool {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	return s.dialing
+	return false
 }
 func (s *fakeSwitch) DialPeerWithAddress(addr *p2p.NetAddress) error {
 	s.mu.Lock()
@@ -291,8 +287,9 @@ func TestManagerPinnedConnectedPeerSkipped(t *testing.T) {
 	})
 	m.Pin(pid, string(pid)+"@1.2.3.4:26656")
 
+	// The connected-peer skip in tick() runs before any dial goroutine
+	// is spawned, so dialCount is authoritative the moment tick returns.
 	m.tick()
-	time.Sleep(20 * time.Millisecond)
 
 	if sw.dialCount() != 0 {
 		t.Fatalf("connected peer was dialed; want skip")
@@ -312,12 +309,14 @@ func TestManagerMaxRedialsAutoBans(t *testing.T) {
 		Banlist:     bans,
 		WarmTarget:  0,
 		MaxRedials:  2,
-		Backoff:     1 * time.Microsecond, // backoff effectively absent
 		BanDuration: time.Hour,
 	})
 	m.Pin(pid, addr)
 
-	// Force backoff state to indicate we've hit MaxRedials.
+	// Bypass the natural disconnect counter to pin the threshold check
+	// directly. Driving disconnects up via repeated ticks would also work
+	// but couples the test to backoff-timer behavior we don't care about
+	// here.
 	m.mu.Lock()
 	m.backoffs[pid] = &peerBackoff{disconnects: 2}
 	m.mu.Unlock()
@@ -389,8 +388,9 @@ func TestManagerBanSkipsPeerInPool(t *testing.T) {
 	})
 	m.Ban(pid, "test")
 
+	// dialFromPool decides whether to spawn a dial goroutine synchronously,
+	// so dialCount is authoritative the moment tick returns.
 	m.tick()
-	time.Sleep(20 * time.Millisecond)
 
 	if sw.dialCount() != 0 {
 		t.Fatalf("banned peer was dialed from pool")
@@ -435,6 +435,3 @@ func TestManagerDialFailureBansAtMaxDialFailures(t *testing.T) {
 type dialError struct{}
 
 func (*dialError) Error() string { return "dial fail" }
-
-// silence unused-import warning during incremental development.
-var _ = context.Background
