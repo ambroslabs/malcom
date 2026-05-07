@@ -8,7 +8,7 @@ import (
 
 	cmtlog "github.com/cometbft/cometbft/libs/log"
 
-	"github.com/zrbecker/cosmos-p2p/internal/peers"
+	"github.com/zrbecker/cosmos-p2p/internal/addrbook"
 )
 
 func bytesEq(a, b []byte) bool {
@@ -57,7 +57,7 @@ func loadAddrBookSeeds(addrBookPath string, logger cmtlog.Logger) []peerSeed {
 	if addrBookPath == "" {
 		return nil
 	}
-	items, err := peers.Load(addrBookPath)
+	items, err := addrbook.Load(addrBookPath)
 	if err != nil {
 		logger.Error("load addrbook failed", "err", err)
 		return nil

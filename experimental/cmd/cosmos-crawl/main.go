@@ -26,7 +26,7 @@ import (
 
 	"github.com/zrbecker/cosmos-p2p/internal/blocksync"
 	"github.com/zrbecker/cosmos-p2p/internal/crawler"
-	"github.com/zrbecker/cosmos-p2p/internal/peers"
+	"github.com/zrbecker/cosmos-p2p/internal/addrbook"
 	"github.com/zrbecker/cosmos-p2p/internal/pex"
 )
 
@@ -67,15 +67,15 @@ func main() {
 		log.Fatalf("node key: %v", err)
 	}
 
-	items, err := peers.Load(*addrBookPath)
+	items, err := addrbook.Load(*addrBookPath)
 	if err != nil {
 		log.Fatalf("load addrbook: %v", err)
 	}
 	var seedAddrs []string
 	if *useAll {
-		seedAddrs = peers.All(items)
+		seedAddrs = addrbook.All(items)
 	} else {
-		seedAddrs = peers.FreshTop(items, *seedCount)
+		seedAddrs = addrbook.FreshTop(items, *seedCount)
 	}
 	// Always prepend the chain-registry seed list — most cosmoshub full
 	// nodes run with `pex = false`, but seed-mode nodes will hand us address

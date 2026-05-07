@@ -1,6 +1,28 @@
-// Package peers loads and ranks peer addresses from a CometBFT-style
-// addrbook.json (e.g. the snapshot Polkachu publishes for cosmoshub).
-package peers
+// Package addrbook reads cometbft's addrbook.json file format and
+// returns a sorted list of seed addresses for the initial dial pool.
+//
+// This package is a READ-ONLY parser, not a runtime address book. The
+// live address book — bucket management, TTL'd bans, on-disk
+// persistence — is owned by cometbft's p2p/pex.AddrBook (imported as
+// pexcb in our code). We hand-roll a parallel reader of the same JSON
+// file because pexcb's public API exposes neither:
+//
+//	(a) enumerate-all-entries (GetSelection caps at ~250 random entries), nor
+//	(b) sort-by-LastSuccess (GetSelection randomizes via Fisher-Yates).
+//
+// cometbft's Fisher-Yates sampling is the right choice for validator
+// nodes: it spreads each node's connections evenly across the known
+// network so no peer-set is disproportionately relied on, which is
+// what a decentralized chain needs for resilience and eclipse
+// resistance. Our goal is the opposite. We are a short-lived snapshot
+// fetcher with one objective — maximize the probability of connecting
+// to a working peer right now. We don't care about network-wide
+// diversity; we just want the historically-good peers first. So we
+// read the file directly and prioritize by LastSuccess.
+//
+// All WRITES to addrbook.json go through pexcb.AddrBook.Save() — never
+// this package.
+package addrbook
 
 import (
 	"encoding/json"
@@ -45,9 +67,14 @@ func (i AddrBookItem) IsIPv6() bool {
 	return ip != nil && ip.To4() == nil
 }
 
-// Load reads a Polkachu-style addrbook.json and returns all syntactically
-// valid entries (both IPv4 and IPv6), sorted by LastSuccess descending so
-// the most-recently-reachable peers come first.
+// Load is a one-shot read of a cometbft addrbook.json from disk. It
+// does not retain a file handle, manage state, or write back. The
+// returned entries are syntactically valid (IPv4 and IPv6) and sorted
+// by LastSuccess descending — most-recently-reachable first.
+//
+// To modify the address book at runtime, use pexcb.AddrBook
+// (constructed with pexcb.NewAddrBook). This function is for boot-time
+// enumeration only.
 func Load(path string) ([]AddrBookItem, error) {
 	f, err := os.Open(path)
 	if err != nil {

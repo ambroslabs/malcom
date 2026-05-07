@@ -33,7 +33,7 @@ import (
 	"github.com/cometbft/cometbft/version"
 
 	"github.com/zrbecker/cosmos-p2p/internal/crawler"
-	"github.com/zrbecker/cosmos-p2p/internal/peers"
+	"github.com/zrbecker/cosmos-p2p/internal/addrbook"
 	"github.com/zrbecker/cosmos-p2p/internal/statesync"
 )
 
@@ -405,7 +405,7 @@ func loadSeeds(cumPath, addrBookPath string, logger cmtlog.Logger) []peerSeed {
 
 	if len(out) == 0 {
 		// Fallback to the static addrbook.
-		items, err := peers.Load(addrBookPath)
+		items, err := addrbook.Load(addrBookPath)
 		if err != nil {
 			logger.Error("load addrbook fallback failed", "path", addrBookPath, "err", err)
 			return nil

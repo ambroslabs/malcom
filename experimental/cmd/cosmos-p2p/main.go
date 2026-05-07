@@ -32,7 +32,7 @@ import (
 	"github.com/cosmos/gogoproto/proto"
 
 	"github.com/zrbecker/cosmos-p2p/internal/blocksync"
-	"github.com/zrbecker/cosmos-p2p/internal/peers"
+	"github.com/zrbecker/cosmos-p2p/internal/addrbook"
 )
 
 func main() {
@@ -278,11 +278,11 @@ func pickCandidates(explicit, path string, max int) ([]string, error) {
 	if explicit != "" {
 		return []string{explicit}, nil
 	}
-	items, err := peers.Load(path)
+	items, err := addrbook.Load(path)
 	if err != nil {
 		return nil, fmt.Errorf("load addrbook %s: %w", path, err)
 	}
-	return peers.FreshTop(items, max), nil
+	return addrbook.FreshTop(items, max), nil
 }
 
 func dial(sw *p2p.Switch, logger cmtlog.Logger, candidates []string) string {
