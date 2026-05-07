@@ -59,7 +59,7 @@ func InspectAndEnrich(dir string, logger cmtlog.Logger) error {
 		return err
 	}
 	if err := writeFileAtomic(mp, append(enriched, '\n'), 0o644); err != nil {
-		return err
+		return fmt.Errorf("write meta.json: %w", err)
 	}
 	if err := fsyncDir(dir); err != nil {
 		return fmt.Errorf("fsync snapshot dir: %w", err)

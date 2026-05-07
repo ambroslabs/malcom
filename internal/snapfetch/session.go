@@ -274,6 +274,11 @@ func (s *fetchSession) prepareSnapshotDir(outRoot string, offer *snapshotOffer) 
 	if err := os.MkdirAll(snapDir, 0o755); err != nil {
 		return "", nil, fmt.Errorf("mkdir snapshot dir: %w", err)
 	}
+	// Make outRoot's directory entry for snapDir durable, so post-reboot
+	// `ls outRoot` agrees with the durable contents inside snapDir.
+	if err := fsyncDir(outRoot); err != nil {
+		return "", nil, fmt.Errorf("fsync outRoot: %w", err)
+	}
 	if err := writeFileAtomic(filepath.Join(snapDir, "metadata.bin"), offer.Metadata, 0o644); err != nil {
 		return "", nil, fmt.Errorf("write metadata.bin: %w", err)
 	}
