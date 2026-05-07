@@ -130,6 +130,10 @@ type Manager struct {
 	pool     []addrbook.PeerAddr     // shuffled at New()
 	cursor   int
 
+	// kickCh signals an immediate tick. Buffered=1 so multiple kicks
+	// in quick succession coalesce into one extra tick.
+	kickCh chan struct{}
+
 	cancel context.CancelFunc
 }
 
@@ -155,10 +159,22 @@ func New(ctx context.Context, c Config) *Manager {
 		banned:   map[p2p.ID]bool{},
 		dialFail: map[string]int{},
 		pool:     pool,
+		kickCh:   make(chan struct{}, 1),
 		cancel:   cancel,
 	}
 	go m.loop(loopCtx)
 	return m
+}
+
+// Kick signals the dial loop to fire a tick immediately, without
+// waiting for the next RefreshTick. Used after a PEX gossip lands so
+// freshly-learned peer addrs get dialed before they go stale.
+// Non-blocking and idempotent — multiple Kicks coalesce into one.
+func (m *Manager) Kick() {
+	select {
+	case m.kickCh <- struct{}{}:
+	default:
+	}
 }
 
 // buildPool copies in and shuffles only the addrbook-sourced suffix.
@@ -227,6 +243,10 @@ func (m *Manager) IsBanned(pid p2p.ID) bool {
 }
 
 func (m *Manager) loop(ctx context.Context) {
+	// Fire an immediate tick so the first dial wave goes out at t≈0
+	// instead of t+RefreshTick. Without this, the walk's warmup ends
+	// before the manager has even tried dialing.
+	m.tick()
 	t := time.NewTicker(m.cfg.RefreshTick)
 	defer t.Stop()
 	for {
@@ -234,6 +254,8 @@ func (m *Manager) loop(ctx context.Context) {
 		case <-ctx.Done():
 			return
 		case <-t.C:
+			m.tick()
+		case <-m.kickCh:
 			m.tick()
 		}
 	}
