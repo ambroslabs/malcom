@@ -25,13 +25,16 @@ func TestNewMissingFileIsFine(t *testing.T) {
 }
 
 func TestAddSaveLoadRoundtrip(t *testing.T) {
-	path := filepath.Join(t.TempDir(), "banlist.json")
+	// Path includes a missing parent dir to also exercise Save's MkdirAll.
+	path := filepath.Join(t.TempDir(), "sub", "deep", "banlist.json")
 	s, err := New(path)
 	if err != nil {
 		t.Fatalf("New: %v", err)
 	}
-	s.Add("a@1.1.1.1:26656", "test")
+	s.Add("a@1.1.1.1:26656", "first")
+	s.Add("a@1.1.1.1:26656", "second")
 	s.Add("b@2.2.2.2:26656", "test")
+	want := s.entries["a@1.1.1.1:26656"]
 	if err := s.Save(); err != nil {
 		t.Fatalf("Save: %v", err)
 	}
@@ -40,11 +43,27 @@ func TestAddSaveLoadRoundtrip(t *testing.T) {
 	if err != nil {
 		t.Fatalf("reload New: %v", err)
 	}
-	if !s2.Has("a@1.1.1.1:26656") || !s2.Has("b@2.2.2.2:26656") {
-		t.Fatalf("entries missing after reload")
-	}
 	if s2.Len() != 2 {
 		t.Fatalf("Len=%d after reload, want 2", s2.Len())
+	}
+	if !s2.Has("b@2.2.2.2:26656") {
+		t.Fatalf("entry b missing after reload")
+	}
+	got, ok := s2.entries["a@1.1.1.1:26656"]
+	if !ok {
+		t.Fatalf("entry a missing after reload")
+	}
+	if got.FailCount != want.FailCount {
+		t.Fatalf("FailCount=%d after reload, want %d", got.FailCount, want.FailCount)
+	}
+	if got.Reason != want.Reason {
+		t.Fatalf("Reason=%q after reload, want %q", got.Reason, want.Reason)
+	}
+	if !got.FirstSeenAt.Equal(want.FirstSeenAt) {
+		t.Fatalf("FirstSeenAt=%v after reload, want %v", got.FirstSeenAt, want.FirstSeenAt)
+	}
+	if !got.LastSeenAt.Equal(want.LastSeenAt) {
+		t.Fatalf("LastSeenAt=%v after reload, want %v", got.LastSeenAt, want.LastSeenAt)
 	}
 }
 
@@ -81,31 +100,20 @@ func TestRemoveIdempotent(t *testing.T) {
 func TestLoadPrunesAgedEntries(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "b.json")
 	s, _ := New(path)
-	s.maxAge = 100 * time.Millisecond
 	s.Add("fresh@1.1.1.1:26656", "")
-	// Manually inject an old entry.
+	// Manually inject an old entry past the default MaxAge.
 	s.entries["old@2.2.2.2:26656"] = Entry{
 		Addr:        "old@2.2.2.2:26656",
-		FirstSeenAt: time.Now().Add(-time.Hour),
-		LastSeenAt:  time.Now().Add(-time.Hour),
+		FirstSeenAt: time.Now().Add(-2 * DefaultMaxAge),
+		LastSeenAt:  time.Now().Add(-2 * DefaultMaxAge),
 	}
 	if err := s.Save(); err != nil {
 		t.Fatalf("Save: %v", err)
 	}
 
-	s2, _ := New(path)
-	s2.maxAge = 100 * time.Millisecond
-	if err := s2.load(); err != nil {
+	s2, err := New(path)
+	if err != nil {
 		t.Fatalf("reload: %v", err)
-	}
-	// reload via New already happened; we re-loaded with a tighter maxAge.
-	// `New` already called load with the default maxAge; calling load
-	// again with the tighter bound should drop the old entry on the
-	// next load, but our load is additive. Simulate by clearing entries
-	// and reloading.
-	s2.entries = map[string]Entry{}
-	if err := s2.load(); err != nil {
-		t.Fatalf("load: %v", err)
 	}
 	if s2.Has("old@2.2.2.2:26656") {
 		t.Fatalf("aged entry not pruned")

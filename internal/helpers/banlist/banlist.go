@@ -80,13 +80,14 @@ func New(path string) (*Set, error) {
 	return s, nil
 }
 
-// load reads path into memory, dropping entries older than MaxAge and
-// enforcing Cap. Returns nil (and leaves the set empty) if the file
-// does not exist.
+// load replaces the in-memory set with the contents of path, dropping
+// entries older than MaxAge and enforcing Cap. Returns nil (and leaves
+// the set empty) if the file does not exist.
 func (s *Set) load() error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
+	s.entries = map[string]Entry{}
 	b, err := os.ReadFile(s.path)
 	if err != nil {
 		if os.IsNotExist(err) {
