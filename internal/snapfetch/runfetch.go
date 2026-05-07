@@ -7,6 +7,8 @@ import (
 
 	cfg "github.com/cometbft/cometbft/config"
 	"github.com/cometbft/cometbft/p2p/conn"
+
+	"github.com/zrbecker/cosmos-p2p/internal/logctx"
 )
 
 // RunFetch is the library entry point. It builds a p2p.Switch, walks
@@ -19,6 +21,7 @@ import (
 // without .complete, so the user can safely inspect / remove the
 // partial output before re-running fetch.
 func RunFetch(ctx context.Context, c Config, outRoot string) error {
+	ctx = logctx.WithFields(ctx, "module", "fetch")
 	s, cleanup, err := newFetchSession(ctx, c)
 	if err != nil {
 		return err

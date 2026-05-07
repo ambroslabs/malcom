@@ -52,7 +52,6 @@ type fetchSession struct {
 // runs the same shutdown sequence as a successful run.
 func newFetchSession(ctx context.Context, c Config) (*fetchSession, func(), error) {
 	c.applyDefaults()
-	ctx = logctx.WithFields(ctx, "module", "fetch")
 	log := logctx.From(ctx)
 
 	nodeKey, err := nodekey.LoadOrGen(c.NodeKeyPath)
