@@ -145,8 +145,7 @@ func New(ctx context.Context, c Config) *Manager {
 	c.defaults()
 	loopCtx, cancel := context.WithCancel(ctx)
 
-	pool := append([]addrbook.PeerAddr(nil), c.Pool...)
-	rand.Shuffle(len(pool), func(i, j int) { pool[i], pool[j] = pool[j], pool[i] })
+	pool := buildPool(c.Pool)
 
 	m := &Manager{
 		cfg:      c,
@@ -160,6 +159,23 @@ func New(ctx context.Context, c Config) *Manager {
 	}
 	go m.loop(loopCtx)
 	return m
+}
+
+// buildPool copies in and shuffles only the addrbook-sourced suffix.
+// Bootstrap-sourced entries (well-known seeds) keep their head-of-pool
+// position so dialFromPool's cursor reaches them inside the first
+// warm-fill wave instead of drowning them in thousands of stale
+// addrbook entries.
+func buildPool(in []addrbook.PeerAddr) []addrbook.PeerAddr {
+	pool := append([]addrbook.PeerAddr(nil), in...)
+	split := 0
+	for split < len(pool) && pool[split].Source == addrbook.SourceBootstrap {
+		split++
+	}
+	rand.Shuffle(len(pool)-split, func(i, j int) {
+		pool[split+i], pool[split+j] = pool[split+j], pool[split+i]
+	})
+	return pool
 }
 
 // Stop halts the dial loop. Idempotent.
@@ -293,8 +309,15 @@ func (m *Manager) tick() {
 		return
 	}
 
-	fired := m.dialFromPool(sw, need)
-	if fired < need && m.cfg.Book != nil {
+	// Split each wave between the static pool (bootstrap + initial
+	// addrbook snapshot) and the live cometbft addrbook (which
+	// accumulates PEX-learned addrs after startup). Without the book
+	// half, PEX-gossiped peers never get dialed: the static pool has
+	// thousands of entries so dialFromPool never reports fired < need
+	// and the fallback never triggers.
+	poolShare := need - need/2
+	fired := m.dialFromPool(sw, poolShare)
+	if m.cfg.Book != nil {
 		fired += m.dialFromBook(sw, need-fired)
 	}
 	if fired > 0 {

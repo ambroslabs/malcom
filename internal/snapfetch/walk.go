@@ -170,13 +170,17 @@ walkLoop:
 					return nil, nil, fmt.Errorf("event channel closed")
 				}
 				if ev.Snapshot != nil {
+					log.Debug("walk recv offer",
+						"target", target,
+						"offer_height", ev.Snapshot.Height,
+						"peer", ev.PeerID,
+						"failed_target", failed[ev.Snapshot.Height])
 					offers.add(ev.Snapshot, ev.PeerID)
-					// Jump-up: a new offer arrived for a height
-					// fresher than our current target. Abort this
-					// iteration; the queue gets the new height
-					// prioritized (and the current target requeued
-					// behind it, since we never gave it the full
-					// 10s window).
+					// Jump-up: a fresher offer arrived for a height
+					// above the current target. Abort this iteration
+					// and prepend the fresher height to the queue (the
+					// current target is requeued behind it, since we
+					// never gave it the full per-height window).
 					if cfg.TargetHeight == 0 &&
 						ev.Snapshot.Height > target &&
 						(cfg.MinHeight == 0 || ev.Snapshot.Height >= cfg.MinHeight) &&
@@ -191,10 +195,21 @@ walkLoop:
 						break heightLoop
 					}
 					if ev.Snapshot.Height == target {
-						// New offer at our target — dispatch chunk-0 to this peer.
-						dispatch(target)
+						n := dispatch(target)
+						log.Debug("walk dispatch on offer match",
+							"target", target, "asked", n, "peer", ev.PeerID)
 					}
 					continue
+				}
+				if ev.Chunk != nil {
+					log.Debug("walk recv chunk",
+						"target", target,
+						"chunk_height", ev.Chunk.Height,
+						"chunk_format", ev.Chunk.Format,
+						"chunk_index", ev.Chunk.Index,
+						"missing", ev.Chunk.Missing,
+						"bytes", len(ev.Chunk.Bytes),
+						"peer", ev.PeerID)
 				}
 				if ev.Chunk == nil || ev.Chunk.Index != 0 {
 					continue
@@ -205,11 +220,11 @@ walkLoop:
 				if ev.Chunk.Missing || len(ev.Chunk.Bytes) == 0 {
 					continue
 				}
-				// Find the offer whose (height, format) matches.
 				for _, e := range offers.at(target) {
 					if e.Offer.Format == ev.Chunk.Format {
 						accepted = e.Offer
 						responder = p2p.ID(ev.PeerID)
+						log.Debug("walk accepting", "height", target, "format", e.Offer.Format, "peer", ev.PeerID)
 						deadline.Stop()
 						break heightLoop
 					}

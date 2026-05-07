@@ -435,3 +435,58 @@ func TestManagerDialFailureBansAtMaxDialFailures(t *testing.T) {
 type dialError struct{}
 
 func (*dialError) Error() string { return "dial fail" }
+
+// buildPool must keep bootstrap-sourced entries at the front of the
+// pool. Without that, dialFromPool's cursor takes thousands of dial
+// ticks to reach the seeds — the walk's per-height timeout fires
+// long before any bootstrap peer is tried.
+func TestBuildPoolKeepsBootstrapAtFront(t *testing.T) {
+	bootstrap := []addrbook.PeerAddr{
+		{Addr: "0000000000000000000000000000000000000001@1.1.1.1:26656", Source: addrbook.SourceBootstrap},
+		{Addr: "0000000000000000000000000000000000000002@2.2.2.2:26656", Source: addrbook.SourceBootstrap},
+		{Addr: "0000000000000000000000000000000000000003@3.3.3.3:26656", Source: addrbook.SourceBootstrap},
+	}
+	addrbookEntries := make([]addrbook.PeerAddr, 100)
+	for i := range addrbookEntries {
+		addrbookEntries[i] = addrbook.PeerAddr{
+			Addr:   "ffffffffffffffffffffffffffffffffffffffff@10.0.0.1:26656",
+			Source: addrbook.SourceAddrbook,
+		}
+	}
+	in := append(append([]addrbook.PeerAddr(nil), bootstrap...), addrbookEntries...)
+
+	pool := buildPool(in)
+
+	if len(pool) != len(in) {
+		t.Fatalf("pool len=%d, want %d", len(pool), len(in))
+	}
+	for i, want := range bootstrap {
+		if pool[i].Source != addrbook.SourceBootstrap {
+			t.Fatalf("pool[%d].Source=%q, want bootstrap", i, pool[i].Source)
+		}
+		if pool[i].Addr != want.Addr {
+			t.Fatalf("pool[%d].Addr=%q, want %q (bootstrap order changed)", i, pool[i].Addr, want.Addr)
+		}
+	}
+	for i := len(bootstrap); i < len(pool); i++ {
+		if pool[i].Source != addrbook.SourceAddrbook {
+			t.Fatalf("pool[%d].Source=%q after bootstrap split, want addrbook", i, pool[i].Source)
+		}
+	}
+}
+
+func TestBuildPoolHandlesEmptyAndAllBootstrap(t *testing.T) {
+	if got := buildPool(nil); len(got) != 0 {
+		t.Fatalf("empty input -> pool len=%d, want 0", len(got))
+	}
+	allBoot := []addrbook.PeerAddr{
+		{Addr: "0000000000000000000000000000000000000001@1.1.1.1:26656", Source: addrbook.SourceBootstrap},
+		{Addr: "0000000000000000000000000000000000000002@2.2.2.2:26656", Source: addrbook.SourceBootstrap},
+	}
+	got := buildPool(allBoot)
+	for i, want := range allBoot {
+		if got[i].Addr != want.Addr {
+			t.Fatalf("all-bootstrap pool[%d].Addr=%q, want %q", i, got[i].Addr, want.Addr)
+		}
+	}
+}
