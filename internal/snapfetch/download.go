@@ -25,6 +25,55 @@ type peerStat struct {
 	provisional bool // true until peer responds with first verified chunk; provisional peers get one in-flight slot and a single-strike ban budget
 }
 
+func (st *peerStat) addInflight() { st.inflight++ }
+
+func (st *peerStat) removeInflight() {
+	if st.inflight > 0 {
+		st.inflight--
+	}
+}
+
+func (st *peerStat) clearInflight() { st.inflight = 0 }
+
+// failureLimit returns the strike budget for this peer based on
+// provisional/proven status.
+func (st *peerStat) failureLimit(proven, provisional int) int {
+	if st.provisional {
+		return provisional
+	}
+	return proven
+}
+
+// recordFailure increments failures and bans if the limit is reached.
+// Returns true on transition to banned (caller does banAndDrop).
+func (st *peerStat) recordFailure(limit int) bool {
+	st.failures++
+	if st.failures >= limit {
+		st.banned = true
+		return true
+	}
+	return false
+}
+
+// promote flips a provisional peer to proven. Returns true on transition.
+func (st *peerStat) promote() bool {
+	if st.provisional {
+		st.provisional = false
+		return true
+	}
+	return false
+}
+
+// benchIfProvisional bans the peer if it's still provisional. Returns
+// true on transition. Used by probe-timeout handling.
+func (st *peerStat) benchIfProvisional() bool {
+	if st.provisional {
+		st.banned = true
+		return true
+	}
+	return false
+}
+
 // download is the phase-3 chunk scheduler. It dispatches chunks across
 // good peers, verifies SHA256 against the metadata hashes, and writes
 // each verified chunk to <snapDir>/chunk_<idx>.bin. Returns total bytes
@@ -164,7 +213,7 @@ func download(ctx context.Context, sw *p2p.Switch, ssR *statesync.Reactor,
 				peer p2p.ID
 				sent time.Time
 			}{peer: pid, sent: time.Now()}
-			stats[pid].inflight++
+			stats[pid].addInflight()
 			dispatched++
 		}
 		return dispatched
@@ -225,15 +274,11 @@ func download(ctx context.Context, sw *p2p.Switch, ssR *statesync.Reactor,
 				if now.Sub(info.sent) > chunkTimeout {
 					st := stats[info.peer]
 					if st != nil {
-						st.inflight--
-						if st.inflight < 0 {
-							st.inflight = 0
-						}
+						st.removeInflight()
 						// Provisional peers that time out on their
 						// probe lose their slot immediately — their
 						// connection is suspect.
-						if st.provisional {
-							st.banned = true
+						if st.benchIfProvisional() {
 							log.Debug("benching provisional peer (probe timeout)",
 								"peer", string(info.peer))
 							banAndDrop(info.peer, "probe timeout")
@@ -287,7 +332,7 @@ func download(ctx context.Context, sw *p2p.Switch, ssR *statesync.Reactor,
 					}
 				}
 				if st, ok := stats[peer]; ok {
-					st.inflight = 0
+					st.clearInflight()
 				}
 				dispatch()
 				continue
@@ -309,9 +354,7 @@ func download(ctx context.Context, sw *p2p.Switch, ssR *statesync.Reactor,
 			if info, ok := inflight[idx]; ok && info.peer == peer {
 				delete(inflight, idx)
 			}
-			if st.inflight > 0 {
-				st.inflight--
-			}
+			st.removeInflight()
 
 			if completed[idx] {
 				continue
@@ -320,15 +363,10 @@ func download(ctx context.Context, sw *p2p.Switch, ssR *statesync.Reactor,
 			// Provisional peers get a tighter strike budget on their
 			// probe than proven peers (configurable via
 			// ProvisionalProbeStrikes / PeerFailLimit).
-			banLimit := peerFailLimit
-			if st.provisional {
-				banLimit = provisionalStrikes
-			}
+			limit := st.failureLimit(peerFailLimit, provisionalStrikes)
 
 			if ev.Chunk.Missing || len(ev.Chunk.Bytes) == 0 {
-				st.failures++
-				if st.failures >= banLimit {
-					st.banned = true
+				if st.recordFailure(limit) {
 					log.Debug("benching peer", "peer", string(peer), "failures", st.failures, "provisional", st.provisional)
 					banAndDrop(peer, "missing/empty chunk")
 				}
@@ -343,9 +381,7 @@ func download(ctx context.Context, sw *p2p.Switch, ssR *statesync.Reactor,
 					"peer", string(peer), "idx", idx,
 					"got_sha", hex.EncodeToString(h[:8]),
 					"want_sha", hex.EncodeToString(chunkHashes[idx][:8]))
-				st.failures++
-				if st.failures >= banLimit {
-					st.banned = true
+				if st.recordFailure(limit) {
 					banAndDrop(peer, "chunk hash mismatch")
 				}
 				pending[idx] = true
@@ -354,8 +390,7 @@ func download(ctx context.Context, sw *p2p.Switch, ssR *statesync.Reactor,
 			}
 
 			// Verified chunk — promote a provisional peer to proven.
-			if st.provisional {
-				st.provisional = false
+			if st.promote() {
 				log.Info("peer promoted from provisional", "peer", string(peer))
 			}
 
