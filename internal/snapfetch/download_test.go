@@ -17,13 +17,13 @@ import (
 // and the supplied fakes wired in. Tests can then call methods
 // directly to drive the state machine.
 type scenarioBuilder struct {
-	sw          *fakeSchedulerSwitch
-	reactor     *fakeReactor
-	mgr         *fakeManager
-	target      *snapshotOffer
-	chunkBytes  []byte
-	chunkHash   []byte
-	snapDir     string
+	sw         *fakeSchedulerSwitch
+	reactor    *fakeReactor
+	mgr        *fakeManager
+	target     *snapshotOffer
+	chunkBytes []byte
+	chunkHash  []byte
+	snapDir    string
 }
 
 func newScenario(t *testing.T) *scenarioBuilder {
@@ -49,18 +49,25 @@ func (b *scenarioBuilder) build() *chunkScheduler {
 	for i := range pending {
 		pending[i] = true
 	}
+	hashes := make([][]byte, b.target.Chunks)
+	for i := range hashes {
+		hashes[i] = b.chunkHash
+	}
 	now := time.Now()
 	return &chunkScheduler{
-		sw:                  b.sw,
-		ssR:                 b.reactor,
-		mgr:                 b.mgr,
-		watch:               nil, // banAndDrop falls through to mgr.Ban only
-		log:                 cmtlog.NewNopLogger(),
-		target:              b.target,
-		chunkHashes:         [][]byte{b.chunkHash},
-		snapDir:             b.snapDir,
-		perPeer:             4,
-		chunkTimeout:        time.Second,
+		sw:          b.sw,
+		ssR:         b.reactor,
+		mgr:         b.mgr,
+		watch:       nil, // banAndDrop falls through to mgr.Ban only
+		log:         cmtlog.NewNopLogger(),
+		target:      b.target,
+		chunkHashes: hashes,
+		snapDir:     b.snapDir,
+		perPeer:     4,
+		// chunkTimeout is set high so non-timeout tests can never
+		// accidentally trigger a timeout. Timeout-focused tests
+		// override on the built scheduler.
+		chunkTimeout:        time.Hour,
 		peerFailLimit:       3,
 		provisionalStrikes:  1,
 		provisionalInflight: 1,
@@ -70,6 +77,32 @@ func (b *scenarioBuilder) build() *chunkScheduler {
 		stats:               map[p2p.ID]*peerStat{},
 		startTime:           now,
 		lastProgress:        now,
+	}
+}
+
+// assignInflight mirrors what dispatch() does internally: marks the
+// chunk in-flight on the peer and clears pending. Setup paths that
+// only set s.inflight without addInflight desync peerStat.inflight
+// from production state.
+func assignInflight(s *chunkScheduler, pid p2p.ID, idx uint32, sent time.Time) {
+	s.inflight[idx] = inflightEntry{peer: pid, sent: sent}
+	s.pending[idx] = false
+	s.stats[pid].addInflight()
+}
+
+// chunkEvent constructs a statesync.Event for a chunk reply against
+// the scenario's target snapshot.
+func (b *scenarioBuilder) chunkEvent(peerID p2p.ID, idx uint32, body []byte, missing bool) statesync.Event {
+	return statesync.Event{
+		PeerID: string(peerID),
+		Chunk: &statesync.ChunkInfo{
+			Height:  b.target.Height,
+			Format:  b.target.Format,
+			Index:   idx,
+			Size:    len(body),
+			Bytes:   body,
+			Missing: missing,
+		},
 	}
 }
 
@@ -105,9 +138,7 @@ func TestChunkSchedulerOnRemovedDropsInflight(t *testing.T) {
 	// Peer was previously connected, then disconnected. Production
 	// flow: Switch removes the peer first, then RemovePeer fires.
 	s.stats[peer.ID()] = &peerStat{}
-	s.inflight[0] = inflightEntry{peer: peer.ID(), sent: time.Now()}
-	s.pending[0] = false
-	s.stats[peer.ID()].addInflight()
+	assignInflight(s, peer.ID(), 0, time.Now())
 
 	s.onRemoved(peer.ID())
 
@@ -117,8 +148,10 @@ func TestChunkSchedulerOnRemovedDropsInflight(t *testing.T) {
 	if !s.pending[0] {
 		t.Fatalf("chunk not re-marked pending after Removed")
 	}
-	if s.stats[peer.ID()].inflight != 0 {
-		t.Fatalf("inflight not cleared")
+	// Stats entry may be retained (current behavior, clearInflight) or
+	// removed in the future — both satisfy "inflight cleared".
+	if st, ok := s.stats[peer.ID()]; ok && st.inflight != 0 {
+		t.Fatalf("inflight not cleared: got %d", st.inflight)
 	}
 }
 
@@ -129,16 +162,21 @@ func TestChunkSchedulerVerifiedChunkPromotesAndWrites(t *testing.T) {
 	peer := newFakePeer("peer-A", "1.1.1.1", 26656)
 	b.sw.peerSet.Add(peer)
 	s.stats[peer.ID()] = &peerStat{provisional: true}
-	s.inflight[0] = inflightEntry{peer: peer.ID(), sent: time.Now()}
-	s.pending[0] = false
-	s.stats[peer.ID()].addInflight()
+	assignInflight(s, peer.ID(), 0, time.Now())
 
-	ev := makeChunkEvent(peer.ID(), b.target, 0, b.chunkBytes, false)
+	ev := b.chunkEvent(peer.ID(), 0, b.chunkBytes, false)
 	s.onChunk(ev)
 
 	// Promoted.
 	if s.stats[peer.ID()].provisional {
 		t.Fatalf("peer not promoted from provisional")
+	}
+	// In-flight bookkeeping cleared.
+	if _, still := s.inflight[0]; still {
+		t.Fatalf("inflight[0] not cleared after verified chunk")
+	}
+	if got := s.stats[peer.ID()].inflight; got != 0 {
+		t.Fatalf("peerStat.inflight=%d after verified chunk, want 0", got)
 	}
 	// Completed and written.
 	if !s.completed[0] {
@@ -167,11 +205,10 @@ func TestChunkSchedulerHashMismatchSingleStrikeBansProvisional(t *testing.T) {
 	peer := newFakePeer("peer-A", "1.1.1.1", 26656)
 	b.sw.peerSet.Add(peer)
 	s.stats[peer.ID()] = &peerStat{provisional: true}
-	s.inflight[0] = inflightEntry{peer: peer.ID(), sent: time.Now()}
-	s.pending[0] = false
+	assignInflight(s, peer.ID(), 0, time.Now())
 
 	// Wrong bytes — hash won't match.
-	ev := makeChunkEvent(peer.ID(), b.target, 0, []byte("WRONG"), false)
+	ev := b.chunkEvent(peer.ID(), 0, []byte("WRONG"), false)
 	s.onChunk(ev)
 
 	if !s.stats[peer.ID()].banned {
@@ -196,11 +233,11 @@ func TestChunkSchedulerProvenPeerNeedsThreeStrikesToBan(t *testing.T) {
 	b.sw.peerSet.Add(peer)
 	s.stats[peer.ID()] = &peerStat{} // proven (provisional=false)
 
-	// Three missing-chunk events — peerFailLimit=3 in the scenario.
+	// Seed the first assignment; onChunk's redispatch sets up the
+	// next two iterations naturally, mirroring production flow.
+	assignInflight(s, peer.ID(), 0, time.Now())
 	for i := 0; i < 3; i++ {
-		s.inflight[0] = inflightEntry{peer: peer.ID(), sent: time.Now()}
-		s.pending[0] = false
-		ev := makeChunkEvent(peer.ID(), b.target, 0, nil, true) // missing
+		ev := b.chunkEvent(peer.ID(), 0, nil, true) // missing
 		s.onChunk(ev)
 	}
 
@@ -209,6 +246,13 @@ func TestChunkSchedulerProvenPeerNeedsThreeStrikesToBan(t *testing.T) {
 	}
 	if b.mgr.banReason(peer.ID()) == "" {
 		t.Fatalf("manager.Ban not invoked")
+	}
+	// After ban, the failed assignment must be released, not leaked.
+	if _, still := s.inflight[0]; still {
+		t.Fatalf("inflight[0] leaked after final strike")
+	}
+	if !s.pending[0] {
+		t.Fatalf("chunk not re-pending after final strike")
 	}
 }
 
@@ -219,10 +263,11 @@ func TestChunkSchedulerProbeTimeoutBansProvisional(t *testing.T) {
 	peer := newFakePeer("peer-A", "1.1.1.1", 26656)
 	b.sw.peerSet.Add(peer)
 	s.stats[peer.ID()] = &peerStat{provisional: true}
-	s.stats[peer.ID()].addInflight()
-	// Sent 10 minutes ago — way past chunkTimeout (1s).
-	s.inflight[0] = inflightEntry{peer: peer.ID(), sent: time.Now().Add(-10 * time.Minute)}
-	s.pending[0] = false
+	// Override the scenario's high default so the assignment below
+	// is past the deadline.
+	s.chunkTimeout = time.Second
+	// Sent 10 minutes ago — way past chunkTimeout.
+	assignInflight(s, peer.ID(), 0, time.Now().Add(-10*time.Minute))
 
 	s.onTimeoutTick(time.Now())
 
@@ -316,20 +361,5 @@ func TestChunkSchedulerPickPeerProvisionalSlotsLimited(t *testing.T) {
 	s.stats[prov.ID()].addInflight()
 	if pid := s.pickPeer(); pid != "" {
 		t.Fatalf("pick with provisional inflight=2 should return empty, got %q", pid)
-	}
-}
-
-// makeChunkEvent constructs a statesync.Event for a chunk reply.
-func makeChunkEvent(peerID p2p.ID, target *snapshotOffer, idx uint32, body []byte, missing bool) statesync.Event {
-	return statesync.Event{
-		PeerID: string(peerID),
-		Chunk: &statesync.ChunkInfo{
-			Height:  target.Height,
-			Format:  target.Format,
-			Index:   idx,
-			Size:    len(body),
-			Bytes:   body,
-			Missing: missing,
-		},
 	}
 }
