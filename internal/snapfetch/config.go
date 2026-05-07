@@ -16,7 +16,7 @@ type Config struct {
 	Listen            string // default "tcp://0.0.0.0:0"
 	Moniker           string // default "cosmos-p2p-snapfetch"
 	AddrBook          string // path to cometbft PEX-managed addrbook
-	BootstrapPeersCSV string
+	BootstrapPeers []string
 
 	DiscoverFor       time.Duration // default 25s
 	DialParallel      int           // default 32

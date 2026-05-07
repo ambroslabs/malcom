@@ -146,7 +146,7 @@ func Run(args []string) int {
 		Listen:            ch.Fetch.Listen,
 		Moniker:           ch.Fetch.Moniker,
 		AddrBook:          ch.AddrBook,
-		BootstrapPeersCSV: joinCSV(ch.Fetch.BootstrapPeers),
+		BootstrapPeers:    ch.Fetch.BootstrapPeers,
 		DiscoverFor:       ch.Fetch.Discover.Duration(),
 		DialParallel:      ch.Fetch.DialParallel,
 		MaxCandidates:     ch.Fetch.MaxCandidates,
@@ -288,16 +288,5 @@ func fetchCurrentHeight(rpcs []string) (uint64, error) {
 		return h, nil
 	}
 	return 0, fmt.Errorf("all RPCs failed: %w", lastErr)
-}
-
-func joinCSV(items []string) string {
-	if len(items) == 0 {
-		return ""
-	}
-	out := items[0]
-	for _, s := range items[1:] {
-		out += "," + s
-	}
-	return out
 }
 

@@ -43,7 +43,7 @@ func RunFetch(ctx context.Context, c Config, outRoot string) error {
 
 	peerAddrs := loadAddrbookPeers(ctx, c.AddrBook)
 	addrbookCount := len(peerAddrs)
-	for _, s := range strings.Split(c.BootstrapPeersCSV, ",") {
+	for _, s := range c.BootstrapPeers {
 		s = strings.TrimSpace(s)
 		if s != "" {
 			peerAddrs = append([]peerAddr{{addr: s, source: "bootstrap"}}, peerAddrs...)
