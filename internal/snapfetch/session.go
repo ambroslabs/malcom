@@ -3,8 +3,10 @@ package snapfetch
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
 	"encoding/hex"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"sort"
@@ -309,6 +311,42 @@ func (s *fetchSession) download(ctx context.Context, offer *snapshotOffer, good 
 		s.cfg.PerPeerLimit, s.cfg.ChunkTimeout, s.cfg.PeerFailLimit,
 		s.cfg.ProvisionalProbeStrikes, s.cfg.ProvisionalProbeInflight,
 		s.watch, s.mgr)
+}
+
+// verifySnapshotHash recomputes the wire-level snapshot hash from the
+// chunk files on disk and compares it to offer.Hash. cosmos-sdk's
+// snapshotter sets Snapshot.Hash = SHA256(chunk_0 || ... || chunk_{N-1})
+// during snapshot creation in store/snapshots/store.go's Save.
+//
+// Complements the per-chunk verify in download.onChunk, which proves
+// chunks match metadata.chunk_hashes. Per-chunk alone leaves a gap:
+// offerSet.add caches the first peer's metadata for each
+// (height, format, hash) key, so a peer racing first with forged
+// metadata + matching forged chunks passes per-chunk and only fails
+// the aggregate check here.
+func verifySnapshotHash(snapDir string, offer *snapshotOffer) error {
+	h := sha256.New()
+	buf := make([]byte, 1<<20)
+	for i := uint32(0); i < offer.Chunks; i++ {
+		path := filepath.Join(snapDir, fmt.Sprintf("chunk_%05d.bin", i))
+		f, err := os.Open(path)
+		if err != nil {
+			return fmt.Errorf("open chunk %d: %w", i, err)
+		}
+		if _, err := io.CopyBuffer(h, f, buf); err != nil {
+			f.Close()
+			return fmt.Errorf("read chunk %d: %w", i, err)
+		}
+		if err := f.Close(); err != nil {
+			return fmt.Errorf("close chunk %d: %w", i, err)
+		}
+	}
+	got := h.Sum(nil)
+	if !bytes.Equal(got, offer.Hash) {
+		return fmt.Errorf("snapshot hash mismatch: got %s, want %s",
+			hex.EncodeToString(got), hex.EncodeToString(offer.Hash))
+	}
+	return nil
 }
 
 // writeMeta writes meta.json and the .complete sentinel in snapDir.

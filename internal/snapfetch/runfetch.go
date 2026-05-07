@@ -2,6 +2,7 @@ package snapfetch
 
 import (
 	"context"
+	"encoding/hex"
 	"fmt"
 	"time"
 
@@ -49,6 +50,17 @@ func RunFetch(ctx context.Context, c Config, outRoot string) error {
 				c.MaxFetchTime, c.ChainID, err)
 		}
 		return fmt.Errorf("download failed: %w", err)
+	}
+
+	if c.SkipVerifyHash {
+		s.log.Info("snapshot hash verify skipped — run `malcom verify` against a trusted RPC to authenticate contents",
+			"flag", "-no-verify-hash")
+	} else {
+		s.log.Info("verifying snapshot hash", "chunks", offer.Chunks)
+		if err := verifySnapshotHash(snapDir, offer); err != nil {
+			return fmt.Errorf("snapshot hash verify: %w", err)
+		}
+		s.log.Info("snapshot hash verified", "hash", hex.EncodeToString(offer.Hash))
 	}
 
 	return s.writeMeta(snapDir, offer, good, bytesTotal)
