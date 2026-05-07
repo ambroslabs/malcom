@@ -31,10 +31,16 @@ type peerWatch struct {
 	requireStateSyncChannel bool
 	log                     cmtlog.Logger // snapshot of logctx.From(ctx) at construction
 
-	mu               sync.Mutex
-	firstSeen        map[p2p.ID]time.Time
-	useful           map[p2p.ID]bool
-	externallyBanned map[p2p.ID]bool // signaled by download(); skip in tryRedial
+	mu        sync.Mutex
+	firstSeen map[p2p.ID]time.Time
+	useful    map[p2p.ID]bool
+	// banned is the set of peers we've benched — by peerWatch's own
+	// tick (channel filter or no-useful-offer-in-window) or by
+	// download's misbehavior path (probe timeout, hash mismatch,
+	// max-redials hit). Queried via isBanned() from
+	// download.tryRedial so the redial loop doesn't keep
+	// re-establishing connections to peers we've already kicked.
+	banned map[p2p.ID]bool
 }
 
 func newPeerWatch(ctx context.Context, sw *p2p.Switch, book pexcb.AddrBook, minHeight uint64, grace, banDuration time.Duration, requireStateSyncChannel bool) *peerWatch {
@@ -48,17 +54,16 @@ func newPeerWatch(ctx context.Context, sw *p2p.Switch, book pexcb.AddrBook, minH
 		log:                     logctx.From(ctx),
 		firstSeen:               map[p2p.ID]time.Time{},
 		useful:                  map[p2p.ID]bool{},
-		externallyBanned:        map[p2p.ID]bool{},
+		banned:                  map[p2p.ID]bool{},
 	}
 }
 
-// isBanned reports whether the peer was banned (by peerWatch's own
-// tick or via download()'s misbehavior path). Used by tryRedial to
-// avoid the legacy "banned-but-still-redialed" loop.
+// isBanned reports whether the peer was benched by any path —
+// peerWatch's tick or download's misbehavior handling.
 func (w *peerWatch) isBanned(id p2p.ID) bool {
 	w.mu.Lock()
 	defer w.mu.Unlock()
-	return w.externallyBanned[id]
+	return w.banned[id]
 }
 
 // markUseful records that the named peer offered something inside
@@ -69,9 +74,11 @@ func (w *peerWatch) markUseful(peerID p2p.ID) {
 	w.mu.Unlock()
 }
 
-// banPeer is the one-stop shop for "this peer is useless; evict it":
-// disconnect + addrbook-ban + signal download() so its tryRedial
-// stops dialing this peer for the rest of the run.
+// banPeer is the one-stop eviction for a connected peer: disconnect,
+// addrbook-MarkBad with banDuration TTL, and flag in `banned` so
+// download.tryRedial stops attempting to redial. Called from
+// peerWatch's own tick (channel filter / churn-grace) AND from
+// download (misbehavior).
 func (w *peerWatch) banPeer(peer p2p.Peer, reason string) {
 	addr := peer.SocketAddr()
 	w.log.Debug("evicting peer", "peer", string(peer.ID()), "reason", reason)
@@ -81,14 +88,14 @@ func (w *peerWatch) banPeer(peer p2p.Peer, reason string) {
 	}
 	w.mu.Lock()
 	delete(w.firstSeen, peer.ID())
-	w.externallyBanned[peer.ID()] = true
+	w.banned[peer.ID()] = true
 	w.mu.Unlock()
 }
 
 // markBannedByID is the disconnected-peer counterpart to banPeer.
 // Used by download() when MaxRedials is hit — the peer isn't
 // currently connected so we can't StopPeerGracefully, but we still
-// want to addrbook-MarkBad and signal tryRedial to stop trying.
+// want to addrbook-MarkBad and flag in `banned` so tryRedial stops.
 func (w *peerWatch) markBannedByID(id p2p.ID, addr string, reason string) {
 	w.log.Debug("benching peer (no connection)", "peer", string(id), "reason", reason)
 	if w.book != nil && addr != "" {
@@ -97,7 +104,7 @@ func (w *peerWatch) markBannedByID(id p2p.ID, addr string, reason string) {
 		}
 	}
 	w.mu.Lock()
-	w.externallyBanned[id] = true
+	w.banned[id] = true
 	w.mu.Unlock()
 }
 
