@@ -191,7 +191,7 @@ func Run(args []string) int {
 		cancel()
 	}()
 
-	if _, err := snapfetch.RunFetch(rootCtx, scfg, *out); err != nil {
+	if err := snapfetch.RunFetch(rootCtx, scfg, *out); err != nil {
 		fmt.Fprintf(os.Stderr, "snapfetch: %v\n", err)
 		return 1
 	}
