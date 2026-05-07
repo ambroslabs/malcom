@@ -75,7 +75,7 @@ func loadAddrBookSeeds(addrBookPath string, logger cmtlog.Logger) []peerSeed {
 	return out
 }
 
-func writeJSON(path string, v interface{}) error {
+func writeJSON(path string, v any) error {
 	f, err := os.Create(path)
 	if err != nil {
 		return err

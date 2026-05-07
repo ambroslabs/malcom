@@ -13,11 +13,11 @@ import (
 // Config holds all knobs for RunFetch. Field defaults are documented in
 // the comments — pass zero values to opt into the defaults via Defaults().
 type Config struct {
-	ChainID     string
-	NodeKeyPath string
-	Listen      string // default "tcp://0.0.0.0:0"
-	Moniker     string // default "cosmos-p2p-snapfetch"
-	AddrBook    string // path to cometbft PEX-managed addrbook
+	ChainID           string
+	NodeKeyPath       string
+	Listen            string // default "tcp://0.0.0.0:0"
+	Moniker           string // default "cosmos-p2p-snapfetch"
+	AddrBook          string // path to cometbft PEX-managed addrbook
 	BootstrapPeersCSV string
 
 	DiscoverFor       time.Duration // default 25s
@@ -236,8 +236,4 @@ type savedMeta struct {
 
 func snapKey(s *statesync.Snapshot) string {
 	return fmt.Sprintf("%d_%d_%s", s.Height, s.Format, hex.EncodeToString(s.Hash))
-}
-
-func snapKeyOffer(o *snapshotOffer) string {
-	return fmt.Sprintf("%d_%d_%s", o.Height, o.Format, hex.EncodeToString(o.Hash))
 }
