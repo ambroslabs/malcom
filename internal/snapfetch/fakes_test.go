@@ -173,6 +173,8 @@ func (r *fakeReactor) RequestChunk(peer p2p.Peer, height uint64, format, index u
 	return r.requestChunkOK
 }
 
+func (r *fakeReactor) Drops() (ctrl, chunk int64) { return 0, 0 }
+
 func (r *fakeReactor) sentTo(pid p2p.ID, idx uint32) bool {
 	r.mu.Lock()
 	defer r.mu.Unlock()

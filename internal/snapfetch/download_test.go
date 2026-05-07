@@ -304,6 +304,50 @@ func TestChunkSchedulerTimeoutMirrorsManagerBans(t *testing.T) {
 	}
 }
 
+// If a Connected event was dropped (reactor.Out full), the peer never
+// makes it into stats. onTimeoutTick must reconcile against the
+// current peer set so the peer becomes available for dispatch.
+func TestChunkSchedulerTimeoutReconcilesConnectedPeers(t *testing.T) {
+	b := newScenario(t)
+	s := b.build()
+
+	peer := newFakePeer("peer-A", "1.1.1.1", 26656)
+	// Peer is connected on the switch but missed Connected — stats is empty.
+	b.sw.peerSet.Add(peer)
+
+	s.onTimeoutTick(time.Now())
+
+	st, ok := s.stats[peer.ID()]
+	if !ok {
+		t.Fatalf("connected peer not folded into stats by reconcile")
+	}
+	if !st.provisional {
+		t.Fatalf("reconciled peer should be provisional")
+	}
+}
+
+// Reconcile must not undo prior bans: a banned peer that's still
+// connected stays banned (and stays non-provisional), regardless of
+// how many times the ticker fires.
+func TestChunkSchedulerTimeoutReconcileSkipsBannedPeer(t *testing.T) {
+	b := newScenario(t)
+	s := b.build()
+
+	peer := newFakePeer("peer-A", "1.1.1.1", 26656)
+	b.sw.peerSet.Add(peer)
+	s.stats[peer.ID()] = &peerStat{banned: true}
+
+	s.onTimeoutTick(time.Now())
+
+	st := s.stats[peer.ID()]
+	if !st.banned {
+		t.Fatalf("reconcile un-banned a previously banned peer")
+	}
+	if st.provisional {
+		t.Fatalf("reconcile flipped banned peer back to provisional")
+	}
+}
+
 func TestChunkSchedulerDispatchAssignsChunks(t *testing.T) {
 	b := newScenario(t)
 	b.target.Chunks = 3

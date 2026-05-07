@@ -38,7 +38,7 @@ func walkBackward(
 	// Subscribe to events BEFORE dialing so any SnapshotsResponse
 	// arriving during the kickstart wave + warmup is captured (the mux
 	// drops events when there are no subscribers).
-	evs := mux.subscribe()
+	sub := mux.subscribe()
 
 	// Kickstart: fire-and-forget dials to a capped subset of our peer
 	// addrs. connect.Manager will continue dialing on its tick, but
@@ -89,10 +89,13 @@ func walkBackward(
 	drainEvents := func() {
 		for {
 			select {
-			case ev := <-evs:
+			case ev := <-sub.Ctrl:
 				if ev.Snapshot != nil {
 					offers.add(ev.Snapshot, ev.PeerID)
 				}
+			case <-sub.Chunk:
+				// Discard pre-walk chunks; we only request chunk-0
+				// once a target is in flight.
 			default:
 				return
 			}
@@ -112,10 +115,11 @@ func walkBackward(
 		case <-warmupDeadline.C:
 			drainEvents()
 			goto walkLoop
-		case ev := <-evs:
+		case ev := <-sub.Ctrl:
 			if ev.Snapshot != nil {
 				offers.add(ev.Snapshot, ev.PeerID)
 			}
+		case <-sub.Chunk:
 		}
 	}
 walkLoop:
@@ -182,57 +186,60 @@ walkLoop:
 				return nil, nil, ctx.Err()
 			case <-deadline.C:
 				break heightLoop
-			case ev, ok := <-evs:
+			case ev, ok := <-sub.Ctrl:
 				if !ok {
 					deadline.Stop()
 					return nil, nil, fmt.Errorf("event channel closed")
 				}
-				if ev.Snapshot != nil {
-					log.Debug("walk recv offer",
-						"target", target,
-						"offer_height", ev.Snapshot.Height,
-						"peer", ev.PeerID,
-						"failed_target", failed[ev.Snapshot.Height])
-					offers.add(ev.Snapshot, ev.PeerID)
-					// Jump-up: a fresher offer arrived for a height
-					// above the current target. Abort this iteration
-					// and prepend the fresher height to the queue (the
-					// current target is requeued behind it, since we
-					// never gave it the full per-height window).
-					if cfg.TargetHeight == 0 &&
-						ev.Snapshot.Height > target &&
-						(cfg.MinHeight == 0 || ev.Snapshot.Height >= cfg.MinHeight) &&
-						!failed[ev.Snapshot.Height] {
-						log.Info("found higher snapshot from new peer; jumping",
-							"from_height", target,
-							"to_height", ev.Snapshot.Height,
-							"peer", ev.PeerID)
-						deadline.Stop()
-						queue = append([]uint64{ev.Snapshot.Height, target}, queue...)
-						jumped = true
-						break heightLoop
-					}
-					if ev.Snapshot.Height == target {
-						n := dispatch(target)
-						log.Debug("walk dispatch on offer match",
-							"target", target, "asked", n, "peer", ev.PeerID)
-					}
+				if ev.Snapshot == nil {
 					continue
 				}
-				if ev.Chunk != nil {
-					log.Debug("walk recv chunk",
-						"target", target,
-						"chunk_height", ev.Chunk.Height,
-						"chunk_format", ev.Chunk.Format,
-						"chunk_index", ev.Chunk.Index,
-						"missing", ev.Chunk.Missing,
-						"bytes", len(ev.Chunk.Bytes),
+				log.Debug("walk recv offer",
+					"target", target,
+					"offer_height", ev.Snapshot.Height,
+					"peer", ev.PeerID,
+					"failed_target", failed[ev.Snapshot.Height])
+				offers.add(ev.Snapshot, ev.PeerID)
+				// Jump-up: a fresher offer arrived for a height
+				// above the current target. Abort this iteration
+				// and prepend the fresher height to the queue (the
+				// current target is requeued behind it, since we
+				// never gave it the full per-height window).
+				if cfg.TargetHeight == 0 &&
+					ev.Snapshot.Height > target &&
+					(cfg.MinHeight == 0 || ev.Snapshot.Height >= cfg.MinHeight) &&
+					!failed[ev.Snapshot.Height] {
+					log.Info("found higher snapshot from new peer; jumping",
+						"from_height", target,
+						"to_height", ev.Snapshot.Height,
 						"peer", ev.PeerID)
+					deadline.Stop()
+					queue = append([]uint64{ev.Snapshot.Height, target}, queue...)
+					jumped = true
+					break heightLoop
 				}
-				if ev.Chunk == nil || ev.Chunk.Index != 0 {
+				if ev.Snapshot.Height == target {
+					n := dispatch(target)
+					log.Debug("walk dispatch on offer match",
+						"target", target, "asked", n, "peer", ev.PeerID)
+				}
+			case ev, ok := <-sub.Chunk:
+				if !ok {
+					deadline.Stop()
+					return nil, nil, fmt.Errorf("event channel closed")
+				}
+				if ev.Chunk == nil {
 					continue
 				}
-				if ev.Chunk.Height != target {
+				log.Debug("walk recv chunk",
+					"target", target,
+					"chunk_height", ev.Chunk.Height,
+					"chunk_format", ev.Chunk.Format,
+					"chunk_index", ev.Chunk.Index,
+					"missing", ev.Chunk.Missing,
+					"bytes", len(ev.Chunk.Bytes),
+					"peer", ev.PeerID)
+				if ev.Chunk.Index != 0 || ev.Chunk.Height != target {
 					continue
 				}
 				if ev.Chunk.Missing || len(ev.Chunk.Bytes) == 0 {

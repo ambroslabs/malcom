@@ -155,6 +155,9 @@ func (w *peerWatch) onDisconnect(id p2p.ID) {
 // connected past their grace window without offering anything useful.
 // Channel-filter eviction is deferred from onConnect to here so peers
 // have ≥1 tick to send a PexAddrs reply before we disconnect them.
+//
+// Also drops firstSeen entries whose peer is gone (covers a dropped
+// Removed event).
 func (w *peerWatch) tick() {
 	if w.minHeight == 0 {
 		return
@@ -167,6 +170,10 @@ func (w *peerWatch) tick() {
 	}
 	pending := make([]evict, 0)
 	for id, first := range w.firstSeen {
+		if w.sw.Peers().Get(id) == nil {
+			delete(w.firstSeen, id)
+			continue
+		}
 		if w.useful[id] {
 			continue
 		}
@@ -191,10 +198,10 @@ func (w *peerWatch) tick() {
 	}
 }
 
-// run is the watcher's main loop. Subscribes to evs (the caller
-// supplies the mux subscription so subscriber lifecycle matches
+// run is the watcher's main loop. Subscribes to ctrl-only events (the
+// caller supplies the channel so subscriber lifecycle matches
 // peerWatch's). Returns when ctx is cancelled.
-func (w *peerWatch) run(ctx context.Context, evs <-chan statesync.Event) {
+func (w *peerWatch) run(ctx context.Context, ctrl <-chan statesync.Event) {
 	t := time.NewTicker(1 * time.Second)
 	defer t.Stop()
 	for {
@@ -203,7 +210,7 @@ func (w *peerWatch) run(ctx context.Context, evs <-chan statesync.Event) {
 			return
 		case <-t.C:
 			w.tick()
-		case ev, ok := <-evs:
+		case ev, ok := <-ctrl:
 			if !ok {
 				return
 			}

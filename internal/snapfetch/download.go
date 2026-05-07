@@ -104,6 +104,7 @@ type schedulerSwitch interface {
 // schedulerReactor is the subset of *statesync.Reactor chunkScheduler needs.
 type schedulerReactor interface {
 	RequestChunk(peer p2p.Peer, height uint64, format, index uint32) bool
+	Drops() (ctrl, chunk int64)
 }
 
 // schedulerManager is the subset of *connect.Manager chunkScheduler needs.
@@ -153,7 +154,7 @@ const progressEvery = 10 * time.Second
 // seeds it with the chunk-0 responder + offer's good peers, and runs
 // the main loop. Returns total bytes transferred.
 func download(ctx context.Context, sw *p2p.Switch, ssR *statesync.Reactor,
-	evs <-chan statesync.Event, target *snapshotOffer, chunkHashes [][]byte,
+	sub *subscription, target *snapshotOffer, chunkHashes [][]byte,
 	good []p2p.ID, snapDir string,
 	perPeer int, chunkTimeout time.Duration, peerFailLimit int,
 	provisionalStrikes, provisionalInflight int,
@@ -188,7 +189,7 @@ func download(ctx context.Context, sw *p2p.Switch, ssR *statesync.Reactor,
 		lastProgress:        now,
 	}
 	s.init(good)
-	return s.run(ctx, evs)
+	return s.run(ctx, sub)
 }
 
 // init populates stats with the offer's "good" peers, pins them with
@@ -220,7 +221,7 @@ func (s *chunkScheduler) init(good []p2p.ID) {
 
 // run is the main event loop. Returns when all chunks are received
 // (completed = N), all peers are banned, or ctx is cancelled.
-func (s *chunkScheduler) run(ctx context.Context, evs <-chan statesync.Event) (uint64, error) {
+func (s *chunkScheduler) run(ctx context.Context, sub *subscription) (uint64, error) {
 	timeoutTicker := time.NewTicker(2 * time.Second)
 	defer timeoutTicker.Stop()
 
@@ -239,7 +240,9 @@ func (s *chunkScheduler) run(ctx context.Context, evs <-chan statesync.Event) (u
 			now := time.Now()
 			s.onTimeoutTick(now)
 			s.logProgress(now, alive, connected)
-		case ev := <-evs:
+		case ev := <-sub.Ctrl:
+			s.onEvent(ev)
+		case ev := <-sub.Chunk:
 			s.onEvent(ev)
 		}
 
@@ -270,7 +273,9 @@ func (s *chunkScheduler) peerCounts() (alive, connected int) {
 }
 
 // onTimeoutTick handles the 2s ticker: expire timed-out in-flight
-// chunks, mirror manager bans into stats, then redispatch.
+// chunks, mirror manager bans into stats, reconcile against the
+// current peer set (so a dropped Connected event self-heals), then
+// redispatch.
 func (s *chunkScheduler) onTimeoutTick(now time.Time) {
 	for idx, info := range s.inflight {
 		if now.Sub(info.sent) <= s.chunkTimeout {
@@ -300,6 +305,9 @@ func (s *chunkScheduler) onTimeoutTick(now time.Time) {
 			st.banned = true
 		}
 	}
+	for _, p := range s.sw.Peers().List() {
+		s.addProvisional(p)
+	}
 	s.dispatch()
 }
 
@@ -309,12 +317,15 @@ func (s *chunkScheduler) logProgress(now time.Time, alive, connected int) {
 		return
 	}
 	rate := float64(s.doneCount) / now.Sub(s.startTime).Seconds()
+	dropsCtrl, dropsChunk := s.ssR.Drops()
 	s.log.Info("download progress",
 		"chunks", fmt.Sprintf("%d/%d", s.doneCount, s.target.Chunks),
 		"MB", s.bytesTotal.Load()>>20,
 		"chunks_per_s", fmt.Sprintf("%.1f", rate),
 		"peers", fmt.Sprintf("%d/%d", connected, alive),
-		"inflight", len(s.inflight))
+		"inflight", len(s.inflight),
+		"drops_ctrl", dropsCtrl,
+		"drops_chunk", dropsChunk)
 	s.lastProgress = now
 }
 

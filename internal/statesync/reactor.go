@@ -8,7 +8,7 @@
 package statesync
 
 import (
-	"sync"
+	"sync/atomic"
 
 	"github.com/cometbft/cometbft/libs/log"
 	"github.com/cometbft/cometbft/p2p"
@@ -48,11 +48,11 @@ type ChunkInfo struct {
 	Missing bool
 }
 
-// Event is the union surfaced via Out:
-//   - Snapshot != nil  → a SnapshotsResponse arrived
-//   - Chunk != nil     → a ChunkResponse arrived
-//   - Connected        → AddPeer fired (peer just connected)
-//   - Removed          → RemovePeer fired (peer just disconnected)
+// Event is the union surfaced via Out / OutChunks:
+//   - Snapshot != nil  → a SnapshotsResponse arrived (Out)
+//   - Chunk != nil     → a ChunkResponse arrived (OutChunks)
+//   - Connected        → AddPeer fired (Out)
+//   - Removed          → RemovePeer fired (Out)
 //
 // Exactly one of these is set per event.
 type Event struct {
@@ -65,26 +65,33 @@ type Event struct {
 
 // Reactor probes peers for snapshots. AddPeer fires a SnapshotsRequest;
 // inbound SnapshotsResponse is forwarded on Out. ChunkRequest can be
-// dispatched explicitly via RequestChunk.
+// dispatched explicitly via RequestChunk; ChunkResponse is forwarded on
+// OutChunks. The two channels are separate so a 16 MiB chunk burst
+// can't queue tiny control events behind it.
 type Reactor struct {
 	p2p.BaseReactor
-	logger log.Logger
-	Out    chan Event
+	logger    log.Logger
+	Out       chan Event // Connected, Removed, Snapshot
+	OutChunks chan Event // Chunk
 
-	mu        sync.Mutex
-	bytesRecv int64
-	bytesSent int64
+	bytesRecv  atomic.Int64
+	bytesSent  atomic.Int64
+	dropsCtrl  atomic.Int64
+	dropsChunk atomic.Int64
 
 	// AskOnAdd, when true, sends SnapshotsRequest to every peer on AddPeer.
 	// Defaults to true.
 	AskOnAdd bool
 }
 
+const outChunksCapacity = 8
+
 func NewReactor(logger log.Logger) *Reactor {
 	r := &Reactor{
-		logger:   logger,
-		Out:      make(chan Event, 256),
-		AskOnAdd: true,
+		logger:    logger,
+		Out:       make(chan Event, 256),
+		OutChunks: make(chan Event, outChunksCapacity),
+		AskOnAdd:  true,
 	}
 	r.BaseReactor = *p2p.NewBaseReactor("statesync-probe", r)
 	r.BaseReactor.SetLogger(logger)
@@ -126,6 +133,7 @@ func (r *Reactor) AddPeer(peer p2p.Peer) {
 	select {
 	case r.Out <- Event{PeerID: peerID, Connected: true}:
 	default:
+		r.dropsCtrl.Add(1)
 		r.logger.Error("connect Out channel full; dropping", "peer", peerID)
 	}
 	if !r.AskOnAdd {
@@ -133,9 +141,7 @@ func (r *Reactor) AddPeer(peer p2p.Peer) {
 	}
 	req := &ssproto.SnapshotsRequest{}
 	if peer.Send(p2p.Envelope{ChannelID: SnapshotChannel, Message: req}) {
-		r.mu.Lock()
-		r.bytesSent += int64(proto.Size(req))
-		r.mu.Unlock()
+		r.bytesSent.Add(int64(proto.Size(req)))
 		r.logger.Debug("SnapshotsRequest sent", "peer", peer.ID())
 	} else {
 		r.logger.Error("SnapshotsRequest send queue full", "peer", peer.ID())
@@ -149,6 +155,7 @@ func (r *Reactor) RemovePeer(peer p2p.Peer, reason interface{}) {
 	select {
 	case r.Out <- Event{PeerID: peerID, Removed: true}:
 	default:
+		r.dropsCtrl.Add(1)
 		r.logger.Error("disconnect Out channel full; dropping", "peer", peerID)
 	}
 }
@@ -160,17 +167,13 @@ func (r *Reactor) RequestChunk(peer p2p.Peer, height uint64, format, index uint3
 	if !peer.Send(p2p.Envelope{ChannelID: ChunkChannel, Message: req}) {
 		return false
 	}
-	r.mu.Lock()
-	r.bytesSent += int64(proto.Size(req))
-	r.mu.Unlock()
+	r.bytesSent.Add(int64(proto.Size(req)))
 	return true
 }
 
 func (r *Reactor) Receive(env p2p.Envelope) {
 	if pm, ok := env.Message.(proto.Message); ok {
-		r.mu.Lock()
-		r.bytesRecv += int64(proto.Size(pm))
-		r.mu.Unlock()
+		r.bytesRecv.Add(int64(proto.Size(pm)))
 	}
 	peerID := string(env.Src.ID())
 	switch m := env.Message.(type) {
@@ -187,6 +190,7 @@ func (r *Reactor) Receive(env p2p.Envelope) {
 			},
 		}:
 		default:
+			r.dropsCtrl.Add(1)
 			r.logger.Error("snapshot Out channel full; dropping", "peer", peerID)
 		}
 
@@ -203,9 +207,10 @@ func (r *Reactor) Receive(env p2p.Envelope) {
 			copy(ci.Bytes, m.Chunk)
 		}
 		select {
-		case r.Out <- Event{PeerID: peerID, Chunk: ci}:
+		case r.OutChunks <- Event{PeerID: peerID, Chunk: ci}:
 		default:
-			r.logger.Error("chunk Out channel full; dropping", "peer", peerID)
+			r.dropsChunk.Add(1)
+			r.logger.Error("chunk OutChunks channel full; dropping", "peer", peerID)
 		}
 
 	case *ssproto.SnapshotsRequest, *ssproto.ChunkRequest:
@@ -220,7 +225,12 @@ func (r *Reactor) Receive(env p2p.Envelope) {
 
 // Bytes returns recv/sent byte counters across both channels.
 func (r *Reactor) Bytes() (recv, sent int64) {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	return r.bytesRecv, r.bytesSent
+	return r.bytesRecv.Load(), r.bytesSent.Load()
+}
+
+// Drops returns counts of events dropped because the relevant outgoing
+// channel was full. ctrl covers Connected/Removed/Snapshot; chunk
+// covers ChunkResponse.
+func (r *Reactor) Drops() (ctrl, chunk int64) {
+	return r.dropsCtrl.Load(), r.dropsChunk.Load()
 }
