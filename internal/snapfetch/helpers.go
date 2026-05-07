@@ -7,7 +7,7 @@ import (
 	"fmt"
 	"os"
 
-	"github.com/zrbecker/cosmos-p2p/internal/addrbook"
+	"github.com/zrbecker/cosmos-p2p/internal/helpers/addrbook"
 	"github.com/zrbecker/cosmos-p2p/internal/logctx"
 )
 

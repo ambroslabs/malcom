@@ -13,9 +13,9 @@ import (
 	cfg "github.com/cometbft/cometbft/config"
 	"github.com/cometbft/cometbft/p2p"
 	"github.com/cometbft/cometbft/p2p/conn"
-	pexcb "github.com/cometbft/cometbft/p2p/pex"
 	"github.com/cometbft/cometbft/version"
 
+	"github.com/zrbecker/cosmos-p2p/internal/helpers/addrbook"
 	"github.com/zrbecker/cosmos-p2p/internal/helpers/nodekey"
 	"github.com/zrbecker/cosmos-p2p/internal/logctx"
 	"github.com/zrbecker/cosmos-p2p/internal/peers/dead"
@@ -88,26 +88,19 @@ func RunFetch(ctx context.Context, c Config, outRoot string) error {
 	// AddrBook holds peer addresses learned via PEX (and seeded with
 	// our bootstrap_peers list at startup). cometbft's implementation —
 	// JSON-persistent, bucket-balanced, freshness-tracked.
-	if c.AddrBook == "" {
-		return fmt.Errorf("AddrBook path is empty")
+	book, err := addrbook.NewAddrBook(c.AddrBook, log.With("module", "addrbook"))
+	if err != nil {
+		return fmt.Errorf("addrbook: %w", err)
 	}
-	if err := os.MkdirAll(filepath.Dir(c.AddrBook), 0o755); err != nil {
-		return fmt.Errorf("mkdir addrbook dir: %w", err)
-	}
-	book := pexcb.NewAddrBook(c.AddrBook, false /* routabilityStrict */)
-	book.SetLogger(log.With("module", "addrbook"))
 
 	// Dead-peer set: persistent cross-run tombstone for addresses that
 	// repeatedly fail to dial. Without this, PEX gossip would
 	// re-introduce known-dead peers on every run, costing a fresh
 	// MaxDialFailures cycle per stale gossip.
-	if c.DeadPeers == "" {
-		return fmt.Errorf("DeadPeers path is empty")
+	deadSet, err := dead.New(c.DeadPeers)
+	if err != nil {
+		return fmt.Errorf("dead-peers: %w", err)
 	}
-	if err := os.MkdirAll(filepath.Dir(c.DeadPeers), 0o755); err != nil {
-		return fmt.Errorf("mkdir dead-peers dir: %w", err)
-	}
-	deadSet := dead.New(c.DeadPeers)
 	if err := deadSet.Load(); err != nil {
 		log.Error("load dead-peers failed", "path", c.DeadPeers, "err", err)
 	}

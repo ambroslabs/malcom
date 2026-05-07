@@ -26,7 +26,7 @@ import (
 
 	"github.com/zrbecker/cosmos-p2p/internal/blocksync"
 	"github.com/zrbecker/cosmos-p2p/internal/crawler"
-	"github.com/zrbecker/cosmos-p2p/internal/addrbook"
+	"github.com/zrbecker/cosmos-p2p/internal/helpers/addrbook"
 	"github.com/zrbecker/cosmos-p2p/internal/pex"
 )
 

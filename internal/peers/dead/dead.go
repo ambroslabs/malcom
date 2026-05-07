@@ -54,15 +54,20 @@ type Set struct {
 	entries map[string]Entry
 }
 
-// New returns an empty Set bound to path. Call Load to populate from
-// disk; Save writes the current state back atomically.
-func New(path string) *Set {
+// New returns an empty Set bound to path. Errors on empty path. Call
+// Load to populate from disk; Save writes the current state back
+// atomically (Save MkdirAll's the parent dir on demand, so callers
+// don't need to pre-create it).
+func New(path string) (*Set, error) {
+	if path == "" {
+		return nil, fmt.Errorf("dead-peers path is empty")
+	}
 	return &Set{
 		path:    path,
 		cap:     DefaultCap,
 		maxAge:  DefaultMaxAge,
 		entries: map[string]Entry{},
-	}
+	}, nil
 }
 
 // Load reads path into memory, dropping entries older than MaxAge and

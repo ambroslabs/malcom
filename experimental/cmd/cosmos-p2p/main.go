@@ -32,7 +32,7 @@ import (
 	"github.com/cosmos/gogoproto/proto"
 
 	"github.com/zrbecker/cosmos-p2p/internal/blocksync"
-	"github.com/zrbecker/cosmos-p2p/internal/addrbook"
+	"github.com/zrbecker/cosmos-p2p/internal/helpers/addrbook"
 )
 
 func main() {
