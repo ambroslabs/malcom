@@ -81,7 +81,7 @@ func applyFetchDefaults(t *FetchTuning) {
 		t.ChunkTimeout = duration(45 * time.Second)
 	}
 	if t.MaxFetch.Duration() == 0 {
-		t.MaxFetch = duration(30 * time.Minute)
+		t.MaxFetch = duration(60 * time.Minute)
 	}
 	if t.PeerFails == 0 {
 		t.PeerFails = 3
