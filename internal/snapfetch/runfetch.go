@@ -46,7 +46,7 @@ func RunFetch(ctx context.Context, c Config, outRoot string) error {
 	for _, s := range c.BootstrapPeers {
 		s = strings.TrimSpace(s)
 		if s != "" {
-			peerAddrs = append([]peerAddr{{addr: s, source: "bootstrap"}}, peerAddrs...)
+			peerAddrs = append([]addrbook.PeerAddr{{Addr: s, Source: addrbook.SourceBootstrap}}, peerAddrs...)
 		}
 	}
 	if len(peerAddrs) == 0 {
@@ -104,6 +104,25 @@ func RunFetch(ctx context.Context, c Config, outRoot string) error {
 	log.Info("addrbook loaded", "path", c.AddrBook, "size", addrbookCount)
 	log.Info("banlist loaded", "path", c.Banlist, "size", bans.Len())
 
+	// Don't dial ourselves.
+	if selfAddr, err := p2p.NewNetAddressString(p2p.IDAddressString(nodeKey.ID(), listenAddr.DialString())); err == nil {
+		book.AddOurAddress(selfAddr)
+	}
+
+	// Populate is our addrbook load step. We use it instead of cometbft's
+	// auto-load (loadFromFile, which would fire if we called book.Start)
+	// because loadFromFile doesn't apply our banlist:
+	//   - addrbook-sourced addrs that are in the banlist must be skipped.
+	//   - bootstrap addrs clear any existing banlist entry (explicit
+	//     user re-allow).
+	// loadFromFile would re-add banned entries indiscriminately. Cost we
+	// accept: AddAddress creates fresh knownAddress records, so we lose
+	// per-entry history (LastSuccess, Attempts, bucket placement) that
+	// loadFromFile would have restored.
+	res := addrbook.Populate(book, bans, peerAddrs)
+	log.Info("addrbook ready", "path", c.AddrBook,
+		"added", res.Added, "skipped_banned", res.SkippedBanned)
+
 	// PEX reactor: sends PexRequest on every AddPeer, writes received
 	// PexAddrs to the book, and runs a dial loop that grows the
 	// connected-peer set toward TargetPeers in parallel waves. ~30×
@@ -126,38 +145,6 @@ func RunFetch(ctx context.Context, c Config, outRoot string) error {
 	sw.SetAddrBook(book)
 	sw.AddReactor("PEX", pexR)
 	sw.AddReactor("STATESYNC", ssR)
-
-	// Don't dial ourselves.
-	if selfAddr, err := p2p.NewNetAddressString(p2p.IDAddressString(nodeKey.ID(), listenAddr.DialString())); err == nil {
-		book.AddOurAddress(selfAddr)
-	}
-
-	// Pre-populate the book with our peer addrs (bootstrap CSV entries
-	// from chain-registry, plus any addrs loaded from a previous
-	// addrbook.json). Source = peer's own address (it "told us about
-	// itself"). Addrbook-sourced addrs are filtered against the
-	// banlist; user-supplied bootstrap addrs are not (the user
-	// explicitly named them, so they get a fresh chance and any prior
-	// banlist entry is cleared).
-	added := 0
-	skippedBanned := 0
-	for _, s := range peerAddrs {
-		if s.source == "addrbook" && bans.Has(s.addr) {
-			skippedBanned++
-			continue
-		}
-		if s.source == "bootstrap" {
-			bans.Remove(s.addr)
-		}
-		na, err := p2p.NewNetAddressString(s.addr)
-		if err != nil {
-			continue
-		}
-		if err := book.AddAddress(na, na); err == nil {
-			added++
-		}
-	}
-	log.Info("addrbook ready", "path", c.AddrBook, "added", added, "skipped_banned", skippedBanned)
 
 	if err := sw.Start(); err != nil {
 		return fmt.Errorf("switch.Start: %w", err)

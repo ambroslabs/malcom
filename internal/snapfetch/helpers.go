@@ -53,7 +53,7 @@ func parseChunkHashes(metadata []byte) ([][]byte, error) {
 	return out, nil
 }
 
-func loadAddrbookPeers(ctx context.Context, addrBookPath string) []peerAddr {
+func loadAddrbookPeers(ctx context.Context, addrBookPath string) []addrbook.PeerAddr {
 	if addrBookPath == "" {
 		return nil
 	}
@@ -62,7 +62,7 @@ func loadAddrbookPeers(ctx context.Context, addrBookPath string) []peerAddr {
 		logctx.From(ctx).Error("load addrbook failed", "err", err)
 		return nil
 	}
-	out := make([]peerAddr, 0, len(items))
+	out := make([]addrbook.PeerAddr, 0, len(items))
 	seen := map[string]bool{}
 	for _, it := range items {
 		s := it.String()
@@ -70,7 +70,7 @@ func loadAddrbookPeers(ctx context.Context, addrBookPath string) []peerAddr {
 			continue
 		}
 		seen[s] = true
-		out = append(out, peerAddr{addr: s, source: "addrbook"})
+		out = append(out, addrbook.PeerAddr{Addr: s, Source: addrbook.SourceAddrbook})
 	}
 	return out
 }

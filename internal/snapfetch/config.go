@@ -195,11 +195,6 @@ func (c *Config) applyDefaults() {
 	}
 }
 
-// peerAddr is one candidate dial address with provenance — pulled
-// from a previous addrbook.json or from the user's bootstrap_peers
-// CSV. NOT a connection; just an endpoint we might try. Internal.
-type peerAddr struct{ addr, source string }
-
 // snapshotOffer is one (height, format, hash) tuple advertised by ≥1
 // peer. Internal.
 type snapshotOffer struct {

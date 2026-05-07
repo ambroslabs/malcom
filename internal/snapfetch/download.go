@@ -13,6 +13,7 @@ import (
 
 	"github.com/cometbft/cometbft/p2p"
 
+	"github.com/zrbecker/cosmos-p2p/internal/helpers/addrbook"
 	"github.com/zrbecker/cosmos-p2p/internal/logctx"
 	"github.com/zrbecker/cosmos-p2p/internal/statesync"
 )
@@ -45,7 +46,7 @@ type peerStat struct {
 //     mismatch single-strikes them out.
 func download(ctx context.Context, sw *p2p.Switch, ssR *statesync.Reactor,
 	evs chan statesync.Event, target *snapshotOffer, chunkHashes [][]byte,
-	good []p2p.ID, snapDir string, peerAddrs []peerAddr,
+	good []p2p.ID, snapDir string, peerAddrs []addrbook.PeerAddr,
 	perPeer int, chunkTimeout time.Duration, peerFailLimit int,
 	maxRedials int, redialBackoff, maxRedialBackoff time.Duration,
 	provisionalStrikes, provisionalInflight int,
@@ -60,9 +61,9 @@ func download(ctx context.Context, sw *p2p.Switch, ssR *statesync.Reactor,
 	// can't recover the address from the Switch.
 	addrByNodeID := map[string]string{}
 	for _, p := range peerAddrs {
-		parts := strings.SplitN(p.addr, "@", 2)
+		parts := strings.SplitN(p.Addr, "@", 2)
 		if len(parts) == 2 {
-			addrByNodeID[parts[0]] = p.addr
+			addrByNodeID[parts[0]] = p.Addr
 		}
 	}
 

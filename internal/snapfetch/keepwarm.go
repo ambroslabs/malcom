@@ -7,6 +7,7 @@ import (
 
 	"github.com/cometbft/cometbft/p2p"
 
+	"github.com/zrbecker/cosmos-p2p/internal/helpers/addrbook"
 	"github.com/zrbecker/cosmos-p2p/internal/logctx"
 )
 
@@ -19,7 +20,7 @@ import (
 // Addrs are shuffled once at start so we don't bias toward the front
 // of the list, and a cursor advances through the shuffled slice with
 // wraparound — over a long bench, every addr eventually gets a try.
-func runKeepWarm(ctx context.Context, sw *p2p.Switch, peerAddrs []peerAddr,
+func runKeepWarm(ctx context.Context, sw *p2p.Switch, peerAddrs []addrbook.PeerAddr,
 	warmTarget int, refresh time.Duration) {
 
 	if len(peerAddrs) == 0 {
@@ -28,7 +29,7 @@ func runKeepWarm(ctx context.Context, sw *p2p.Switch, peerAddrs []peerAddr,
 	log := logctx.From(ctx)
 	const dialBatch = 4
 
-	shuffled := make([]peerAddr, len(peerAddrs))
+	shuffled := make([]addrbook.PeerAddr, len(peerAddrs))
 	copy(shuffled, peerAddrs)
 	rand.Shuffle(len(shuffled), func(i, j int) {
 		shuffled[i], shuffled[j] = shuffled[j], shuffled[i]
@@ -53,7 +54,7 @@ func runKeepWarm(ctx context.Context, sw *p2p.Switch, peerAddrs []peerAddr,
 		for tries := 0; tries < len(shuffled) && dialed < dialBatch; tries++ {
 			s := shuffled[cursor]
 			cursor = (cursor + 1) % len(shuffled)
-			na, err := p2p.NewNetAddressString(s.addr)
+			na, err := p2p.NewNetAddressString(s.Addr)
 			if err != nil {
 				continue
 			}

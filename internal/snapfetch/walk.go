@@ -8,6 +8,7 @@ import (
 
 	"github.com/cometbft/cometbft/p2p"
 
+	"github.com/zrbecker/cosmos-p2p/internal/helpers/addrbook"
 	"github.com/zrbecker/cosmos-p2p/internal/logctx"
 	"github.com/zrbecker/cosmos-p2p/internal/statesync"
 )
@@ -29,7 +30,7 @@ func walkBackward(
 	sw *p2p.Switch,
 	ssR *statesync.Reactor,
 	mux *eventMux,
-	peerAddrs []peerAddr,
+	peerAddrs []addrbook.PeerAddr,
 	cfg Config,
 ) (*snapshotOffer, []p2p.ID, error) {
 	log := logctx.From(ctx)
@@ -52,7 +53,7 @@ func walkBackward(
 			if i >= kickstartCap {
 				break
 			}
-			addrs = append(addrs, s.addr)
+			addrs = append(addrs, s.Addr)
 		}
 		if err := sw.DialPeersAsync(addrs); err != nil {
 			log.Error("kickstart dial", "err", err)
