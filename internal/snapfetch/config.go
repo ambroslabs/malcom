@@ -37,14 +37,9 @@ type Config struct {
 	// strikes (PeerFailLimit) ban a peer.
 	MaxRedialBackoff time.Duration // default 5m
 
-	// WarmPeerTarget is the connected-peer count below which the
-	// background refresher keeps dialing peer addrs during phase 3.
-	// Without this, peer attrition during a long bank-store import can
-	// starve snapfetch even though plenty of addrs are still reachable.
-	WarmPeerTarget int // default 16
-
-	// WarmRefreshInterval is how often the background refresher checks
-	// the connected count and dials more peer addrs if needed.
+	// WarmRefreshInterval is how often connect.Manager's dial loop
+	// fires. Pinned redials, warm-fill, and dial-failure recording
+	// all happen on this cadence.
 	WarmRefreshInterval time.Duration // default 5s
 
 	TargetHeight uint64
@@ -162,9 +157,6 @@ func (c *Config) applyDefaults() {
 	}
 	if c.MaxDialFailures == 0 {
 		c.MaxDialFailures = 3
-	}
-	if c.WarmPeerTarget == 0 {
-		c.WarmPeerTarget = 16
 	}
 	if c.WarmRefreshInterval == 0 {
 		c.WarmRefreshInterval = 5 * time.Second

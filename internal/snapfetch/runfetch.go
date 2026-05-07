@@ -124,19 +124,11 @@ func RunFetch(ctx context.Context, c Config, outRoot string) error {
 	log.Info("addrbook ready", "path", c.AddrBook,
 		"added", res.Added, "skipped_banned", res.SkippedBanned)
 
-	// PEX reactor: sends PexRequest on every AddPeer, writes received
-	// PexAddrs to the book, and runs a dial loop that grows the
-	// connected-peer set toward TargetPeers in parallel waves. ~30×
-	// more aggressive than cometbft's ensurePeers default — we're a
-	// one-shot fetcher, not a long-running node.
+	// PEX reactor: sends PexRequest on every AddPeer and writes
+	// banlist-filtered PexAddrs into the book. Dialing is owned by
+	// connect.Manager (constructed below) — this reactor is gossip-only.
 	pexR := localpex.NewAutoReactor(book, localpex.AutoConfig{
-		TargetPeers:        c.PEXTargetPeers,
-		MaxPerWave:         c.PEXMaxPerWave,
-		DialInterval:       2 * time.Second,
-		BookBias:           50,
-		MaxDialFailures:    c.MaxDialFailures,
-		FailureBanDuration: 5 * time.Minute,
-		Banlist:            bans,
+		Banlist: bans,
 	}, log.With("module", "pex"))
 
 	sw := p2p.NewSwitch(p2pConfig, transport)
@@ -151,20 +143,28 @@ func RunFetch(ctx context.Context, c Config, outRoot string) error {
 		return fmt.Errorf("switch.Start: %w", err)
 	}
 
-	// connect.Manager owns all outbound dialing for the run: warm-fill
-	// from the static pool (replaces the old runKeepWarm goroutine) and
-	// pinned-redial for peers that download/peerWatch care about
-	// (replaces the old download.tryRedial loop).
+	// connect.Manager owns all outbound dialing for the run:
+	//   - warm-fill from the static pool, then from the cometbft
+	//     addrbook via PickAddress (replaces PEX's old dial loop and
+	//     the old runKeepWarm goroutine);
+	//   - pinned-redial for peers that download/peerWatch care about
+	//     (replaces download.tryRedial);
+	//   - per-addr dial-failure tracking with book.RemoveAddress +
+	//     banlist.Add on threshold (replaces PEX's onDialFail).
 	mgr := connect.New(ctx, connect.Config{
-		Switch:      sw,
-		Book:        book,
-		Pool:        peerAddrs,
-		WarmTarget:  c.WarmPeerTarget,
-		RefreshTick: c.WarmRefreshInterval,
-		Backoff:     c.PeerRedialBackoff,
-		MaxBackoff:  c.MaxRedialBackoff,
-		MaxRedials:  c.MaxRedials,
-		BanDuration: c.AddrBookBanDuration,
+		Switch:          sw,
+		Book:            book,
+		Banlist:         bans,
+		Pool:            peerAddrs,
+		WarmTarget:      c.PEXTargetPeers,
+		DialBatch:       c.PEXMaxPerWave,
+		RefreshTick:     c.WarmRefreshInterval,
+		BookBias:        50,
+		Backoff:         c.PeerRedialBackoff,
+		MaxBackoff:      c.MaxRedialBackoff,
+		MaxRedials:      c.MaxRedials,
+		MaxDialFailures: c.MaxDialFailures,
+		BanDuration:     c.AddrBookBanDuration,
 	})
 	defer mgr.Stop()
 	// Defers run LIFO. book.Save first (fast, JSON dump), then sw.Stop

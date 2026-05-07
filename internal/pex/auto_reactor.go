@@ -1,7 +1,8 @@
-// AutoReactor is the full PEX reactor used by `malcom snapshot fetch`:
-// it sends PexRequest on every AddPeer, receives PexAddrs and writes
-// them to a cometbft AddrBook, and runs a dial loop that grows the
-// connected-peer set toward TargetPeers.
+// AutoReactor is a leaf-only PEX reactor: it sends PexRequest on every
+// AddPeer, receives PexAddrs and writes them to a cometbft AddrBook
+// (filtered against the Banlist), and answers nothing to inbound
+// PexRequests. It does NOT dial — outbound dialing is owned entirely
+// by internal/connect.Manager, which picks from the same AddrBook.
 //
 // We do not serve PEX to inbound peers (we're a leaf, not a seed).
 // Some peers may bench us for not responding to their PexRequest; for
@@ -10,9 +11,6 @@
 package pex
 
 import (
-	"sync"
-	"time"
-
 	"github.com/cometbft/cometbft/libs/log"
 	"github.com/cometbft/cometbft/p2p"
 	"github.com/cometbft/cometbft/p2p/conn"
@@ -21,69 +19,19 @@ import (
 )
 
 // Banlist is the optional persistent banlist of peer addresses. When
-// non-nil:
-//   - PEX-gossiped addresses matching Has() are dropped before
-//     book.AddAddress so re-gossip can't resurrect a banned peer.
-//   - Addresses that hit MaxDialFailures are recorded via Add() so the
-//     verdict survives across process restarts.
+// non-nil, PEX-gossiped addresses matching Has() are dropped before
+// book.AddAddress so re-gossip can't resurrect a banned peer.
 //
 // Implemented by *internal/helpers/banlist.Set; defined as an interface
 // here to keep the pex package free of a hard dependency on it.
 type Banlist interface {
 	Has(addr string) bool
-	Add(addr, reason string)
 }
 
-// AutoConfig tunes the dial loop. Zero values get sensible defaults.
+// AutoConfig holds the gossip-filter dependency.
 type AutoConfig struct {
-	// TargetPeers is the connected-outbound count we aim for. The dial
-	// loop fires waves until (out + dialing) >= TargetPeers.
-	TargetPeers int
-
-	// MaxPerWave caps parallel dials per tick.
-	MaxPerWave int
-
-	// DialInterval is how often the dial loop ticks. Each tick may
-	// fire up to MaxPerWave dials. Receiving fresh PexAddrs also
-	// signals the loop opportunistically.
-	DialInterval time.Duration
-
-	// BookBias passes to AddrBook.PickAddress: 0..100 percent bias
-	// toward "new" (untried) addresses. cometbft convention.
-	BookBias int
-
-	// MaxDialFailures caps consecutive dial failures against an
-	// addrbook entry before it's RemoveAddress'd from the addrbook
-	// entirely. When Banlist is set, the address is also recorded
-	// there so PEX gossip can't reintroduce it on the next run.
-	// 0 disables (the address keeps cycling through MarkBad TTLs).
-	MaxDialFailures int
-
-	// FailureBanDuration is the TTL passed to book.MarkBad on each
-	// pre-threshold dial failure.
-	FailureBanDuration time.Duration
-
-	// Banlist is the optional cross-run banlist. nil disables both
-	// gossip filtering and persistent recording.
+	// Banlist is the optional cross-run banlist for filtering gossip.
 	Banlist Banlist
-}
-
-func (c *AutoConfig) defaults() {
-	if c.TargetPeers == 0 {
-		c.TargetPeers = 50
-	}
-	if c.MaxPerWave == 0 {
-		c.MaxPerWave = 8
-	}
-	if c.DialInterval == 0 {
-		c.DialInterval = 2 * time.Second
-	}
-	if c.BookBias == 0 {
-		c.BookBias = 50
-	}
-	if c.FailureBanDuration == 0 {
-		c.FailureBanDuration = 5 * time.Minute
-	}
 }
 
 type AutoReactor struct {
@@ -91,27 +39,16 @@ type AutoReactor struct {
 	book pexcb.AddrBook
 	cfg  AutoConfig
 	log  log.Logger
-
-	dialCh chan struct{}
-
-	// Per-address consecutive dial-failure counter. Reset on connect.
-	// Once it hits MaxDialFailures we RemoveAddress(addr) so the
-	// addrbook stops accumulating unreachable entries.
-	failMu sync.Mutex
-	fails  map[string]int // key: NetAddress.String()
 }
 
 // NewAutoReactor returns a PEX reactor wired to a cometbft AddrBook.
 // Register on the Switch alongside any state-sync / blocksync reactors
 // and call sw.SetAddrBook(book) before sw.Start().
 func NewAutoReactor(book pexcb.AddrBook, cfg AutoConfig, logger log.Logger) *AutoReactor {
-	cfg.defaults()
 	r := &AutoReactor{
-		book:   book,
-		cfg:    cfg,
-		log:    logger,
-		dialCh: make(chan struct{}, 1),
-		fails:  map[string]int{},
+		book: book,
+		cfg:  cfg,
+		log:  logger,
 	}
 	r.BaseReactor = *p2p.NewBaseReactor("PEX-Auto", r)
 	r.BaseReactor.SetLogger(logger)
@@ -132,37 +69,23 @@ func (r *AutoReactor) GetChannels() []*conn.ChannelDescriptor {
 	}}
 }
 
-// OnStart launches the dial loop.
-func (r *AutoReactor) OnStart() error {
-	go r.dialLoop()
-	return nil
-}
-
-// AddPeer sends a PexRequest, marks the peer "good" in the addrbook
+// AddPeer sends a PexRequest and marks the peer "good" in the addrbook
 // (the addrbook biases future PickAddress calls toward known-good
-// peers, both in this run and after .Save()), clears any pending
-// dial-failure count, and signals the dial loop in case our
-// connected count drops below TargetPeers.
+// peers, both in this run and after .Save()).
 func (r *AutoReactor) AddPeer(peer p2p.Peer) {
 	r.book.MarkGood(peer.ID())
-	r.failMu.Lock()
-	delete(r.fails, peer.SocketAddr().String())
-	r.failMu.Unlock()
 	if !peer.Send(p2p.Envelope{ChannelID: Channel, Message: &tmp2p.PexRequest{}}) {
 		r.log.Debug("PEX: PexRequest send queue full", "peer", peer.ID())
 	}
-	r.kick()
 }
 
-// RemovePeer signals the dial loop to refill if we dropped below
-// TargetPeers.
-func (r *AutoReactor) RemovePeer(peer p2p.Peer, reason interface{}) {
-	r.kick()
-}
+// RemovePeer is a no-op. Reconnection / refill is owned by
+// internal/connect.Manager, which polls Switch.NumPeers() on its tick.
+func (r *AutoReactor) RemovePeer(peer p2p.Peer, reason interface{}) {}
 
 // Receive handles inbound PEX messages. We answer PexRequest with
 // nothing (intentional — we're a leaf). PexAddrs entries land in the
-// AddrBook keyed by the peer who told us.
+// AddrBook keyed by the peer who told us, after banlist filtering.
 func (r *AutoReactor) Receive(env p2p.Envelope) {
 	switch m := env.Message.(type) {
 	case *tmp2p.PexRequest:
@@ -199,97 +122,4 @@ func (r *AutoReactor) handleAddrs(src p2p.Peer, raw []tmp2p.NetAddress) {
 		r.log.Debug("PEX: gossip processed",
 			"from", src.ID(), "added", added, "skipped_banned", skippedBanned, "book_size", r.book.Size())
 	}
-	if added > 0 {
-		r.kick()
-	}
-}
-
-func (r *AutoReactor) dialLoop() {
-	t := time.NewTicker(r.cfg.DialInterval)
-	defer t.Stop()
-	for {
-		select {
-		case <-r.Quit():
-			return
-		case <-t.C:
-		case <-r.dialCh:
-		}
-		r.dialWave()
-	}
-}
-
-// dialWave fires up to MaxPerWave parallel dials toward TargetPeers.
-// It uses Switch.IsDialingOrExistingAddress to skip duplicates and
-// MarkAttempt on the book so PickAddress's freshness scoring stays
-// honest.
-func (r *AutoReactor) dialWave() {
-	sw := r.Switch
-	if sw == nil {
-		return
-	}
-	out, _, dialing := sw.NumPeers()
-	need := r.cfg.TargetPeers - out - dialing
-	if need <= 0 {
-		return
-	}
-	if need > r.cfg.MaxPerWave {
-		need = r.cfg.MaxPerWave
-	}
-	fired := 0
-	// Cap iterations defensively — if every PickAddress returns a
-	// duplicate we don't want an infinite loop.
-	for tries := 0; tries < need*4 && fired < need; tries++ {
-		addr := r.book.PickAddress(r.cfg.BookBias)
-		if addr == nil {
-			return
-		}
-		if sw.IsDialingOrExistingAddress(addr) {
-			continue
-		}
-		r.book.MarkAttempt(addr)
-		fired++
-		go func(a *p2p.NetAddress) {
-			if err := sw.DialPeerWithAddress(a); err != nil {
-				r.onDialFail(a, err)
-			}
-		}(addr)
-	}
-}
-
-func (r *AutoReactor) kick() {
-	select {
-	case r.dialCh <- struct{}{}:
-	default:
-	}
-}
-
-// onDialFail bumps the per-address failure counter. Pre-threshold
-// failures get a soft MarkBad with FailureBanDuration TTL so the
-// addrbook stops re-picking the address during the current ban
-// window. Once the counter hits MaxDialFailures, the address is
-// RemoveAddress'd from the addrbook entirely — preventing the
-// on-disk file from accumulating unreachable entries across runs. PEX
-// gossip will re-add the address if the peer comes back online.
-func (r *AutoReactor) onDialFail(a *p2p.NetAddress, dialErr error) {
-	key := a.String()
-	r.failMu.Lock()
-	r.fails[key]++
-	count := r.fails[key]
-	r.failMu.Unlock()
-
-	r.log.Debug("PEX: dial failed", "addr", a, "err", dialErr, "consecutive_fails", count)
-
-	if r.cfg.MaxDialFailures > 0 && count >= r.cfg.MaxDialFailures {
-		r.book.RemoveAddress(a)
-		if r.cfg.Banlist != nil {
-			r.cfg.Banlist.Add(key, "max-dial-failures")
-		}
-		r.failMu.Lock()
-		delete(r.fails, key)
-		r.failMu.Unlock()
-		r.log.Debug("PEX: removed address from book (max dial failures)",
-			"addr", a, "fails", count)
-		return
-	}
-	r.book.MarkBad(a, r.cfg.FailureBanDuration)
 }
