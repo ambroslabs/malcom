@@ -521,6 +521,48 @@ func TestChunkSchedulerResumePartialMix(t *testing.T) {
 	}
 }
 
+func TestChunkSchedulerResumeRemovesOrphanChunks(t *testing.T) {
+	s, bodies := resumeScheduler(t, 3)
+
+	// In-range valid chunk: kept.
+	writeChunk(t, s.snapDir, 0, bodies[0])
+	// Out-of-range orphans from a prior run that picked a 6-chunk
+	// offer: must be removed so disk usage tracks the current offer.
+	writeChunk(t, s.snapDir, 4, []byte("orphan-4"))
+	writeChunk(t, s.snapDir, 5, []byte("orphan-5"))
+
+	resumed, removed := s.resumeFromDisk()
+	if resumed != 1 || removed != 2 {
+		t.Fatalf("resumeFromDisk = (%d,%d), want (1,2)", resumed, removed)
+	}
+	for _, idx := range []uint32{4, 5} {
+		path := filepath.Join(s.snapDir, fmt.Sprintf("chunk_%05d.bin", idx))
+		if _, err := os.Stat(path); !os.IsNotExist(err) {
+			t.Fatalf("orphan chunk %d not removed: stat err = %v", idx, err)
+		}
+	}
+	if !s.completed[0] {
+		t.Fatalf("in-range valid chunk wrongly cleared")
+	}
+}
+
+func TestChunkSchedulerResumeSweepsStaleTmpFiles(t *testing.T) {
+	s, _ := resumeScheduler(t, 2)
+
+	tmp := filepath.Join(s.snapDir, "chunk_00000.bin.tmp")
+	if err := os.WriteFile(tmp, []byte("partial-write"), 0o644); err != nil {
+		t.Fatalf("seed tmp: %v", err)
+	}
+
+	resumed, removed := s.resumeFromDisk()
+	if resumed != 0 || removed != 1 {
+		t.Fatalf("resumeFromDisk = (%d,%d), want (0,1)", resumed, removed)
+	}
+	if _, err := os.Stat(tmp); !os.IsNotExist(err) {
+		t.Fatalf("stale tmp not removed: stat err = %v", err)
+	}
+}
+
 func TestChunkSchedulerPickPeerProvisionalSlotsLimited(t *testing.T) {
 	b := newScenario(t)
 	b.target.Chunks = 5

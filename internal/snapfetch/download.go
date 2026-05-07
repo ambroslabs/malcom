@@ -8,6 +8,8 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strconv"
+	"strings"
 	"sync/atomic"
 	"time"
 
@@ -222,34 +224,85 @@ func (s *chunkScheduler) init(good []p2p.ID) {
 	s.dispatch()
 }
 
-// resumeFromDisk scans snapDir for chunk_<idx>.bin files left over by
-// a prior partial fetch. Each file is SHA256-verified against the
-// chosen offer's chunk_hashes — matches are pre-marked completed so
-// the dispatcher skips them; mismatches are removed so they get
-// re-fetched. Returns (resumed, removed) for logging.
+// resumeFromDisk scans snapDir for chunk artefacts left by a prior
+// partial fetch. Each in-range chunk_<idx>.bin is SHA256-verified
+// against the chosen offer's chunk_hashes — matches are pre-marked
+// completed so the dispatcher skips them; mismatches are removed.
+// Out-of-range chunk_<idx>.bin files (orphans from a prior run that
+// picked an offer with more chunks) and chunk_*.bin.tmp leftovers
+// from a crash mid-rename are also swept. Returns (resumed, removed)
+// for logging.
 //
 // Reuses the same verification logic as onChunk; the only difference
 // is the bytes are read from disk instead of arriving in a
 // ChunkResponse. Called from init() before the first dispatch.
 func (s *chunkScheduler) resumeFromDisk() (resumed, removed int) {
-	for i := uint32(0); i < s.target.Chunks; i++ {
-		path := filepath.Join(s.snapDir, fmt.Sprintf("chunk_%05d.bin", i))
-		data, err := os.ReadFile(path)
-		if err != nil {
+	entries, err := os.ReadDir(s.snapDir)
+	if err != nil {
+		s.log.Error("resume: read snap dir", "path", s.snapDir, "err", err)
+		return
+	}
+	for _, e := range entries {
+		if e.IsDir() {
+			continue
+		}
+		name := e.Name()
+		if !strings.HasPrefix(name, "chunk_") {
+			continue
+		}
+		path := filepath.Join(s.snapDir, name)
+		// Stale tmp from a crash mid writeFileAtomic (live runs never
+		// see it — rename clears the tmp in the same syscall).
+		if strings.HasSuffix(name, ".bin.tmp") {
+			if err := os.Remove(path); err != nil {
+				s.log.Error("resume: remove stale tmp", "name", name, "err", err)
+				continue
+			}
+			removed++
+			continue
+		}
+		if !strings.HasSuffix(name, ".bin") {
+			continue
+		}
+		idxStr := strings.TrimSuffix(strings.TrimPrefix(name, "chunk_"), ".bin")
+		idx64, perr := strconv.ParseUint(idxStr, 10, 32)
+		if perr != nil {
+			continue
+		}
+		idx := uint32(idx64)
+		// Orphan: prior run picked an offer with more chunks. Drop
+		// the file so disk usage tracks the current offer.
+		if idx >= s.target.Chunks {
+			if err := os.Remove(path); err != nil {
+				s.log.Error("resume: remove orphan chunk", "idx", idx, "err", err)
+				continue
+			}
+			removed++
+			continue
+		}
+		// Already marked completed (dup file, e.g. chunk_00001.bin and
+		// chunk_001.bin both decoding to idx=1) — skip the second one
+		// to keep doneCount/bytesTotal honest.
+		if s.completed[idx] {
+			continue
+		}
+		data, rerr := os.ReadFile(path)
+		if rerr != nil {
+			// Read errors leave the file alone; the dispatcher's
+			// atomic rename will clobber it during a refetch.
 			continue
 		}
 		h := sha256.Sum256(data)
-		if bytes.Equal(h[:], s.chunkHashes[i]) {
-			s.completed[i] = true
-			s.pending[i] = false
+		if bytes.Equal(h[:], s.chunkHashes[idx]) {
+			s.completed[idx] = true
+			s.pending[idx] = false
 			s.bytesTotal.Add(uint64(len(data)))
 			s.doneCount++
 			resumed++
 			continue
 		}
 		if rmErr := os.Remove(path); rmErr != nil {
-			s.log.Error("resume: remove stale chunk",
-				"idx", i, "err", rmErr)
+			s.log.Error("resume: remove stale chunk", "idx", idx, "err", rmErr)
 			continue
 		}
 		removed++
