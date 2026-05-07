@@ -47,18 +47,23 @@ func (s *fakeWatchSwitch) wasStopped(pid p2p.ID) bool {
 
 // fakeWatchBook is a pexcb.AddrBook with just MarkBad recording.
 type fakeWatchBook struct {
-	mu        sync.Mutex
-	markedBad map[string]int
+	mu              sync.Mutex
+	markedBad       map[string]int
+	markBadDuration map[string]time.Duration // last TTL forwarded to MarkBad
 }
 
 func newFakeWatchBook() *fakeWatchBook {
-	return &fakeWatchBook{markedBad: map[string]int{}}
+	return &fakeWatchBook{
+		markedBad:       map[string]int{},
+		markBadDuration: map[string]time.Duration{},
+	}
 }
 
-func (b *fakeWatchBook) MarkBad(addr *p2p.NetAddress, _ time.Duration) {
+func (b *fakeWatchBook) MarkBad(addr *p2p.NetAddress, d time.Duration) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	b.markedBad[addr.String()]++
+	b.markBadDuration[addr.String()] = d
 }
 
 // pexcb.AddrBook surface — defaults.
@@ -184,6 +189,9 @@ func TestPeerWatchOnConnectRequireChannelMissingBans(t *testing.T) {
 	if b.book.markedBad[addrStr] == 0 {
 		t.Fatalf("book.MarkBad not invoked")
 	}
+	if got := b.book.markBadDuration[addrStr]; got != time.Hour {
+		t.Fatalf("book.MarkBad duration=%s, want banDuration=%s", got, time.Hour)
+	}
 }
 
 func TestPeerWatchOnDisconnectClearsFirstSeen(t *testing.T) {
@@ -204,14 +212,13 @@ func TestPeerWatchOnDisconnectClearsFirstSeen(t *testing.T) {
 
 func TestPeerWatchTickEvictsAfterGrace(t *testing.T) {
 	b := newPeerWatchScenario(t)
-	// Tiny grace so we don't have to wait.
-	w := b.build(100, 1*time.Millisecond, false)
+	// grace=0 → any peer without the useful flag expires on next tick.
+	// Avoids wall-clock flakiness on loaded CI runners.
+	w := b.build(100, 0, false)
 
 	peer := newFakePeer("peer-A", "1.1.1.1", 26656)
 	b.sw.peerSet.Add(peer)
 	w.onConnect(peer.ID())
-
-	time.Sleep(5 * time.Millisecond) // exceed grace
 
 	w.tick()
 
@@ -226,14 +233,12 @@ func TestPeerWatchTickEvictsAfterGrace(t *testing.T) {
 
 func TestPeerWatchUsefulPeerImmuneToTick(t *testing.T) {
 	b := newPeerWatchScenario(t)
-	w := b.build(100, 1*time.Millisecond, false)
+	w := b.build(100, 0, false)
 
 	peer := newFakePeer("peer-A", "1.1.1.1", 26656)
 	b.sw.peerSet.Add(peer)
 	w.onConnect(peer.ID())
 	w.markUseful(peer.ID())
-
-	time.Sleep(5 * time.Millisecond)
 
 	w.tick()
 
@@ -244,13 +249,11 @@ func TestPeerWatchUsefulPeerImmuneToTick(t *testing.T) {
 
 func TestPeerWatchMinHeightZeroDisablesChurning(t *testing.T) {
 	b := newPeerWatchScenario(t)
-	w := b.build(0, 1*time.Millisecond, false) // minHeight = 0 → no churning
+	w := b.build(0, 0, false) // minHeight = 0 → tick() short-circuits regardless of grace
 
 	peer := newFakePeer("peer-A", "1.1.1.1", 26656)
 	b.sw.peerSet.Add(peer)
 	w.onConnect(peer.ID())
-
-	time.Sleep(5 * time.Millisecond)
 
 	w.tick()
 
@@ -261,13 +264,12 @@ func TestPeerWatchMinHeightZeroDisablesChurning(t *testing.T) {
 
 func TestPeerWatchIsBannedAfterEviction(t *testing.T) {
 	b := newPeerWatchScenario(t)
-	w := b.build(100, 1*time.Millisecond, false)
+	w := b.build(100, 0, false)
 
 	peer := newFakePeer("peer-A", "1.1.1.1", 26656)
 	b.sw.peerSet.Add(peer)
 	w.onConnect(peer.ID())
 
-	time.Sleep(5 * time.Millisecond)
 	w.tick()
 
 	if !w.isBanned(peer.ID()) {

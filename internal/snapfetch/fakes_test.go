@@ -10,8 +10,8 @@ import (
 	cmtlog "github.com/cometbft/cometbft/libs/log"
 	"github.com/cometbft/cometbft/p2p"
 	"github.com/cometbft/cometbft/p2p/conn"
-	pexcb "github.com/cometbft/cometbft/p2p/pex"
-	tmp2p "github.com/cometbft/cometbft/proto/tendermint/p2p"
+
+	"github.com/zrbecker/cosmos-p2p/internal/statesync"
 )
 
 // fakePeer satisfies p2p.Peer just enough for our tests.
@@ -30,14 +30,15 @@ func newFakePeer(id string, host string, port uint16) *fakePeer {
 		addr: na,
 		info: p2p.DefaultNodeInfo{
 			DefaultNodeID: pid,
-			Channels:      []byte{0x60, 0x61},
+			Channels:      []byte{statesync.SnapshotChannel, statesync.ChunkChannel},
 		},
 	}
 }
 
 func (p *fakePeer) ID() p2p.ID                    { return p.id }
 func (p *fakePeer) RemoteIP() net.IP              { return p.addr.IP }
-func (p *fakePeer) RemoteAddr() net.Addr          { return nil }
+func (p *fakePeer) RemoteAddr() net.Addr          { return nil } // unused by code under test; nil-deref will panic loudly if that changes
+
 func (p *fakePeer) IsOutbound() bool              { return true }
 func (p *fakePeer) IsPersistent() bool            { return false }
 func (p *fakePeer) CloseConn() error              { return nil }
@@ -96,7 +97,8 @@ func (s *fakePeerSet) Has(id p2p.ID) bool {
 	return ok
 }
 
-func (s *fakePeerSet) HasIP(net.IP) bool { return false }
+func (s *fakePeerSet) HasIP(net.IP) bool { return false } // no caller exercises this; implement against s.peers if a test needs it
+
 
 func (s *fakePeerSet) Get(id p2p.ID) p2p.Peer {
 	s.mu.Lock()
@@ -146,9 +148,9 @@ func (s *fakeSchedulerSwitch) NumPeers() (int, int, int) {
 type fakeReactor struct {
 	mu       sync.Mutex
 	requests []chunkRequest
-	// reply controls whether RequestChunk returns true (success) or
-	// false (send-queue full).
-	reply bool
+	// requestChunkOK is the value RequestChunk returns: true for the
+	// happy path, false to simulate a full send queue.
+	requestChunkOK bool
 }
 
 type chunkRequest struct {
@@ -159,7 +161,7 @@ type chunkRequest struct {
 }
 
 func newFakeReactor() *fakeReactor {
-	return &fakeReactor{reply: true}
+	return &fakeReactor{requestChunkOK: true}
 }
 
 func (r *fakeReactor) RequestChunk(peer p2p.Peer, height uint64, format, index uint32) bool {
@@ -168,7 +170,7 @@ func (r *fakeReactor) RequestChunk(peer p2p.Peer, height uint64, format, index u
 	r.requests = append(r.requests, chunkRequest{
 		PeerID: peer.ID(), Height: height, Format: format, Index: index,
 	})
-	return r.reply
+	return r.requestChunkOK
 }
 
 func (r *fakeReactor) sentTo(pid p2p.ID, idx uint32) bool {
@@ -226,9 +228,3 @@ func (m *fakeManager) banReason(pid p2p.ID) string {
 	defer m.mu.Unlock()
 	return m.banned[pid]
 }
-
-// silence unused-import warnings; pexcb and tmp2p only used via type assertions in some tests below.
-var (
-	_ pexcb.AddrBook
-	_ tmp2p.Message
-)
