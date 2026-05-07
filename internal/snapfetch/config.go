@@ -26,7 +26,7 @@ type Config struct {
 	MinGoodPeers      int           // default 1
 	PerPeerLimit      int           // default 2
 	ChunkTimeout      time.Duration // default 45s
-	MaxFetchTime      time.Duration // default 30m
+	MaxFetchTime      time.Duration // default 60m
 	PeerFailLimit     int           // default 3 (hash-mismatch / missing-chunk strikes before ban)
 	MaxRedials        int           // default 5 (consecutive disconnect/redial cycles before benching). 0 = unlimited.
 	PeerRedialBackoff time.Duration // default 5s — base backoff between redial attempts; doubles on each retry up to MaxRedialBackoff
@@ -132,7 +132,7 @@ func (c *Config) applyDefaults() {
 		c.ChunkTimeout = 45 * time.Second
 	}
 	if c.MaxFetchTime == 0 {
-		c.MaxFetchTime = 30 * time.Minute
+		c.MaxFetchTime = 60 * time.Minute
 	}
 	if c.PeerFailLimit == 0 {
 		c.PeerFailLimit = 3

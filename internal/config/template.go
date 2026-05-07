@@ -23,7 +23,7 @@ default_chain = %q
 # during the actual chunk download.
 per_peer       = 2          # max in-flight chunks per peer
 chunk_timeout  = "45s"      # per-chunk request timeout
-max_fetch      = "30m"      # hard cap on full download
+max_fetch      = "60m"      # hard cap on full download — raise on slow links / flaky peer sets
 peer_fails     = 3          # missing/hash-mismatch strikes before banning
 peer_redials   = 5          # disconnect/redial cycles before benching a flapping peer
 redial_backoff = "5s"

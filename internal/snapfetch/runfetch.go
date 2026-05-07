@@ -42,6 +42,12 @@ func RunFetch(ctx context.Context, c Config, outRoot string) error {
 	bytesTotal, err := s.download(fetchCtx, offer, good, chunkHashes, snapDir)
 	fetchCancel()
 	if err != nil {
+		// Distinguish our timeout from a parent cancel (Ctrl-C). Only
+		// the former wants the config-knob hint.
+		if fetchCtx.Err() == context.DeadlineExceeded && ctx.Err() == nil {
+			return fmt.Errorf("download exceeded max_fetch=%s — raise [chains.%s.fetch] max_fetch in config.toml: %w",
+				c.MaxFetchTime, c.ChainID, err)
+		}
 		return fmt.Errorf("download failed: %w", err)
 	}
 
