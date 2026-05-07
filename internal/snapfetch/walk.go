@@ -31,9 +31,7 @@ func walkBackward(
 	mux *eventMux,
 	peerAddrs []peerAddr,
 	cfg Config,
-	addrByNodeID map[string]string,
 ) (*snapshotOffer, []p2p.ID, error) {
-	_ = addrByNodeID
 	log := logctx.From(ctx)
 
 	// Subscribe to events BEFORE dialing so any SnapshotsResponse

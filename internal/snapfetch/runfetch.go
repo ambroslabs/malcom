@@ -52,13 +52,6 @@ func RunFetch(ctx context.Context, c Config, outRoot string) error {
 	if len(peerAddrs) == 0 {
 		return fmt.Errorf("no peer addrs available")
 	}
-	addrByNodeID := map[string]string{}
-	for _, s := range peerAddrs {
-		parts := strings.SplitN(s.addr, "@", 2)
-		if len(parts) == 2 {
-			addrByNodeID[parts[0]] = s.addr
-		}
-	}
 	log.Info("starting",
 		"node_id", string(nodeKey.ID()), "peer_addrs", len(peerAddrs))
 
@@ -219,8 +212,7 @@ func RunFetch(ctx context.Context, c Config, outRoot string) error {
 	// Walk: dial peer addrs, warm up, then probe target heights in
 	// descending order until one peer serves chunk-0. No rescan
 	// loop — if the walk exhausts the freshness window, error out.
-	chosen, goodPeers, err = walkBackward(ctx, sw, ssR, mux, peerAddrs,
-		c, addrByNodeID)
+	chosen, goodPeers, err = walkBackward(ctx, sw, ssR, mux, peerAddrs, c)
 	if err != nil {
 		return err
 	}
@@ -248,7 +240,7 @@ func RunFetch(ctx context.Context, c Config, outRoot string) error {
 	// ─── Download all chunks ──────────────────────────────────────────
 	fetchCtx, fetchCancel := context.WithTimeout(ctx, c.MaxFetchTime)
 	bt, derr := download(fetchCtx, sw, ssR, mux.subscribe(),
-		chosen, chunkHashes, goodPeers, addrByNodeID, snapDir, peerAddrs,
+		chosen, chunkHashes, goodPeers, snapDir, peerAddrs,
 		c.PerPeerLimit, c.ChunkTimeout, c.PeerFailLimit,
 		c.MaxRedials, c.PeerRedialBackoff, c.MaxRedialBackoff,
 		c.ProvisionalProbeStrikes, c.ProvisionalProbeInflight,

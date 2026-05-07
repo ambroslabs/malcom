@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync/atomic"
 	"time"
 
@@ -44,7 +45,7 @@ type peerStat struct {
 //     mismatch single-strikes them out.
 func download(ctx context.Context, sw *p2p.Switch, ssR *statesync.Reactor,
 	evs chan statesync.Event, target *snapshotOffer, chunkHashes [][]byte,
-	good []p2p.ID, addrByNodeID map[string]string, snapDir string, peerAddrs []peerAddr,
+	good []p2p.ID, snapDir string, peerAddrs []peerAddr,
 	perPeer int, chunkTimeout time.Duration, peerFailLimit int,
 	maxRedials int, redialBackoff, maxRedialBackoff time.Duration,
 	provisionalStrikes, provisionalInflight int,
@@ -52,6 +53,18 @@ func download(ctx context.Context, sw *p2p.Switch, ssR *statesync.Reactor,
 	watch *peerWatch) (uint64, error) {
 
 	log := logctx.From(ctx)
+
+	// Map peer node-ID → full dial address ("nodeID@host:port"). Used by
+	// tryRedial below to dial a peer we previously connected to but
+	// dropped — sw.Peers().Get returns nil once disconnected, so we
+	// can't recover the address from the Switch.
+	addrByNodeID := map[string]string{}
+	for _, p := range peerAddrs {
+		parts := strings.SplitN(p.addr, "@", 2)
+		if len(parts) == 2 {
+			addrByNodeID[parts[0]] = p.addr
+		}
+	}
 
 	// banAndDrop disconnects + addrbook-bans a misbehaving peer so
 	// PEX can dial a replacement (banned peers occupying connection
