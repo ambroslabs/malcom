@@ -13,7 +13,7 @@ import (
 )
 
 // walkBackward replaces the old discover→rank→race-probe pipeline with
-// a direct walk: it dials seeds, lets PEX warm the peer set for ~3s,
+// a direct walk: it dials our peer addrs, lets PEX warm the peer set for ~3s,
 // then iterates target heights in descending order (interval-aligned)
 // from floor(MaxHeight, interval) down to MinHeight. For each target
 // it asks every offering peer for chunk-0 and accepts the first valid
@@ -29,7 +29,7 @@ func walkBackward(
 	sw *p2p.Switch,
 	ssR *statesync.Reactor,
 	mux *eventMux,
-	seeds []peerSeed,
+	peerAddrs []peerAddr,
 	cfg Config,
 	addrByNodeID map[string]string,
 	logger cmtlog.Logger,
@@ -37,20 +37,20 @@ func walkBackward(
 	_ = addrByNodeID
 
 	// Subscribe to events BEFORE dialing so any SnapshotsResponse
-	// arriving during the seed-dial wave + warmup is captured (the
-	// mux drops events when there are no subscribers).
+	// arriving during the kickstart-dial wave + warmup is captured
+	// (the mux drops events when there are no subscribers).
 	evs := mux.subscribe()
 
-	// Kickstart: fire-and-forget dials to a capped subset of seeds.
-	// We don't wait for results — each unreachable peer can take 30s+
-	// to time out, and with PEX-accumulated addrbooks of thousands of
-	// peers a synchronous wait would stall fetch for tens of minutes.
-	// PEX's auto-dial loop (running on a 2s tick against the addrbook)
-	// handles the rest.
+	// Kickstart: fire-and-forget dials to a capped subset of our peer
+	// addrs. We don't wait for results — each unreachable peer can
+	// take 30s+ to time out, and with PEX-accumulated addrbooks of
+	// thousands of entries a synchronous wait would stall fetch for
+	// tens of minutes. PEX's auto-dial loop (2s tick over the
+	// addrbook) handles the rest.
 	const kickstartCap = 64
 	{
 		addrs := make([]string, 0, kickstartCap)
-		for i, s := range seeds {
+		for i, s := range peerAddrs {
 			if i >= kickstartCap {
 				break
 			}

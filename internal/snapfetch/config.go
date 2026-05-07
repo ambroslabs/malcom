@@ -39,13 +39,13 @@ type Config struct {
 	MaxRedialBackoff time.Duration // default 5m
 
 	// WarmPeerTarget is the connected-peer count below which the
-	// background refresher keeps dialing seeds during phase 3. Without
-	// this, peer attrition during a long bank-store import can starve
-	// snapfetch even though plenty of seeds are still reachable.
+	// background refresher keeps dialing peer addrs during phase 3.
+	// Without this, peer attrition during a long bank-store import can
+	// starve snapfetch even though plenty of addrs are still reachable.
 	WarmPeerTarget int // default 16
 
 	// WarmRefreshInterval is how often the background refresher checks
-	// the connected count and dials more seeds if needed.
+	// the connected count and dials more peer addrs if needed.
 	WarmRefreshInterval time.Duration // default 5s
 
 	TargetHeight uint64
@@ -204,9 +204,12 @@ func (c *Config) applyDefaults() {
 	}
 }
 
-// peerSeed is one address (with provenance) pulled from the addrbook or
-// addrbook. Internal.
-type peerSeed struct{ addr, source string }
+// peerAddr is one candidate dial address with provenance — pulled
+// from a previous addrbook.json or from the user's bootstrap_peers
+// CSV. NOT a connection; just an endpoint we might try. Named
+// "peerAddr" rather than "seed" because in cosmos terminology a "seed"
+// is a specific kind of node (PEX-only relay). Internal.
+type peerAddr struct{ addr, source string }
 
 // snapshotOffer is one (height, format, hash) tuple advertised by ≥1
 // peer. Internal.

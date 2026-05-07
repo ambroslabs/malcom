@@ -39,26 +39,26 @@ func RunFetch(ctx context.Context, c Config, outRoot string) error {
 		return fmt.Errorf("node key: %w", err)
 	}
 
-	seeds := loadAddrBookSeeds(c.AddrBook, logger)
-	addrbookCount := len(seeds)
+	peerAddrs := loadAddrbookPeers(c.AddrBook, logger)
+	addrbookCount := len(peerAddrs)
 	for _, s := range strings.Split(c.BootstrapPeersCSV, ",") {
 		s = strings.TrimSpace(s)
 		if s != "" {
-			seeds = append([]peerSeed{{addr: s, source: "bootstrap"}}, seeds...)
+			peerAddrs = append([]peerAddr{{addr: s, source: "bootstrap"}}, peerAddrs...)
 		}
 	}
-	if len(seeds) == 0 {
-		return fmt.Errorf("no seeds available")
+	if len(peerAddrs) == 0 {
+		return fmt.Errorf("no peer addrs available")
 	}
 	addrByNodeID := map[string]string{}
-	for _, s := range seeds {
+	for _, s := range peerAddrs {
 		parts := strings.SplitN(s.addr, "@", 2)
 		if len(parts) == 2 {
 			addrByNodeID[parts[0]] = s.addr
 		}
 	}
 	logger.With("module", "snapfetch").Info("starting",
-		"node_id", string(nodeKey.ID()), "seeds", len(seeds))
+		"node_id", string(nodeKey.ID()), "peer_addrs", len(peerAddrs))
 
 	listenAddr, err := p2p.NewNetAddressString(p2p.IDAddressString(nodeKey.ID(), c.Listen))
 	if err != nil {
@@ -147,15 +147,16 @@ func RunFetch(ctx context.Context, c Config, outRoot string) error {
 		book.AddOurAddress(selfAddr)
 	}
 
-	// Seed the book with our bootstrap_peers (chain-registry entries).
-	// Source = peer's own address (it "told us about itself"). Seeds
-	// loaded from a previous addrbook.json are filtered against the
-	// dead set; user-supplied bootstrap addrs are not (the user
-	// explicitly named them, so they get a fresh chance and any prior
-	// dead-set entry is cleared).
-	seeded := 0
+	// Pre-populate the book with our peer addrs (bootstrap CSV entries
+	// from chain-registry, plus any addrs loaded from a previous
+	// addrbook.json). Source = peer's own address (it "told us about
+	// itself"). Addrbook-sourced addrs are filtered against the dead
+	// set; user-supplied bootstrap addrs are not (the user explicitly
+	// named them, so they get a fresh chance and any prior dead-set
+	// entry is cleared).
+	added := 0
 	skippedDead := 0
-	for _, s := range seeds {
+	for _, s := range peerAddrs {
 		if s.source == "addrbook" && deadSet.Has(s.addr) {
 			skippedDead++
 			continue
@@ -168,11 +169,11 @@ func RunFetch(ctx context.Context, c Config, outRoot string) error {
 			continue
 		}
 		if err := book.AddAddress(na, na); err == nil {
-			seeded++
+			added++
 		}
 	}
 	logger.With("module", "snapfetch").Info("addrbook ready",
-		"path", bookPath, "seeded", seeded, "skipped_dead", skippedDead)
+		"path", bookPath, "added", added, "skipped_dead", skippedDead)
 
 	if err := sw.Start(); err != nil {
 		return fmt.Errorf("switch.Start: %w", err)
@@ -219,10 +220,10 @@ func RunFetch(ctx context.Context, c Config, outRoot string) error {
 		chunkHashes [][]byte
 	)
 
-	// Walk: dial seeds, warm up, then probe target heights in
+	// Walk: dial peer addrs, warm up, then probe target heights in
 	// descending order until one peer serves chunk-0. No rescan
 	// loop — if the walk exhausts the freshness window, error out.
-	chosen, goodPeers, err = walkBackward(ctx, sw, ssR, mux, seeds,
+	chosen, goodPeers, err = walkBackward(ctx, sw, ssR, mux, peerAddrs,
 		c, addrByNodeID, flog)
 	if err != nil {
 		return err
@@ -251,7 +252,7 @@ func RunFetch(ctx context.Context, c Config, outRoot string) error {
 	// ─── Download all chunks ──────────────────────────────────────────
 	fetchCtx, fetchCancel := context.WithTimeout(ctx, c.MaxFetchTime)
 	bt, derr := download(fetchCtx, sw, ssR, mux.subscribe(),
-		chosen, chunkHashes, goodPeers, addrByNodeID, snapDir, seeds,
+		chosen, chunkHashes, goodPeers, addrByNodeID, snapDir, peerAddrs,
 		c.PerPeerLimit, c.ChunkTimeout, c.PeerFailLimit,
 		c.MaxRedials, c.PeerRedialBackoff, c.MaxRedialBackoff,
 		c.ProvisionalProbeStrikes, c.ProvisionalProbeInflight,

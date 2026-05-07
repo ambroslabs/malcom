@@ -9,25 +9,25 @@ import (
 	"github.com/cometbft/cometbft/p2p"
 )
 
-// runKeepWarm dials seeds in the background while the connected peer
-// count is below warmTarget. Each refresh tick, it dials up to
-// dialBatch new seeds (seeds we haven't already connected to). The
+// runKeepWarm dials peer addrs in the background while the connected
+// peer count is below warmTarget. Each refresh tick, it dials up to
+// dialBatch new addrs (addrs we haven't already connected to). The
 // dialed peers are picked up by download's scanForNewPeers tick and
 // added to stats as provisional.
 //
-// Seeds are shuffled once at start so we don't bias toward the front
+// Addrs are shuffled once at start so we don't bias toward the front
 // of the list, and a cursor advances through the shuffled slice with
-// wraparound — over a long bench, every seed eventually gets a try.
-func runKeepWarm(ctx context.Context, sw *p2p.Switch, seeds []peerSeed,
+// wraparound — over a long bench, every addr eventually gets a try.
+func runKeepWarm(ctx context.Context, sw *p2p.Switch, peerAddrs []peerAddr,
 	warmTarget int, refresh time.Duration, logger cmtlog.Logger) {
 
-	if len(seeds) == 0 {
+	if len(peerAddrs) == 0 {
 		return
 	}
 	const dialBatch = 4
 
-	shuffled := make([]peerSeed, len(seeds))
-	copy(shuffled, seeds)
+	shuffled := make([]peerAddr, len(peerAddrs))
+	copy(shuffled, peerAddrs)
 	rand.Shuffle(len(shuffled), func(i, j int) {
 		shuffled[i], shuffled[j] = shuffled[j], shuffled[i]
 	})
@@ -46,7 +46,7 @@ func runKeepWarm(ctx context.Context, sw *p2p.Switch, seeds []peerSeed,
 			continue
 		}
 		dialed := 0
-		// Walk the seed list for at most one full pass per tick — past
+		// Walk the addr list for at most one full pass per tick — past
 		// the cap, give up for now and retry next tick.
 		for tries := 0; tries < len(shuffled) && dialed < dialBatch; tries++ {
 			s := shuffled[cursor]

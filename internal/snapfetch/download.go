@@ -36,15 +36,15 @@ type peerStat struct {
 //     hash-mismatch / missing-chunk strikes ban a peer; transient socket
 //     drops just defer the next dial attempt.
 //   - Background peer-pool refresher. While the connected peer count is
-//     below WarmPeerTarget, dials seeds in the background so newly-broken
-//     good peers can be replaced.
+//     below WarmPeerTarget, dials peer addrs in the background so
+//     newly-broken good peers can be replaced.
 //   - Provisional peer promotion. Connected non-good peers are added to
 //     stats with provisional=true and given one in-flight slot. The first
 //     verified chunk promotes them to a full-budget good peer; a hash
 //     mismatch single-strikes them out.
 func download(ctx context.Context, sw *p2p.Switch, ssR *statesync.Reactor,
 	evs chan statesync.Event, target *snapshotOffer, chunkHashes [][]byte,
-	good []p2p.ID, addrByNodeID map[string]string, snapDir string, seeds []peerSeed,
+	good []p2p.ID, addrByNodeID map[string]string, snapDir string, peerAddrs []peerAddr,
 	perPeer int, chunkTimeout time.Duration, peerFailLimit int,
 	maxRedials int, redialBackoff, maxRedialBackoff time.Duration,
 	provisionalStrikes, provisionalInflight int,
@@ -248,11 +248,11 @@ func download(ctx context.Context, sw *p2p.Switch, ssR *statesync.Reactor,
 	dispatch()
 
 	// Background peer-pool refresher. Keeps the connected peer count
-	// hovering near warmTarget by dialing seeds (shuffled) whenever we
-	// drop below the threshold. scanForNewPeers in the main loop picks
-	// up the resulting connections as provisional peers.
-	if len(seeds) > 0 && warmTarget > 0 {
-		go runKeepWarm(ctx, sw, seeds, warmTarget, warmRefreshInterval, logger)
+	// hovering near warmTarget by dialing peer addrs (shuffled)
+	// whenever we drop below the threshold. scanForNewPeers in the
+	// main loop picks up the resulting connections as provisional peers.
+	if len(peerAddrs) > 0 && warmTarget > 0 {
+		go runKeepWarm(ctx, sw, peerAddrs, warmTarget, warmRefreshInterval, logger)
 	}
 
 	timeoutTicker := time.NewTicker(2 * time.Second)
