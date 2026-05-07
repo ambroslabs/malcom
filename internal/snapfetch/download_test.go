@@ -196,6 +196,10 @@ func TestChunkSchedulerVerifiedChunkPromotesAndWrites(t *testing.T) {
 	if string(written) != string(b.chunkBytes) {
 		t.Fatalf("chunk file content mismatch")
 	}
+	// Atomic-write must not leave a .tmp behind on success.
+	if _, err := os.Stat(filepath.Join(b.snapDir, "chunk_00000.bin.tmp")); !os.IsNotExist(err) {
+		t.Fatalf("chunk_00000.bin.tmp leaked: stat err = %v", err)
+	}
 }
 
 func TestChunkSchedulerHashMismatchSingleStrikeBansProvisional(t *testing.T) {
