@@ -15,8 +15,9 @@ import (
 // meta.json + .complete marker).
 //
 // On error any partial output under outRoot is left in place — no
-// .complete marker is written, so the cli can detect incomplete dirs
-// and the user can inspect / remove them.
+// .complete marker is written. The importer refuses to run on a dir
+// without .complete, so the user can safely inspect / remove the
+// partial output before re-running fetch.
 func RunFetch(ctx context.Context, c Config, outRoot string) error {
 	s, cleanup, err := newFetchSession(ctx, c)
 	if err != nil {

@@ -97,6 +97,16 @@ func Import(opts Options) (*Stats, error) {
 	if opts.Height == 0 {
 		return nil, fmt.Errorf("Options.Height is required")
 	}
+	// snapfetch writes .complete only after every chunk, metadata.bin,
+	// and meta.json have been fsynced. A missing marker means the fetch
+	// was interrupted — importing the partial dir can succeed at zlib
+	// decompression and still produce a half-built application.db.
+	if _, err := os.Stat(filepath.Join(opts.SnapshotDir, ".complete")); err != nil {
+		if os.IsNotExist(err) {
+			return nil, fmt.Errorf("snapshot dir %s is missing .complete marker; the fetch did not finish — re-run `malcom snapshot fetch` (or delete the dir and start over) before importing", opts.SnapshotDir)
+		}
+		return nil, fmt.Errorf("stat .complete in %s: %w", opts.SnapshotDir, err)
+	}
 	logw := opts.Log
 	if logw == nil {
 		logw = os.Stdout
