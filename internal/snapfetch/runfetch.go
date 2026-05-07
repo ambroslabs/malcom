@@ -76,8 +76,7 @@ func RunFetch(ctx context.Context, c Config, outRoot string) error {
 	if err := nodeInfo.Validate(); err != nil {
 		return fmt.Errorf("nodeInfo invalid: %w", err)
 	}
-	p2pConfig := buildP2PConfig()
-	p2pConfig.MaxNumOutboundPeers = c.MaxOutboundPeers
+	p2pConfig := buildP2PConfig(c.MaxOutboundPeers)
 	mConfig := buildMConnConfig()
 
 	transport := p2p.NewMultiplexTransport(nodeInfo, *nodeKey, mConfig)
@@ -288,30 +287,24 @@ func RunFetch(ctx context.Context, c Config, outRoot string) error {
 	return nil
 }
 
-func buildP2PConfig() *cfg.P2PConfig {
+// buildP2PConfig centralizes snapfetch-specific overrides to cometbft's
+// default P2PConfig. maxOutbound is the only caller-configurable knob;
+// the rest are stable policy.
+func buildP2PConfig(maxOutbound int) *cfg.P2PConfig {
 	p := cfg.DefaultP2PConfig()
-	p.AllowDuplicateIP = true
-	p.HandshakeTimeout = 5 * time.Second
-	p.DialTimeout = 5 * time.Second
-	// Cap outbound peers below cometbft's 256 hard ceiling. Caller
-	// can override via Config.MaxOutboundPeers; 64 is the polite-low
-	// default that still absorbs PEX-harvested addrbooks dominated
-	// by non-snapshot peers.
-	p.MaxNumOutboundPeers = 64 // overridden in NewSwitch by Config below
+	p.AllowDuplicateIP = true            // shared egress IPs are common; default rejection starves the pool
+	p.HandshakeTimeout = 5 * time.Second // drop slow peers fast (cometbft default: 20s)
+	p.DialTimeout = 5 * time.Second      // same — fail fast over politeness
+	p.MaxNumOutboundPeers = maxOutbound
 	return p
 }
 
+// buildMConnConfig centralizes snapfetch-specific overrides to cometbft's
+// default MConnConfig.
 func buildMConnConfig() conn.MConnConfig {
 	mConfig := conn.DefaultMConnConfig()
-	// State-sync peers commonly bump MaxPacketMsgPayloadSize past the
-	// default 1024 bytes (e.g. some send single PacketMsgs of 10–100KB).
-	// 256KB accommodates any reasonable peer config; we only send tiny
-	// requests so this doesn't break anyone we connect to.
-	mConfig.MaxPacketMsgPayloadSize = 256 * 1024
-	// cometbft defaults to 500 KB/s per connection — at that rate one
-	// 10MB chunk takes ~20s and a 3GB snapshot from 5 peers takes ~17min.
-	// Bump to 10 MB/s so we're peer-side-limited, not us-limited.
-	mConfig.SendRate = 10 * 1024 * 1024
-	mConfig.RecvRate = 10 * 1024 * 1024
+	mConfig.MaxPacketMsgPayloadSize = 256 * 1024 // cometbft's 1024B default is below some peers' framing size
+	mConfig.SendRate = 10 * 1024 * 1024          // 500KB/s default caps us well below typical peer-side limits
+	mConfig.RecvRate = 10 * 1024 * 1024          // matched to SendRate
 	return mConfig
 }
