@@ -92,12 +92,20 @@ func NewReactor(logger log.Logger) *Reactor {
 }
 
 func (r *Reactor) GetChannels() []*conn.ChannelDescriptor {
+	// Leave RecvBufferCapacity unset (defaults to 4 KiB in cometbft's
+	// p2p/conn). Setting it equal to RecvMessageCapacity preallocates
+	// the worst-case message buffer per channel per peer up front:
+	// 20 MiB × MaxOutboundPeers resident before a single byte arrives,
+	// which can OOM small (8 GiB) hosts under a malicious peer set.
+	// Upstream cometbft's own statesync reactor leaves this unset for
+	// the same reason — the buffer grows on demand up to
+	// RecvMessageCapacity, so steady-state cost is per active transfer
+	// rather than per connected peer.
 	return []*conn.ChannelDescriptor{
 		{
 			ID:                  SnapshotChannel,
 			Priority:            5,
 			SendQueueCapacity:   10,
-			RecvBufferCapacity:  snapshotMsgSize,
 			RecvMessageCapacity: snapshotMsgSize,
 			MessageType:         &ssproto.Message{},
 		},
@@ -105,7 +113,6 @@ func (r *Reactor) GetChannels() []*conn.ChannelDescriptor {
 			ID:                  ChunkChannel,
 			Priority:            3,
 			SendQueueCapacity:   10,
-			RecvBufferCapacity:  chunkMsgSize,
 			RecvMessageCapacity: chunkMsgSize,
 			MessageType:         &ssproto.Message{},
 		},
