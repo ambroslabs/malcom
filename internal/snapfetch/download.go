@@ -547,6 +547,12 @@ func (s *chunkScheduler) addProvisional(peer p2p.Peer) {
 // back to provisional peers up to provisionalInflight slots. A
 // freshly-warm peer can't take more than its probe budget of
 // concurrent chunks until it's proven it can serve.
+//
+// Proven peers are gated strictly (inflight < perPeer): the configured
+// limit is the actual ceiling. Provisional peers are gated loosely
+// (inflight <= provisionalInflight) so dispatch's post-pick addInflight
+// gives the probe one slot of headroom — enough to surface a hash or
+// timeout strike before the peer either gets proven or banned.
 func (s *chunkScheduler) pickPeer() p2p.ID {
 	var bestProven, bestProvis p2p.ID
 	bestProvenInflight := s.perPeer + 1
