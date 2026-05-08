@@ -32,6 +32,7 @@ package connect
 
 import (
 	"context"
+	"errors"
 	"math/rand"
 	"sync"
 	"time"
@@ -349,15 +350,18 @@ func (m *Manager) tick() {
 
 // dialFromPool walks the shuffled static pool with a cursor, firing
 // up to `need` dials. Skips banned, pinned, and already-connected.
+//
+// Snapshots candidates under m.mu and launches the dial goroutines
+// after release, so concurrent Pin/Ban/Unpin/IsBanned don't block on
+// the goroutine schedule. Pattern mirrors tick's pinned-redial snapshot.
 func (m *Manager) dialFromPool(sw managerSwitch, need int) int {
 	m.mu.Lock()
-	defer m.mu.Unlock()
-
 	if len(m.pool) == 0 {
+		m.mu.Unlock()
 		return 0
 	}
-	fired := 0
-	for tries := 0; tries < len(m.pool) && fired < need; tries++ {
+	candidates := make([]*p2p.NetAddress, 0, need)
+	for tries := 0; tries < len(m.pool) && len(candidates) < need; tries++ {
 		s := m.pool[m.cursor]
 		m.cursor = (m.cursor + 1) % len(m.pool)
 
@@ -374,10 +378,14 @@ func (m *Manager) dialFromPool(sw managerSwitch, need int) int {
 		if sw.Peers().Get(na.ID) != nil {
 			continue
 		}
-		fired++
+		candidates = append(candidates, na)
+	}
+	m.mu.Unlock()
+
+	for _, na := range candidates {
 		go m.dial(na)
 	}
-	return fired
+	return len(candidates)
 }
 
 // dialFromBook draws up to `need` addresses from the cometbft addrbook
@@ -426,12 +434,22 @@ func (m *Manager) fireDial(addr string) {
 // failures per addr. After MaxDialFailures, the entry is RemoveAddress'd
 // from the cometbft addrbook and (if Banlist is configured) recorded
 // for cross-run filtering.
+//
+// ErrCurrentlyDialingOrExistingAddress is treated as a no-op: it means
+// another goroutine has the dial in flight (TOCTOU between the
+// IsDialingOrExistingAddress gate and this call, or the pinned-redial
+// path racing warm-fill). Counting it as a failure can evict a healthy
+// peer purely on internal racing.
 func (m *Manager) dial(na *p2p.NetAddress) {
 	err := m.cfg.Switch.DialPeerWithAddress(na)
 	if err == nil {
 		m.mu.Lock()
 		delete(m.dialFail, na.String())
 		m.mu.Unlock()
+		return
+	}
+	var dialing p2p.ErrCurrentlyDialingOrExistingAddress
+	if errors.As(err, &dialing) {
 		return
 	}
 	m.recordDialFail(na, err)
