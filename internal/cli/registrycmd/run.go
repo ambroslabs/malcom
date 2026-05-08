@@ -59,6 +59,8 @@ func runRefresh(args []string) int {
 
 	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer cancel()
+	ctx, cancelTimeout := context.WithTimeout(ctx, registry.DefaultSyncTimeout)
+	defer cancelTimeout()
 
 	fmt.Printf("[registry] syncing chain-registry → %s\n", cacheDir)
 	t0 := time.Now()

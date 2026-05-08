@@ -211,10 +211,14 @@ func lookupChain(cacheDir, chain string) (*registry.ChainInfo, error) {
 }
 
 // syncRegistry runs registry.Sync against cacheDir, surfacing collisions
-// to stderr. Cancellable via SIGINT/SIGTERM.
+// to stderr. Cancellable via SIGINT/SIGTERM and bounded by
+// registry.DefaultSyncTimeout so a hung TCP connection can't wedge
+// `malcom add`.
 func syncRegistry(cacheDir string) error {
 	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer cancel()
+	ctx, cancelTimeout := context.WithTimeout(ctx, registry.DefaultSyncTimeout)
+	defer cancelTimeout()
 	res, err := registry.Sync(ctx, cacheDir)
 	if err != nil {
 		return err

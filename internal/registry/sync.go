@@ -180,6 +180,13 @@ func extractTarball(ctx context.Context, r io.Reader, cacheDir string) (*extract
 
 		dir := path.Dir(rel)
 		dst := filepath.Join(cacheDir, filepath.FromSlash(dir), chainJSONName)
+		// Defense in depth against a malicious tarball that smuggles a
+		// "../" segment past the underscore filter. Today the source
+		// is GitHub codeload over TLS for a repo we trust, but a future
+		// mirror or fork shouldn't get to bypass this check.
+		if err := ensureWithin(cacheDir, dst); err != nil {
+			return nil, fmt.Errorf("tar entry %q: %w", rel, err)
+		}
 		if err := os.MkdirAll(filepath.Dir(dst), 0o755); err != nil {
 			return nil, fmt.Errorf("mkdir %s: %w", filepath.Dir(dst), err)
 		}
@@ -245,6 +252,25 @@ func isKeepablePath(rel string) bool {
 		}
 	}
 	return true
+}
+
+// ensureWithin verifies that target resolves inside root after symbolic
+// `..` components are flattened by filepath.Clean. We don't EvalSymlinks
+// because we expect to write to a path that doesn't exist yet; the
+// remaining attack vector — a symlink already in the cache pointing
+// out of the tree — is not within the threat model for a personal
+// chain-registry mirror.
+func ensureWithin(root, target string) error {
+	cleanRoot := filepath.Clean(root)
+	cleanTarget := filepath.Clean(target)
+	if cleanTarget == cleanRoot {
+		return nil
+	}
+	sep := string(os.PathSeparator)
+	if !strings.HasPrefix(cleanTarget, cleanRoot+sep) {
+		return fmt.Errorf("path %q escapes %q", cleanTarget, cleanRoot)
+	}
+	return nil
 }
 
 // writeFileAtomic writes data to path via tmp file + rename. Mode is

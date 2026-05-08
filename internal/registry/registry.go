@@ -19,6 +19,13 @@ import "time"
 // callers should consider re-syncing.
 const DefaultIndexMaxAge = 24 * time.Hour
 
+// DefaultSyncTimeout bounds one Sync invocation end-to-end. Real syncs
+// land in a few seconds; the cap exists so a hung TCP connection or a
+// stalled download doesn't wedge `malcom add` indefinitely. Callers
+// that want something different wrap their context.WithTimeout
+// themselves; Sync itself never imposes a timeout.
+const DefaultSyncTimeout = 5 * time.Minute
+
 // ChainInfo is the curated subset of chain.json we expose to callers.
 type ChainInfo struct {
 	ChainID         string

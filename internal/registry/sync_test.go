@@ -6,6 +6,7 @@ import (
 	"compress/gzip"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
@@ -166,6 +167,36 @@ func TestExtractFiltersAndIndexes(t *testing.T) {
 	}
 }
 
+// TestExtractRejectsPathTraversal feeds a tarball whose entry name
+// climbs out of the root via ".." segments. extractTarball must
+// refuse the entry and write nothing outside the cache dir.
+func TestExtractRejectsPathTraversal(t *testing.T) {
+	good := mkChainJSON(t, "cosmoshub-4", "live")
+	evil := mkChainJSON(t, "evil-1", "live")
+
+	tarBytes := makeTarball(t, []tarEntry{
+		// rel = "../escape/chain.json" — has no underscore segments
+		// (so the existing filter accepts it) but escapes cacheDir.
+		{rel: "../escape/chain.json", body: evil},
+		{rel: "cosmoshub/chain.json", body: good},
+	})
+
+	cacheDir := t.TempDir()
+	_, err := extractTarball(context.Background(), bytes.NewReader(tarBytes), cacheDir)
+	if err == nil {
+		t.Fatalf("extractTarball accepted ../escape/chain.json")
+	}
+	if !strings.Contains(err.Error(), "escapes") {
+		t.Fatalf("err=%v, want a path-escape diagnostic", err)
+	}
+
+	// The escape sibling dir must not exist on disk.
+	parent := filepath.Dir(cacheDir)
+	if _, err := os.Stat(filepath.Join(parent, "escape")); !os.IsNotExist(err) {
+		t.Fatalf("escape dir created outside cache: stat err = %v", err)
+	}
+}
+
 // TestResolveIndexCollisions confirms multi-directory live entries for
 // the same chain_id are excluded from the index AND surfaced as
 // Collisions, rather than the silent last-writer-wins behavior.
@@ -212,7 +243,6 @@ func TestSyncIndexRoundTrip(t *testing.T) {
 
 	url, cleanup := serveTarball(t, tarBytes)
 	defer cleanup()
-	t.Cleanup(func() {})
 
 	// Sync hits a hard-coded URL; route the test through it via a
 	// constant override using a per-test helper.
@@ -250,7 +280,7 @@ func TestSyncIndexRoundTrip(t *testing.T) {
 func TestLookupMissingIndex(t *testing.T) {
 	if _, err := Lookup(t.TempDir(), "cosmoshub-4"); err == nil {
 		t.Fatalf("expected error for empty cache dir")
-	} else if !errIs(err, ErrIndexMissing) {
+	} else if !errors.Is(err, ErrIndexMissing) {
 		t.Fatalf("got %v, want ErrIndexMissing", err)
 	}
 }
@@ -285,20 +315,6 @@ func TestLookupChainIDMismatch(t *testing.T) {
 	if !strings.Contains(err.Error(), "chain_id") || !strings.Contains(err.Error(), "cosmoshub-OLD") {
 		t.Fatalf("err=%v, want chain_id mismatch mentioning cosmoshub-OLD", err)
 	}
-}
-
-func errIs(err, target error) bool {
-	for err != nil {
-		if err == target {
-			return true
-		}
-		u, ok := err.(interface{ Unwrap() error })
-		if !ok {
-			return false
-		}
-		err = u.Unwrap()
-	}
-	return false
 }
 
 // syncFromURL is the test variant of Sync that hits a caller-supplied
