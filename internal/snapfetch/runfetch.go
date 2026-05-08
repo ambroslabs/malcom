@@ -18,6 +18,11 @@ import (
 // <outRoot>/snapshot_<chain>_<height>/ (chunks + metadata.bin +
 // meta.json + .complete marker).
 //
+// MaxFetchTime bounds only the chunk-download phase. The walk phase
+// (height discovery + chunk-0 verify) inherits its deadline from the
+// parent ctx; a stuck walk requires Ctrl-C or a parent-ctx timeout
+// to terminate.
+//
 // On error any partial output under outRoot is left in place — no
 // .complete marker is written. The importer refuses to run on a dir
 // without .complete, so the user can safely inspect / remove the

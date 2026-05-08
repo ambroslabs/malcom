@@ -150,18 +150,3 @@ func fsyncDir(dir string) error {
 	return d.Close()
 }
 
-func humanBytes(n uint64) string {
-	const (
-		k = 1024
-		m = k * 1024
-		g = m * 1024
-	)
-	switch {
-	case n >= g:
-		return fmt.Sprintf("%.2f GB", float64(n)/float64(g))
-	case n >= m:
-		return fmt.Sprintf("%.1f MB", float64(n)/float64(m))
-	default:
-		return fmt.Sprintf("%d B", n)
-	}
-}

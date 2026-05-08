@@ -17,6 +17,7 @@ import (
 	"path/filepath"
 
 	"github.com/zrbecker/cosmos-p2p/internal/config"
+	"github.com/zrbecker/cosmos-p2p/internal/humanbytes"
 	"github.com/zrbecker/cosmos-p2p/internal/snapshotdiff"
 	"github.com/zrbecker/cosmos-p2p/internal/snapshotimport"
 )
@@ -116,7 +117,7 @@ func Run(args []string) int {
 	fmt.Printf("  final compact:      %s\n", stats.FinalCompactElapsed)
 	fmt.Printf("  cleanup pass:       %s\n", stats.CleanupElapsed)
 	if size, err := dirSize(finalDB); err == nil {
-		fmt.Printf("  application.db:     %s  (%s)\n", finalDB, humanBytes(uint64(size)))
+		fmt.Printf("  application.db:     %s  (%s)\n", finalDB, humanbytes.Format(uint64(size)))
 	}
 	return 0
 }
@@ -148,20 +149,3 @@ func dirSize(dir string) (int64, error) {
 	return total, err
 }
 
-func humanBytes(n uint64) string {
-	const (
-		k = 1024
-		m = k * 1024
-		g = m * 1024
-	)
-	switch {
-	case n >= g:
-		return fmt.Sprintf("%.2f GB", float64(n)/float64(g))
-	case n >= m:
-		return fmt.Sprintf("%.1f MB", float64(n)/float64(m))
-	case n >= k:
-		return fmt.Sprintf("%.1f KB", float64(n)/float64(k))
-	default:
-		return fmt.Sprintf("%d B", n)
-	}
-}

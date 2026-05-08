@@ -31,6 +31,8 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+
+	"github.com/zrbecker/cosmos-p2p/internal/humanbytes"
 )
 
 // Result is the structural summary of a parsed snapshot.
@@ -163,10 +165,10 @@ func Inspect(dir string) (Result, error) {
 	}
 	// Fill human-readable byte fields for each component.
 	for i := range res.Stores {
-		res.Stores[i].BytesHuman = HumanBytes(res.Stores[i].BytesUncompressed)
+		res.Stores[i].BytesHuman = humanbytes.Format(res.Stores[i].BytesUncompressed)
 	}
 	for i := range res.Extensions {
-		res.Extensions[i].BytesHuman = HumanBytes(res.Extensions[i].BytesUncompressed)
+		res.Extensions[i].BytesHuman = humanbytes.Format(res.Extensions[i].BytesUncompressed)
 	}
 	return res, nil
 }
@@ -311,24 +313,3 @@ func ParseChunkHashes(metadata []byte) ([]string, error) {
 	return out, nil
 }
 
-// HumanBytes formats a byte count as a short human-readable string.
-func HumanBytes(n uint64) string {
-	const (
-		k = 1024
-		m = k * 1024
-		g = m * 1024
-		t = g * 1024
-	)
-	switch {
-	case n >= t:
-		return fmt.Sprintf("%.2f TB", float64(n)/float64(t))
-	case n >= g:
-		return fmt.Sprintf("%.2f GB", float64(n)/float64(g))
-	case n >= m:
-		return fmt.Sprintf("%.1f MB", float64(n)/float64(m))
-	case n >= k:
-		return fmt.Sprintf("%.1f KB", float64(n)/float64(k))
-	default:
-		return fmt.Sprintf("%d B", n)
-	}
-}

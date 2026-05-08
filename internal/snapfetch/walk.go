@@ -113,24 +113,10 @@ func walkBackward(
 
 	// 3s warmup so PEX-harvested peers can connect and send their
 	// SnapshotsResponse. Drain again afterward.
-	warmupDeadline := time.NewTimer(3 * time.Second)
-	for {
-		drainEvents()
-		select {
-		case <-ctx.Done():
-			warmupDeadline.Stop()
-			return nil, nil, nil, ctx.Err()
-		case <-warmupDeadline.C:
-			drainEvents()
-			goto walkLoop
-		case ev := <-sub.Ctrl:
-			if ev.Snapshot != nil {
-				offers.add(ev.Snapshot, ev.PeerID)
-			}
-		case <-sub.Chunk:
-		}
+	if err := warmup(ctx, sub, offers, drainEvents, 3*time.Second); err != nil {
+		return nil, nil, nil, err
 	}
-walkLoop:
+
 	// Dynamic target queue. Walks the precomputed `targets` (newest
 	// first) but allows jumping back UP if a fresher offer arrives
 	// mid-iteration. `failed` records heights whose deadline has
@@ -369,6 +355,29 @@ func isJumpCandidate(newHeight, current, minHeight uint64, failed map[uint64]boo
 		return false
 	}
 	return true
+}
+
+// warmup waits up to d for the warmup window to elapse, draining any
+// SnapshotsResponse events into offers as they arrive. Returns ctx.Err()
+// if the parent context is cancelled mid-warmup.
+func warmup(ctx context.Context, sub *subscription, offers *offerSet, drain func(), d time.Duration) error {
+	deadline := time.NewTimer(d)
+	defer deadline.Stop()
+	for {
+		drain()
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-deadline.C:
+			drain()
+			return nil
+		case ev := <-sub.Ctrl:
+			if ev.Snapshot != nil {
+				offers.add(ev.Snapshot, ev.PeerID)
+			}
+		case <-sub.Chunk:
+		}
+	}
 }
 
 // walkTargets returns a descending list of heights from

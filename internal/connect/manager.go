@@ -320,6 +320,13 @@ func (m *Manager) tick() {
 	}
 
 	// 2. Warm-fill from static pool then addrbook.
+	//
+	// NumPeers is a snapshot taken after step 1 launched its dial
+	// goroutines but before they updated the switch's dialing count.
+	// The result is that warm-fill may over-dial relative to
+	// WarmTarget by however many step-1 dials are still in flight.
+	// Bounded by DialBatch (the cap applied below), so the overshoot
+	// is at most one batch — acceptable for steady-state warm-fill.
 	out, _, dialing := sw.NumPeers()
 	if out+dialing >= m.cfg.WarmTarget {
 		return
