@@ -124,6 +124,7 @@ type schedulerManager interface {
 	Pin(pid p2p.ID, addr string)
 	Ban(pid p2p.ID, reason string)
 	IsBanned(pid p2p.ID) bool
+	BanReason(pid p2p.ID) string
 	Stats() connect.Stats
 }
 
@@ -384,13 +385,18 @@ func (s *chunkScheduler) run(ctx context.Context, sub *subscription) (uint64, er
 // summary covers all dialing across walk + download.
 func (s *chunkScheduler) logFinalSummary() {
 	// Mirror any straggler manager bans into stats so the summary
-	// classifies them correctly.
+	// classifies them correctly. For peers banned via paths the
+	// scheduler doesn't observe directly (peerWatch evictions,
+	// max-redials auto-bans), recover the reason from the manager
+	// so every banned row in the summary has a real cause string.
 	if s.mgr != nil {
 		for pid, st := range s.stats {
 			if !st.banned && s.mgr.IsBanned(pid) {
 				st.banned = true
-				if st.banReason == "" {
-					st.banReason = "manager-banned"
+			}
+			if st.banned && st.banReason == "" {
+				if r := s.mgr.BanReason(pid); r != "" {
+					st.banReason = r
 				}
 			}
 		}
@@ -664,10 +670,24 @@ func (s *chunkScheduler) onChunk(ev statesync.Event) {
 	}
 	st.chunks++
 	// Reset the failure counter: failures count consecutive
-	// missing/mismatch responses since the peer's last verified
-	// chunk. A peer that occasionally lacks a chunk but otherwise
+	// hash-mismatch responses since the peer's last verified chunk.
+	// A peer that occasionally returns a bad chunk but otherwise
 	// serves cleanly should not accumulate strikes across the
 	// whole run.
+	//
+	// Trade-off worth noting: a forger can interleave good chunks
+	// with hash-mismatch chunks indefinitely without ever hitting
+	// PeerFailLimit, since each verified chunk wipes the strike
+	// budget. Mitigations if this becomes a real attack: (a) require
+	// N consecutive successes before reset, (b) keep a separate
+	// cumulative-mismatch counter with a higher cap, or (c) ban
+	// outright on the first hash mismatch (the strict pre-PR
+	// behaviour for provisionals — was a single strike). Verified
+	// downloads still pass the snapshot.Hash check at the end, so a
+	// forger has to produce hash-valid forged chunks for every chunk
+	// they serve to actually corrupt the output — interleaving real
+	// and forged is detected by the per-chunk hash check, just at
+	// the cost of extra retry latency.
 	st.failures = 0
 	// Record the peer as a chunk-server in the cross-run list so
 	// future fetches can pin them up front.

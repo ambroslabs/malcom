@@ -238,6 +238,13 @@ func (m *fakeManager) Stats() connect.Stats {
 	return connect.Stats{Pinned: len(m.pinned), Banned: len(m.banned)}
 }
 
+// BanReason satisfies the schedulerManager interface. Delegates to the
+// existing per-test banReason() helper so tests can keep using the
+// short form.
+func (m *fakeManager) BanReason(pid p2p.ID) string {
+	return m.banReason(pid)
+}
+
 func (m *fakeManager) banReason(pid p2p.ID) string {
 	m.mu.Lock()
 	defer m.mu.Unlock()

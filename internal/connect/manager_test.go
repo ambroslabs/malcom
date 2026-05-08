@@ -241,14 +241,15 @@ func newManagerForTest(t *testing.T, sw managerSwitch, c Config) *Manager {
 	c.Switch = sw
 	c.defaults()
 	m := &Manager{
-		cfg:      c,
-		log:      cmtlog.NewNopLogger(),
-		pinned:   map[p2p.ID]string{},
-		backoffs: map[p2p.ID]*peerBackoff{},
-		banned:   map[p2p.ID]bool{},
-		dialFail: map[string]int{},
-		pool:     append([]addrbook.PeerAddr(nil), c.Pool...),
-		cancel:   func() {}, // no goroutine started
+		cfg:        c,
+		log:        cmtlog.NewNopLogger(),
+		pinned:     map[p2p.ID]string{},
+		backoffs:   map[p2p.ID]*peerBackoff{},
+		banned:     map[p2p.ID]bool{},
+		banReasons: map[p2p.ID]string{},
+		dialFail:   map[string]int{},
+		pool:       append([]addrbook.PeerAddr(nil), c.Pool...),
+		cancel:     func() {}, // no goroutine started
 	}
 	return m
 }
@@ -407,6 +408,53 @@ func TestManagerMaxRedialsAutoBans(t *testing.T) {
 	// MarkBad called on book.
 	if book.markedBad[addr] == 0 {
 		t.Fatalf("book.MarkBad not invoked on auto-ban")
+	}
+}
+
+// BanReason returns the reason an explicit Ban() recorded.
+func TestManagerBanReasonRecordsExplicitReason(t *testing.T) {
+	sw := newFakeSwitch()
+	m := newManagerForTest(t, sw, Config{WarmTarget: 0})
+
+	pid := p2p.ID("0123456789abcdef0123456789abcdef01234567")
+	m.Ban(pid, "chunk hash mismatch")
+
+	if got := m.BanReason(pid); got != "chunk hash mismatch" {
+		t.Fatalf("BanReason=%q, want 'chunk hash mismatch'", got)
+	}
+	// Unbanned peer returns empty.
+	other := p2p.ID("ffffffffffffffffffffffffffffffffffffffff")
+	if got := m.BanReason(other); got != "" {
+		t.Fatalf("BanReason for unbanned peer=%q, want empty", got)
+	}
+}
+
+// BanReason returns "max-redials" for peers auto-banned via the
+// MaxRedials path in tick().
+func TestManagerBanReasonMaxRedialsPath(t *testing.T) {
+	sw := newFakeSwitch()
+	book := newFakeBook()
+	bans := newFakeBanlist()
+
+	pid := p2p.ID("0123456789abcdef0123456789abcdef01234567")
+	addr := string(pid) + "@1.2.3.4:26656"
+
+	m := newManagerForTest(t, sw, Config{
+		Book:        book,
+		Banlist:     bans,
+		WarmTarget:  0,
+		MaxRedials:  2,
+		BanDuration: time.Hour,
+	})
+	m.Pin(pid, addr)
+	m.mu.Lock()
+	m.backoffs[pid] = &peerBackoff{disconnects: 2}
+	m.mu.Unlock()
+
+	m.tick()
+
+	if got := m.BanReason(pid); got != "max-redials" {
+		t.Fatalf("BanReason after auto-ban=%q, want 'max-redials'", got)
 	}
 }
 

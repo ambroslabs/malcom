@@ -145,13 +145,14 @@ type Manager struct {
 	cfg Config
 	log cmtlog.Logger
 
-	mu       sync.Mutex
-	pinned   map[p2p.ID]string       // pid → addr (id@host:port)
-	backoffs map[p2p.ID]*peerBackoff // pid → schedule state (pinned peers)
-	banned   map[p2p.ID]bool         // never-redial within this run
-	dialFail map[string]int          // addr → consecutive failed dials
-	pool     []addrbook.PeerAddr     // shuffled at New()
-	cursor   int
+	mu          sync.Mutex
+	pinned      map[p2p.ID]string       // pid → addr (id@host:port)
+	backoffs    map[p2p.ID]*peerBackoff // pid → schedule state (pinned peers)
+	banned      map[p2p.ID]bool         // never-redial within this run
+	banReasons  map[p2p.ID]string       // pid → reason at time of ban
+	dialFail    map[string]int          // addr → consecutive failed dials
+	pool        []addrbook.PeerAddr     // shuffled at New()
+	cursor      int
 
 	// Cumulative counters for end-of-run reporting. All under m.mu.
 	dialsFired    int
@@ -218,15 +219,16 @@ func New(ctx context.Context, c Config) *Manager {
 	pool := buildPool(c.Pool)
 
 	m := &Manager{
-		cfg:      c,
-		log:      logctx.From(ctx).With("module", "connect"),
-		pinned:   map[p2p.ID]string{},
-		backoffs: map[p2p.ID]*peerBackoff{},
-		banned:   map[p2p.ID]bool{},
-		dialFail: map[string]int{},
-		pool:     pool,
-		kickCh:   make(chan struct{}, 1),
-		cancel:   cancel,
+		cfg:        c,
+		log:        logctx.From(ctx).With("module", "connect"),
+		pinned:     map[p2p.ID]string{},
+		backoffs:   map[p2p.ID]*peerBackoff{},
+		banned:     map[p2p.ID]bool{},
+		banReasons: map[p2p.ID]string{},
+		dialFail:   map[string]int{},
+		pool:       pool,
+		kickCh:     make(chan struct{}, 1),
+		cancel:     cancel,
 	}
 	go m.loop(loopCtx)
 	return m
@@ -286,7 +288,9 @@ func (m *Manager) Unpin(pid p2p.ID) {
 }
 
 // Ban marks pid as never-redial within this run. Removes any
-// existing pin. Idempotent. The reason is logged.
+// existing pin. Idempotent. The reason is logged and stored so
+// callers (e.g. download's end-of-run summary) can recover it via
+// BanReason later.
 func (m *Manager) Ban(pid p2p.ID, reason string) {
 	m.mu.Lock()
 	if _, already := m.banned[pid]; already {
@@ -294,6 +298,7 @@ func (m *Manager) Ban(pid p2p.ID, reason string) {
 		return
 	}
 	m.banned[pid] = true
+	m.banReasons[pid] = reason
 	m.manualBans++
 	delete(m.pinned, pid)
 	delete(m.backoffs, pid)
@@ -307,6 +312,18 @@ func (m *Manager) IsBanned(pid p2p.ID) bool {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	return m.banned[pid]
+}
+
+// BanReason returns the reason associated with pid's ban, or empty
+// string if pid is not banned. Used by download's end-of-run summary
+// to label every banned peer with a real cause (peerWatch evictions,
+// max-redials auto-bans, and download-side strikes all populate this
+// — only the dial-failure path bypasses it because dial-fails ban an
+// addr, not a peer ID).
+func (m *Manager) BanReason(pid p2p.ID) string {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.banReasons[pid]
 }
 
 func (m *Manager) loop(ctx context.Context) {
@@ -390,6 +407,7 @@ func (m *Manager) tick() {
 			delete(m.pinned, pid)
 			delete(m.backoffs, pid)
 			m.banned[pid] = true
+			m.banReasons[pid] = "max-redials"
 			m.peerBans++
 			m.mu.Unlock()
 			m.markBadByAddr(addr)
