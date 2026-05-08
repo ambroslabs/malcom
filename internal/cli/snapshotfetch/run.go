@@ -124,6 +124,16 @@ func Run(args []string) int {
 				"chain", ch.ChainID, "rpc_count", len(ch.RPCs))
 			return ExitGeneric
 		}
+		// A successful response of latest_block_height=0 means the
+		// RPC believes the chain has no blocks (brand-new test net,
+		// freshly reset node, misconfigured endpoint). The walk
+		// phase has nothing to enumerate; surface that here with a
+		// clearer message than the downstream ErrWalkFailed.
+		if h == 0 {
+			fetchLog.Error("rpc reports latest_block_height=0 (chain not started or stale node); pass -max-height to override",
+				"chain", ch.ChainID, "source", src)
+			return ExitGeneric
+		}
 		maxHeight = h
 		heightSource = src
 	}

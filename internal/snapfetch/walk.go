@@ -64,7 +64,7 @@ func walkBackward(
 	case cfg.TargetHeight != 0:
 		targets = []uint64{cfg.TargetHeight}
 	case cfg.MaxHeight == 0:
-		return nil, nil, fmt.Errorf("walk has no upper bound — %s", hintMissingHeightInputs)
+		return nil, nil, fmt.Errorf("%w: walk has no upper bound — %s", ErrWalkFailed, hintMissingHeightInputs)
 	default:
 		targets = walkTargets(cfg.MaxHeight, cfg.MinHeight, cfg.SnapshotInterval)
 		if len(targets) == 0 {

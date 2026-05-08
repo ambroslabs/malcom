@@ -323,8 +323,8 @@ func (s *chunkScheduler) run(ctx context.Context, sub *subscription) (uint64, er
 		alive, connected := s.peerCounts()
 		if alive == 0 {
 			return s.bytesTotal.Load(),
-				fmt.Errorf("all peers banned (done %d/%d) — %s",
-					s.doneCount, N, hintAllPeersBanned(s.chainID))
+				fmt.Errorf("%w: all peers banned (done %d/%d) — %s",
+					ErrDownloadFailed, s.doneCount, N, hintAllPeersBanned(s.chainID))
 		}
 
 		select {
