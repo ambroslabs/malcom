@@ -267,9 +267,11 @@ func buildPeerAddrs(ctx context.Context, c Config) ([]addrbook.PeerAddr, error) 
 
 // walk runs the height-discovery walk against the peer set the manager
 // has been warming up. Returns the chosen offer + a starter "good
-// peers" list (chunk-0 responder + everyone the offer was advertised by).
-func (s *fetchSession) walk(ctx context.Context) (*snapshotOffer, []p2p.ID, error) {
-	return walkBackward(ctx, s.sw, s.ssR, s.mux, s.peerAddrs, s.cfg)
+// peers" list (chunk-0 responder + everyone the offer was advertised
+// by) + the verified chunk-0 bytes (so the download phase can seed
+// chunk_00000.bin instead of refetching).
+func (s *fetchSession) walk(ctx context.Context) (*snapshotOffer, []p2p.ID, []byte, error) {
+	return walkBackward(ctx, s.sw, s.ssR, s.mux, s.watch, s.peerAddrs, s.cfg)
 }
 
 // prepareSnapshotDir parses chunk hashes from the chosen offer's

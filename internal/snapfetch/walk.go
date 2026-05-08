@@ -22,17 +22,24 @@ import (
 //
 // If TargetHeight is set, walks exactly that one height (no fallback).
 //
+// Chunk-0 is verified against metadata.chunk_hashes[0] before the offer
+// is accepted; a peer serving a chunk that matches no offer's hashes
+// gets banned via watch and the height keeps waiting for another
+// peer's response.
+//
 // Returns the chosen offer + a starter good-peers list (the chunk-0
 // responder, plus any peer in the offer's Peers map; phase 3
-// dispatches to all of them).
+// dispatches to all of them) + the verified chunk-0 bytes (so the
+// download phase can skip refetching it).
 func walkBackward(
 	ctx context.Context,
 	sw *p2p.Switch,
 	ssR *statesync.Reactor,
 	mux *eventMux,
+	watch *peerWatch,
 	peerAddrs []addrbook.PeerAddr,
 	cfg Config,
-) (*snapshotOffer, []p2p.ID, error) {
+) (*snapshotOffer, []p2p.ID, []byte, error) {
 	log := logctx.From(ctx)
 
 	// Subscribe to events BEFORE dialing so any SnapshotsResponse
@@ -64,11 +71,11 @@ func walkBackward(
 	case cfg.TargetHeight != 0:
 		targets = []uint64{cfg.TargetHeight}
 	case cfg.MaxHeight == 0:
-		return nil, nil, fmt.Errorf("%w: walk has no upper bound — %s", ErrWalkFailed, hintMissingHeightInputs)
+		return nil, nil, nil, fmt.Errorf("%w: walk has no upper bound — %s", ErrWalkFailed, hintMissingHeightInputs)
 	default:
 		targets = walkTargets(cfg.MaxHeight, cfg.MinHeight, cfg.SnapshotInterval)
 		if len(targets) == 0 {
-			return nil, nil, fmt.Errorf("%w: no target heights in [%d, %d] with stride %d — %s",
+			return nil, nil, nil, fmt.Errorf("%w: no target heights in [%d, %d] with stride %d — %s",
 				ErrWalkFailed, cfg.MinHeight, cfg.MaxHeight, cfg.SnapshotInterval,
 				hintEmptyTargetWindow(cfg.ChainID))
 		}
@@ -112,7 +119,7 @@ func walkBackward(
 		select {
 		case <-ctx.Done():
 			warmupDeadline.Stop()
-			return nil, nil, ctx.Err()
+			return nil, nil, nil, ctx.Err()
 		case <-warmupDeadline.C:
 			drainEvents()
 			goto walkLoop
@@ -166,7 +173,7 @@ walkLoop:
 
 	for len(queue) > 0 {
 		if ctx.Err() != nil {
-			return nil, nil, ctx.Err()
+			return nil, nil, nil, ctx.Err()
 		}
 		target := queue[0]
 		queue = queue[1:]
@@ -185,6 +192,7 @@ walkLoop:
 
 		deadline := time.NewTimer(cfg.PerHeightTimeout)
 		var accepted *snapshotOffer
+		var acceptedChunk0 []byte
 		var responder p2p.ID
 		jumped := false
 	heightLoop:
@@ -192,13 +200,13 @@ walkLoop:
 			select {
 			case <-ctx.Done():
 				deadline.Stop()
-				return nil, nil, ctx.Err()
+				return nil, nil, nil, ctx.Err()
 			case <-deadline.C:
 				break heightLoop
 			case ev, ok := <-sub.Ctrl:
 				if !ok {
 					deadline.Stop()
-					return nil, nil, fmt.Errorf("event channel closed")
+					return nil, nil, nil, fmt.Errorf("event channel closed")
 				}
 				if ev.Snapshot == nil {
 					continue
@@ -245,7 +253,7 @@ walkLoop:
 			case ev, ok := <-sub.Chunk:
 				if !ok {
 					deadline.Stop()
-					return nil, nil, fmt.Errorf("event channel closed")
+					return nil, nil, nil, fmt.Errorf("event channel closed")
 				}
 				if ev.Chunk == nil {
 					continue
@@ -264,15 +272,45 @@ walkLoop:
 				if ev.Chunk.Missing || len(ev.Chunk.Bytes) == 0 {
 					continue
 				}
+				// Match chunk-0 bytes against any format-matching offer's
+				// metadata.chunk_hashes[0]. ChunkRequest carries no hash,
+				// so the responder might be serving any of several offers
+				// with the same (height, format). The first whose hash[0]
+				// matches is the offer we accept.
+				var matched *snapshotOffer
+				var lastErr error
 				for _, e := range offers.at(target) {
-					if e.Offer.Format == ev.Chunk.Format {
-						accepted = e.Offer
-						responder = p2p.ID(ev.PeerID)
-						log.Debug("walk accepting", "height", target, "format", e.Offer.Format, "peer", ev.PeerID)
-						deadline.Stop()
-						break heightLoop
+					if e.Offer.Format != ev.Chunk.Format {
+						continue
 					}
+					if err := verifyChunkZero(e.Offer, ev.Chunk.Bytes); err != nil {
+						lastErr = err
+						continue
+					}
+					matched = e.Offer
+					break
 				}
+				if matched == nil {
+					// No format-matching offer's hashes matched the
+					// bytes. Either pure garbage, or a forged chunk
+					// that doesn't even line up with the peer's own
+					// advertised metadata. Ban and keep waiting on
+					// this height for another peer's response.
+					log.Error("chunk-0 verify failed; banning peer",
+						"peer", ev.PeerID, "height", target, "err", lastErr)
+					if watch != nil {
+						if peer := sw.Peers().Get(p2p.ID(ev.PeerID)); peer != nil {
+							watch.banPeer(peer, "chunk-0 hash mismatch")
+						}
+					}
+					continue
+				}
+				accepted = matched
+				acceptedChunk0 = ev.Chunk.Bytes
+				responder = p2p.ID(ev.PeerID)
+				log.Debug("walk accepting", "height", target, "format", matched.Format, "peer", ev.PeerID)
+				deadline.Stop()
+				break heightLoop
 			}
 		}
 
@@ -291,7 +329,7 @@ walkLoop:
 					seen[id] = true
 				}
 			}
-			return accepted, good, nil
+			return accepted, good, acceptedChunk0, nil
 		}
 
 		if jumped {
@@ -299,7 +337,7 @@ walkLoop:
 		}
 
 		if cfg.TargetHeight != 0 {
-			return nil, nil, fmt.Errorf("%w: target height %d: no peer served chunk-0 within %s — %s",
+			return nil, nil, nil, fmt.Errorf("%w: target height %d: no peer served chunk-0 within %s — %s",
 				ErrWalkFailed, cfg.TargetHeight, cfg.PerHeightTimeout,
 				hintTargetHeightUnserved(cfg.ChainID))
 		}
@@ -312,7 +350,7 @@ walkLoop:
 			"height", target, "next", next)
 	}
 
-	return nil, nil, fmt.Errorf("%w: window [%d, %d] — %s",
+	return nil, nil, nil, fmt.Errorf("%w: window [%d, %d] — %s",
 		ErrWalkFailed, cfg.MinHeight, cfg.MaxHeight, hintNoServable(cfg.ChainID))
 }
 
