@@ -94,10 +94,13 @@ max_dial_failures = 3
 
 # Chunk-write failure cap. A verified chunk that fails to land on
 # disk (ENOSPC, EIO, EROFS) leaves the chunk pending so a retry
-# tries again. Once cumulative write failures hit this count the
-# fetch aborts with a typed disk error instead of pretending the
-# missing chunk succeeded and surfacing later as a zlib error
-# during import. Default 3.
+# tries again. The counter is cumulative across the whole fetch —
+# intervening successful writes do not reset it. Once it hits
+# this count the fetch aborts with a typed disk error instead of
+# pretending the missing chunk succeeded and surfacing later as a
+# zlib error during import. Raise on flaky cloud disks where
+# transient failures are expected to recover over a long run.
+# Default 3.
 max_disk_write_failures = 3
 
 [import]

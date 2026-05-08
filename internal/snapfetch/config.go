@@ -113,8 +113,12 @@ type Config struct {
 	// operator follows up with `malcom verify` against a trusted RPC.
 	SkipVerifyHash bool
 
-	// MaxDiskWriteFailures aborts the download once chunk-write
-	// failures cross this count. Any verified-but-unwriteable chunk
+	// MaxDiskWriteFailures aborts the download once cumulative
+	// chunk-write failures cross this count. The counter does not
+	// reset on intervening successful writes, so a long fetch over
+	// a flaky disk that recovers between transients can still trip
+	// the cap — operators on cloud volumes prone to brief stalls
+	// should raise this. Any verified-but-unwriteable chunk
 	// (ENOSPC, EIO, EROFS) leaves pending=true so a retry attempts
 	// it again; the cap surfaces a sustained disk problem as a
 	// typed ErrDiskFailed instead of dragging through a bogus

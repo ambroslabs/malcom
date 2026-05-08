@@ -134,9 +134,12 @@ type FetchTuning struct {
 	// MaxDiskWriteFailures aborts the fetch with ErrDiskFailed once
 	// chunk-write errors (ENOSPC, EIO, EROFS) hit this count. A
 	// failed write leaves the chunk pending so the dispatcher
-	// retries it; the cap distinguishes a one-off filesystem hiccup
-	// (recovers) from a sustained disk problem (gets surfaced now,
-	// not as a confusing zlib error at import).
+	// retries it. The counter is cumulative across the whole fetch
+	// — intervening successful writes don't reset it — so the cap
+	// distinguishes a one-off filesystem hiccup (recovers) from a
+	// sustained disk problem (gets surfaced now, not as a confusing
+	// zlib error at import). Raise on flaky cloud disks where
+	// transient failures are expected over a long run.
 	MaxDiskWriteFailures int `toml:"max_disk_write_failures"`
 
 	Discover      duration `toml:"discover"`
