@@ -3,6 +3,7 @@ package snapfetch
 import (
 	"context"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"time"
 
@@ -43,6 +44,13 @@ func RunFetch(ctx context.Context, c Config, outRoot string) error {
 	bytesTotal, err := s.download(fetchCtx, offer, good, chunkHashes, snapDir)
 	fetchCancel()
 	if err != nil {
+		// download() can surface ErrDiskFailed when chunk-write
+		// failures hit the cap. Don't shadow that with
+		// ErrDownloadFailed — disk error is the more actionable
+		// classification and maps to ExitDiskFailed.
+		if errors.Is(err, ErrDiskFailed) {
+			return err
+		}
 		// Distinguish our timeout from a parent cancel (Ctrl-C). Only
 		// the former wants the config-knob hint.
 		if fetchCtx.Err() == context.DeadlineExceeded && ctx.Err() == nil {

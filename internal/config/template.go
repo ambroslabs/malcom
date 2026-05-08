@@ -92,6 +92,14 @@ provisional_probe_inflight = 1
 # PEX gossip will re-add the address if the peer comes back online.
 max_dial_failures = 3
 
+# Chunk-write failure cap. A verified chunk that fails to land on
+# disk (ENOSPC, EIO, EROFS) leaves the chunk pending so a retry
+# tries again. Once cumulative write failures hit this count the
+# fetch aborts with a typed disk error instead of pretending the
+# missing chunk succeeded and surfacing later as a zlib error
+# during import. Default 3.
+max_disk_write_failures = 3
+
 [import]
 # Pebble bulk-load tuning. Defaults sized for an 8 GiB host with 2-4
 # vCPUs; bump memtable_mb / cache_mb on bigger boxes.

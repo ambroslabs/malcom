@@ -131,6 +131,14 @@ type FetchTuning struct {
 	// PEX gossip will re-add the address if the peer comes back online.
 	MaxDialFailures int `toml:"max_dial_failures"`
 
+	// MaxDiskWriteFailures aborts the fetch with ErrDiskFailed once
+	// chunk-write errors (ENOSPC, EIO, EROFS) hit this count. A
+	// failed write leaves the chunk pending so the dispatcher
+	// retries it; the cap distinguishes a one-off filesystem hiccup
+	// (recovers) from a sustained disk problem (gets surfaced now,
+	// not as a confusing zlib error at import).
+	MaxDiskWriteFailures int `toml:"max_disk_write_failures"`
+
 	Discover      duration `toml:"discover"`
 	DialParallel  int      `toml:"dial_parallel"`
 	MaxCandidates int      `toml:"max_candidates"`

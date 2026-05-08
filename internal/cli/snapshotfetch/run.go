@@ -190,6 +190,7 @@ func Run(args []string) int {
 		ProvisionalProbeStrikes:  ch.Fetch.ProvisionalProbeStrikes,
 		ProvisionalProbeInflight: ch.Fetch.ProvisionalProbeInflight,
 		MaxDialFailures:          ch.Fetch.MaxDialFailures,
+		MaxDiskWriteFailures:     ch.Fetch.MaxDiskWriteFailures,
 		MaxRescans:               ch.Fetch.MaxRescans,
 		RescanDiscoverFor:        ch.Fetch.RescanDiscover.Duration(),
 		SkipVerifyHash:           *noVerifyHash,
