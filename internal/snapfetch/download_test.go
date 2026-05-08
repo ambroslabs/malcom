@@ -1,7 +1,9 @@
 package snapfetch
 
 import (
+	"context"
 	"crypto/sha256"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -61,6 +63,7 @@ func (b *scenarioBuilder) build() *chunkScheduler {
 		mgr:         b.mgr,
 		watch:       nil, // banAndDrop falls through to mgr.Ban only
 		log:         cmtlog.NewNopLogger(),
+		writeFile:   writeFileAtomic,
 		target:      b.target,
 		chunkHashes: hashes,
 		snapDir:     b.snapDir,
@@ -72,6 +75,7 @@ func (b *scenarioBuilder) build() *chunkScheduler {
 		peerFailLimit:       3,
 		provisionalStrikes:  1,
 		provisionalInflight: 1,
+		maxDiskFails:        3,
 		pending:             pending,
 		completed:           make([]bool, b.target.Chunks),
 		inflight:            map[uint32]inflightEntry{},
@@ -667,5 +671,179 @@ func TestChunkSchedulerPickPeerProvisionalSlotsLimited(t *testing.T) {
 	s.stats[prov.ID()].addInflight()
 	if pid := s.pickPeer(nil); pid != "" {
 		t.Fatalf("pick with provisional inflight=2 should return empty, got %q", pid)
+	}
+}
+
+// A verified chunk that fails to write must NOT be marked completed
+// and must not bump doneCount/bytesTotal. Regression for issue #22:
+// the prior code logged the write error then marked the chunk
+// completed, so the fetch would "succeed" and import would later
+// fail with a confusing zlib error.
+func TestChunkSchedulerWriteFailureNotMarkedCompleted(t *testing.T) {
+	b := newScenario(t)
+	s := b.build()
+	boom := errors.New("simulated ENOSPC")
+	s.writeFile = func(string, []byte, os.FileMode) error { return boom }
+
+	peer := newFakePeer("peer-A", "1.1.1.1", 26656)
+	b.sw.peerSet.Add(peer)
+	s.stats[peer.ID()] = &peerStat{provisional: true}
+	assignInflight(s, peer.ID(), 0, time.Now())
+
+	ev := b.chunkEvent(peer.ID(), 0, b.chunkBytes, false)
+	s.onChunk(ev)
+
+	if s.completed[0] {
+		t.Fatalf("completed[0] set despite write failure")
+	}
+	if s.doneCount != 0 {
+		t.Fatalf("doneCount=%d, want 0 (write failed)", s.doneCount)
+	}
+	if got := s.bytesTotal.Load(); got != 0 {
+		t.Fatalf("bytesTotal=%d, want 0", got)
+	}
+	if s.diskFails != 1 {
+		t.Fatalf("diskFails=%d, want 1", s.diskFails)
+	}
+	if !errors.Is(s.firstDiskErr, boom) {
+		t.Fatalf("firstDiskErr=%v, want %v", s.firstDiskErr, boom)
+	}
+	if _, err := os.Stat(filepath.Join(b.snapDir, "chunk_00000.bin")); !os.IsNotExist(err) {
+		t.Fatalf("chunk file present despite write failure: stat err = %v", err)
+	}
+}
+
+// When no peer is available for retry (e.g. peer dropped), a write
+// failure leaves the chunk pending so the next dispatch wave will
+// pick it up.
+func TestChunkSchedulerWriteFailureLeavesPendingWhenNoRetryPeer(t *testing.T) {
+	b := newScenario(t)
+	s := b.build()
+	s.writeFile = func(string, []byte, os.FileMode) error {
+		return errors.New("EIO")
+	}
+
+	peer := newFakePeer("peer-A", "1.1.1.1", 26656)
+	b.sw.peerSet.Add(peer)
+	s.stats[peer.ID()] = &peerStat{provisional: true}
+	assignInflight(s, peer.ID(), 0, time.Now())
+	// Peer disconnects between dispatch and chunk-arrival: dispatch's
+	// retry from inside onChunk has nobody to reassign to.
+	b.sw.peerSet.Remove(peer.ID())
+
+	s.onChunk(b.chunkEvent(peer.ID(), 0, b.chunkBytes, false))
+
+	if !s.pending[0] {
+		t.Fatalf("pending[0] cleared even though no peer was available for retry")
+	}
+	if _, still := s.inflight[0]; still {
+		t.Fatalf("inflight[0] retained after write failure with no retry peer")
+	}
+}
+
+// Repeated write failures across retries accumulate on diskFails;
+// firstDiskErr captures the original cause.
+func TestChunkSchedulerWriteFailuresAccumulate(t *testing.T) {
+	b := newScenario(t)
+	s := b.build()
+	first := errors.New("ENOSPC")
+	second := errors.New("EIO")
+	calls := 0
+	s.writeFile = func(string, []byte, os.FileMode) error {
+		calls++
+		if calls == 1 {
+			return first
+		}
+		return second
+	}
+
+	peer := newFakePeer("peer-A", "1.1.1.1", 26656)
+	b.sw.peerSet.Add(peer)
+	s.stats[peer.ID()] = &peerStat{}
+
+	for i := 0; i < 2; i++ {
+		s.pending[0] = true
+		delete(s.inflight, 0)
+		s.stats[peer.ID()].clearInflight()
+		assignInflight(s, peer.ID(), 0, time.Now())
+		s.onChunk(b.chunkEvent(peer.ID(), 0, b.chunkBytes, false))
+	}
+
+	if s.diskFails != 2 {
+		t.Fatalf("diskFails=%d, want 2", s.diskFails)
+	}
+	if !errors.Is(s.firstDiskErr, first) {
+		t.Fatalf("firstDiskErr=%v, want first error %v (must not be overwritten by later failures)", s.firstDiskErr, first)
+	}
+}
+
+// Once diskFails crosses maxDiskFails the run loop must abort with
+// an ErrDiskFailed-typed error wrapping the first cause, regardless
+// of how healthy the peer set looks.
+func TestChunkSchedulerRunAbortsOnDiskFailureLimit(t *testing.T) {
+	b := newScenario(t)
+	b.target.Chunks = 2
+	s := b.build()
+	s.maxDiskFails = 3
+	s.pending = []bool{true, true}
+	s.completed = []bool{false, false}
+	s.chunkHashes = [][]byte{b.chunkHash, b.chunkHash}
+
+	// At least one healthy peer so the alive==0 branch isn't what
+	// returns first.
+	peer := newFakePeer("peer-A", "1.1.1.1", 26656)
+	b.sw.peerSet.Add(peer)
+	s.stats[peer.ID()] = &peerStat{}
+
+	boom := errors.New("simulated ENOSPC")
+	s.diskFails = 3
+	s.firstDiskErr = boom
+
+	ctrl := make(chan statesync.Event)
+	chunk := make(chan statesync.Event)
+	sub := &subscription{Ctrl: ctrl, Chunk: chunk}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	bytes, err := s.run(ctx, sub)
+	if err == nil {
+		t.Fatalf("run returned nil error, want ErrDiskFailed")
+	}
+	if !errors.Is(err, ErrDiskFailed) {
+		t.Fatalf("run err = %v, want ErrDiskFailed", err)
+	}
+	if !errors.Is(err, boom) {
+		t.Fatalf("run err = %v, want chain to wrap firstDiskErr %v", err, boom)
+	}
+	if bytes != 0 {
+		t.Fatalf("run bytes = %d, want 0 (no successful writes)", bytes)
+	}
+}
+
+// The disk gate must take precedence over the all-peers-banned gate
+// when both apply: disk is the more actionable diagnosis.
+func TestChunkSchedulerRunDiskGateBeatsAllPeersBanned(t *testing.T) {
+	b := newScenario(t)
+	b.target.Chunks = 1
+	s := b.build()
+	s.maxDiskFails = 1
+	s.diskFails = 1
+	boom := errors.New("EIO")
+	s.firstDiskErr = boom
+
+	// No peers in stats — the all-peers-banned branch would fire if
+	// the disk gate weren't checked first.
+
+	ctrl := make(chan statesync.Event)
+	chunk := make(chan statesync.Event)
+	sub := &subscription{Ctrl: ctrl, Chunk: chunk}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	_, err := s.run(ctx, sub)
+	if !errors.Is(err, ErrDiskFailed) {
+		t.Fatalf("run err = %v, want ErrDiskFailed (disk gate must precede peers-banned)", err)
 	}
 }

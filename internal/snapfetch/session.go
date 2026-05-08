@@ -318,6 +318,7 @@ func (s *fetchSession) download(ctx context.Context, offer *snapshotOffer, good 
 		offer, chunkHashes, good, snapDir,
 		s.cfg.PerPeerLimit, s.cfg.ChunkTimeout, s.cfg.PeerFailLimit,
 		s.cfg.ProvisionalProbeStrikes, s.cfg.ProvisionalProbeInflight,
+		s.cfg.MaxDiskWriteFailures,
 		s.watch, s.mgr)
 }
 
