@@ -100,10 +100,10 @@ func TestIsJumpCandidateSkipsFailedHeights(t *testing.T) {
 	}
 }
 
-// Issue #25: an adversarial peer that always offers a slightly higher
-// height than the current target must not be able to keep the walker
-// jumping forever. The walker gates jumps on a per-walk cap; this test
-// drives the same gate the loop uses and asserts termination.
+// An adversarial peer that always offers a slightly higher height
+// than the current target must not be able to keep the walker jumping
+// forever. The walker gates jumps on a per-walk cap; this test drives
+// the same gate the loop uses and asserts termination.
 func TestJumpCapTerminatesUnderAdversary(t *testing.T) {
 	const minHeight = 0
 	failed := map[uint64]bool{}

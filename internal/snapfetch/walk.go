@@ -136,9 +136,9 @@ walkLoop:
 	askKey := func(peerID, k string) string { return peerID + ":" + k }
 
 	// Bound jump-ups per walk so two peers oscillating between heights
-	// can't keep us walking forever (issue #25). 2*len(targets) leaves
-	// generous headroom for legitimate late-arriving offers while
-	// guaranteeing termination under adversarial peers.
+	// can't keep us walking forever. 2*len(targets) leaves generous
+	// headroom for legitimate late-arriving offers while guaranteeing
+	// termination under adversarial peers.
 	maxJumps := 2 * len(targets)
 	jumps := 0
 	jumpCapLogged := false
@@ -319,8 +319,7 @@ walkLoop:
 // isJumpCandidate reports whether a fresher offer at newHeight is
 // a candidate for preempting the current target — i.e., it satisfies
 // the height/floor/failed-set rules. The caller still gates on the
-// per-walk jump budget (issue #25) and on fixed-target mode
-// (cfg.TargetHeight != 0).
+// per-walk jump budget and on fixed-target mode (cfg.TargetHeight != 0).
 func isJumpCandidate(newHeight, current, minHeight uint64, failed map[uint64]bool) bool {
 	if newHeight <= current {
 		return false
