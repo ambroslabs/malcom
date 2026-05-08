@@ -126,6 +126,7 @@ type chunkScheduler struct {
 	log   cmtlog.Logger
 
 	// job
+	chainID     string
 	target      *snapshotOffer
 	chunkHashes [][]byte
 	snapDir     string
@@ -157,7 +158,7 @@ const progressEvery = 10 * time.Second
 // seeds it with the chunk-0 responder + offer's good peers, and runs
 // the main loop. Returns total bytes transferred.
 func download(ctx context.Context, sw *p2p.Switch, ssR *statesync.Reactor,
-	sub *subscription, target *snapshotOffer, chunkHashes [][]byte,
+	sub *subscription, chainID string, target *snapshotOffer, chunkHashes [][]byte,
 	good []p2p.ID, snapDir string,
 	perPeer int, chunkTimeout time.Duration, peerFailLimit int,
 	provisionalStrikes, provisionalInflight int,
@@ -176,6 +177,7 @@ func download(ctx context.Context, sw *p2p.Switch, ssR *statesync.Reactor,
 		mgr:                 mgr,
 		watch:               watch,
 		log:                 logctx.From(ctx),
+		chainID:             chainID,
 		target:              target,
 		chunkHashes:         chunkHashes,
 		snapDir:             snapDir,
@@ -321,7 +323,8 @@ func (s *chunkScheduler) run(ctx context.Context, sub *subscription) (uint64, er
 		alive, connected := s.peerCounts()
 		if alive == 0 {
 			return s.bytesTotal.Load(),
-				fmt.Errorf("all peers banned (done %d/%d)", s.doneCount, N)
+				fmt.Errorf("all peers banned (done %d/%d) — %s",
+					s.doneCount, N, hintAllPeersBanned(s.chainID))
 		}
 
 		select {
