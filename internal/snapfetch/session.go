@@ -221,10 +221,12 @@ func newFetchSession(ctx context.Context, c Config) (*fetchSession, func(), erro
 	// defers (LIFO). Order matters: watchCancel first so the watch
 	// goroutine settles before the mux closes; bans/book saves before
 	// switch stop so persistence wins regardless of how long sw.Stop
-	// takes; sw.Stop skipped on ctx.Err to give Ctrl-C a fast exit
-	// (cometbft's clean per-peer disconnect can take 5-10s, OS reaps
-	// sockets on process exit anyway); manager last because it polls
-	// the switch and we want it quiet during shutdown.
+	// takes; sw.Stop bounded by a 1s deadline because cometbft's clean
+	// per-peer disconnect can take 5-10s and the OS reaps sockets on
+	// process exit anyway — without the bound, fail-fast paths (walk
+	// finds nothing, ctx cancelled mid-run) look like a hang; manager
+	// last because it polls the switch and we want it quiet during
+	// shutdown.
 	cleanup := func() {
 		watchCancel()
 		mux.stop()
@@ -234,8 +236,12 @@ func newFetchSession(ctx context.Context, c Config) (*fetchSession, func(), erro
 			log.Info("banlist saved", "path", c.Banlist, "size", bans.Len())
 		}
 		book.Save()
-		if ctx.Err() == nil {
-			_ = sw.Stop()
+		stopped := make(chan struct{})
+		go func() { _ = sw.Stop(); close(stopped) }()
+		select {
+		case <-stopped:
+		case <-time.After(1 * time.Second):
+			log.Debug("sw.Stop slow; skipping wait")
 		}
 		mgr.Stop()
 	}
