@@ -1,3 +1,0 @@
-[27547.049448] gaiad invoked oom-killer: gfp_mask=0x140cca(GFP_HIGHUSER_MOVABLE|__GFP_COMP), order=0, oom_score_adj=0
-[27547.049892] oom-kill:constraint=CONSTRAINT_NONE,nodemask=(null),cpuset=/,mems_allowed=0,global_oom,task_memcg=/user.slice/user-0.slice/session-487.scope,task=gaiad,pid=97260,uid=0
-[27547.049964] Out of memory: Killed process 97260 (gaiad) total-vm:72104340kB, anon-rss:64729820kB, file-rss:3072kB, shmem-rss:0kB, UID:0 pgtables:128388kB oom_score_adj:0
