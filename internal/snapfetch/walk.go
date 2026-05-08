@@ -135,6 +135,14 @@ walkLoop:
 	asked := map[string]bool{}
 	askKey := func(peerID, k string) string { return peerID + ":" + k }
 
+	// Bound jump-ups per walk so two peers oscillating between heights
+	// can't keep us walking forever (issue #25). 2*len(targets) leaves
+	// generous headroom for legitimate late-arriving offers while
+	// guaranteeing termination under adversarial peers.
+	maxJumps := 2 * len(targets)
+	jumps := 0
+	jumpCapLogged := false
+
 	dispatch := func(target uint64) int {
 		n := 0
 		for _, e := range offers.at(target) {
@@ -207,17 +215,27 @@ walkLoop:
 				// current target is requeued behind it, since we
 				// never gave it the full per-height window).
 				if cfg.TargetHeight == 0 &&
-					ev.Snapshot.Height > target &&
-					(cfg.MinHeight == 0 || ev.Snapshot.Height >= cfg.MinHeight) &&
-					!failed[ev.Snapshot.Height] {
-					log.Info("found higher snapshot from new peer; jumping",
-						"from_height", target,
-						"to_height", ev.Snapshot.Height,
-						"peer", ev.PeerID)
-					deadline.Stop()
-					queue = append([]uint64{ev.Snapshot.Height, target}, queue...)
-					jumped = true
-					break heightLoop
+					isJumpCandidate(ev.Snapshot.Height, target, cfg.MinHeight, failed) {
+					if jumps < maxJumps {
+						log.Info("found higher snapshot from new peer; jumping",
+							"from_height", target,
+							"to_height", ev.Snapshot.Height,
+							"peer", ev.PeerID,
+							"jumps", jumps+1,
+							"max_jumps", maxJumps)
+						deadline.Stop()
+						queue = append([]uint64{ev.Snapshot.Height, target}, queue...)
+						jumps++
+						jumped = true
+						break heightLoop
+					}
+					if !jumpCapLogged {
+						log.Info("walk jump cap reached; ignoring further higher-height offers this walk",
+							"target", target,
+							"offer_height", ev.Snapshot.Height,
+							"max_jumps", maxJumps)
+						jumpCapLogged = true
+					}
 				}
 				if ev.Snapshot.Height == target {
 					n := dispatch(target)
@@ -296,6 +314,24 @@ walkLoop:
 
 	return nil, nil, fmt.Errorf("%w: window [%d, %d] — %s",
 		ErrWalkFailed, cfg.MinHeight, cfg.MaxHeight, hintNoServable(cfg.ChainID))
+}
+
+// isJumpCandidate reports whether a fresher offer at newHeight is
+// a candidate for preempting the current target — i.e., it satisfies
+// the height/floor/failed-set rules. The caller still gates on the
+// per-walk jump budget (issue #25) and on fixed-target mode
+// (cfg.TargetHeight != 0).
+func isJumpCandidate(newHeight, current, minHeight uint64, failed map[uint64]bool) bool {
+	if newHeight <= current {
+		return false
+	}
+	if minHeight != 0 && newHeight < minHeight {
+		return false
+	}
+	if failed[newHeight] {
+		return false
+	}
+	return true
 }
 
 // walkTargets returns a descending list of heights from
