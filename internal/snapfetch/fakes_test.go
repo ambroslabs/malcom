@@ -186,6 +186,12 @@ func (r *fakeReactor) sentTo(pid p2p.ID, idx uint32) bool {
 	return false
 }
 
+func (r *fakeReactor) numRequests() int {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return len(r.requests)
+}
+
 func (r *fakeReactor) reset() {
 	r.mu.Lock()
 	defer r.mu.Unlock()
