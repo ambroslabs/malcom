@@ -132,6 +132,99 @@ func TestCmtShimRoutesThroughHandler(t *testing.T) {
 	}
 }
 
+func TestParseLevel(t *testing.T) {
+	cases := map[string]slog.Level{
+		"":        slog.LevelInfo,
+		"debug":   slog.LevelDebug,
+		"DEBUG":   slog.LevelDebug,
+		"info":    slog.LevelInfo,
+		"warn":    slog.LevelWarn,
+		"warning": slog.LevelWarn,
+		"error":   slog.LevelError,
+		"silent":  LevelSilent,
+		"off":     LevelSilent,
+	}
+	for in, want := range cases {
+		got, err := ParseLevel(in)
+		if err != nil || got != want {
+			t.Errorf("ParseLevel(%q) = (%v, %v); want (%v, nil)", in, got, err, want)
+		}
+	}
+	if _, err := ParseLevel("bogus"); err == nil {
+		t.Errorf("ParseLevel(bogus) should error")
+	}
+}
+
+func TestBuildOptionsRespectsConfig(t *testing.T) {
+	var buf bytes.Buffer
+	opts, err := BuildOptions(Tuning{
+		Level: "info",
+		Modules: map[string]string{
+			"p2p":  "silent",
+			"loud": "debug",
+		},
+	}, ModeText, false, &buf)
+	if err != nil {
+		t.Fatal(err)
+	}
+	logger := slog.New(newHandlerFromOpts(opts))
+
+	logger.With("module", "p2p").Error("should never appear")
+	logger.With("module", "loud").Debug("debug visible")
+	logger.With("module", "fetch").Info("inherits global info")
+	logger.With("module", "fetch").Debug("global blocks this")
+
+	out := buf.String()
+	if strings.Contains(out, "should never appear") {
+		t.Errorf("silent module emitted a record: %q", out)
+	}
+	if !strings.Contains(out, "debug visible") {
+		t.Errorf("module override to debug should pass: %q", out)
+	}
+	if !strings.Contains(out, "inherits global info") {
+		t.Errorf("info-level inheriting global should pass: %q", out)
+	}
+	if strings.Contains(out, "global blocks this") {
+		t.Errorf("debug record should be blocked by global info: %q", out)
+	}
+}
+
+func TestBuildOptionsDebugFlag(t *testing.T) {
+	var buf bytes.Buffer
+	opts, err := BuildOptions(Tuning{
+		Level: "info",
+		Modules: map[string]string{
+			"p2p":      "silent",
+			"addrbook": "error",
+		},
+	}, ModeText, true, &buf)
+	if err != nil {
+		t.Fatal(err)
+	}
+	logger := slog.New(newHandlerFromOpts(opts))
+
+	logger.With("module", "p2p").Error("silent stays silent under -debug")
+	logger.With("module", "addrbook").Debug("debug bumped from error")
+	logger.With("module", "fetch").Debug("global threshold debug")
+
+	out := buf.String()
+	if strings.Contains(out, "silent stays silent under -debug") {
+		t.Errorf("-debug should NOT override silent: %q", out)
+	}
+	if !strings.Contains(out, "debug bumped from error") {
+		t.Errorf("-debug should bump non-silent module to debug: %q", out)
+	}
+	if !strings.Contains(out, "global threshold debug") {
+		t.Errorf("-debug should drop global threshold to debug: %q", out)
+	}
+}
+
+// newHandlerFromOpts mirrors what New does, but lets tests substitute
+// the writer without going through os.Stderr-based mode resolution.
+func newHandlerFromOpts(opts Options) slog.Handler {
+	return New(opts).Handler()
+}
+
 func TestParseMode(t *testing.T) {
 	cases := map[string]Mode{
 		"":       ModeAuto,

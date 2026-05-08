@@ -53,51 +53,40 @@ func Run(args []string) int {
 		return ExitConfig
 	}
 
-	// Per-module level overrides: cometbft's p2p / mconnection modules
-	// log at Error level even on normal disconnects, and dump packet
-	// byte counts at Debug. Keep them quiet by default; -debug bumps
-	// only the malcom-internal modules.
 	mode, ok := malcomlog.ParseMode(*logMode)
 	if !ok {
 		fmt.Fprintf(os.Stderr, "invalid -log %q (want auto/pretty/text/json)\n", *logMode)
 		return ExitConfig
 	}
-	defaultLevel := slog.LevelError
-	moduleLevels := map[string]slog.Level{
-		"fetch-cli": slog.LevelInfo,
-		"fetch":     slog.LevelInfo,
-		"peerwatch": slog.LevelInfo,
-		"addrbook":  slog.LevelError,
-	}
-	if *debug {
-		defaultLevel = slog.LevelError
-		for _, m := range []string{"fetch-cli", "fetch", "connect", "pex", "peerwatch", "addrbook", "statesync"} {
-			moduleLevels[m] = slog.LevelDebug
-		}
-	}
-	logger := malcomlog.New(malcomlog.Options{
-		Writer:       os.Stderr,
-		Mode:         mode,
-		Level:        defaultLevel,
-		ModuleLevels: moduleLevels,
-	})
-
-	fetchLog := logger.With("module", "fetch-cli")
 
 	if *chain == "" {
-		fetchLog.Error("required: -chain <id>")
+		fmt.Fprintln(os.Stderr, "required: -chain <id>")
 		return ExitConfig
 	}
 	cfg, err := config.Load()
 	if err != nil {
-		fetchLog.Error("config load", "err", err)
+		fmt.Fprintln(os.Stderr, err)
 		return ExitConfig
 	}
 	ch, err := cfg.Resolve(*chain)
 	if err != nil {
-		fetchLog.Error("resolve chain", "err", err, "chain", *chain)
+		fmt.Fprintln(os.Stderr, err)
 		return ExitConfig
 	}
+
+	// Build the logger from the resolved [log] / [log.modules] config.
+	// -debug lowers the global threshold to debug AND bumps every
+	// non-"silent" entry in [log.modules] to debug.
+	logOpts, err := malcomlog.BuildOptions(malcomlog.Tuning{
+		Level:   ch.Log.Level,
+		Modules: ch.Log.Modules,
+	}, mode, *debug, os.Stderr)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "log config: %v\n", err)
+		return ExitConfig
+	}
+	logger := malcomlog.New(logOpts)
+	fetchLog := logger.With("module", "fetch-cli")
 
 	if err := os.MkdirAll(*out, 0o755); err != nil {
 		fetchLog.Error("mkdir out failed", "err", err, "dir", *out)

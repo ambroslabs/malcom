@@ -58,28 +58,31 @@ func Run(args []string) int {
 		fmt.Fprintf(os.Stderr, "invalid -log %q (want auto/pretty/text/json)\n", *logMode)
 		return 2
 	}
-	level := slog.LevelInfo
-	if *debug {
-		level = slog.LevelDebug
-	}
-	log := malcomlog.New(malcomlog.Options{
-		Writer: os.Stderr, Mode: mode, Level: level,
-	}).With("module", "bootstrap")
 
 	if *chain == "" {
-		log.Error("required: -chain <id>")
+		fmt.Fprintln(os.Stderr, "required: -chain <id>")
 		return 2
 	}
 	cfgFile, err := config.Load()
 	if err != nil {
-		log.Error("config load", "err", err)
+		fmt.Fprintln(os.Stderr, err)
 		return 1
 	}
 	ch, err := cfgFile.Resolve(*chain)
 	if err != nil {
-		log.Error("resolve chain", "err", err, "chain", *chain)
+		fmt.Fprintln(os.Stderr, err)
 		return 1
 	}
+
+	logOpts, err := malcomlog.BuildOptions(malcomlog.Tuning{
+		Level:   ch.Log.Level,
+		Modules: ch.Log.Modules,
+	}, mode, *debug, os.Stderr)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "log config: %v\n", err)
+		return 2
+	}
+	log := malcomlog.New(logOpts).With("module", "bootstrap")
 
 	if *appdb == "" || *height == 0 {
 		log.Error("required: -appdb -height")

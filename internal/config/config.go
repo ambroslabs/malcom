@@ -26,11 +26,12 @@ import (
 // tuning sections shared across chains.
 type Config struct {
 	// Default tuning sections. Per-chain files can override individual
-	// fields by including their own [fetch] / [import] / [bootstrap]
-	// blocks.
+	// fields by including their own [fetch] / [import] / [bootstrap] /
+	// [log] blocks.
 	Fetch     FetchTuning     `toml:"fetch"`
 	Import    ImportTuning    `toml:"import"`
 	Bootstrap BootstrapTuning `toml:"bootstrap"`
+	Log       LogTuning       `toml:"log"`
 
 	path      string // resolved config.toml path
 	chainsDir string // <dir of config.toml>/chains
@@ -52,6 +53,21 @@ type Chain struct {
 	Fetch     FetchTuning     `toml:"fetch"`
 	Import    ImportTuning    `toml:"import"`
 	Bootstrap BootstrapTuning `toml:"bootstrap"`
+	Log       LogTuning       `toml:"log"`
+}
+
+// LogTuning maps onto internal/log.Tuning. Edit config.toml to surface
+// a silenced module (set its entry to "debug" or remove it) — the
+// -debug flag explicitly does NOT override "silent" entries so noisy
+// modules stay quiet by default even under verbose runs.
+type LogTuning struct {
+	// Level is the global threshold ("debug"/"info"/"warn"/"error").
+	// Empty = "info".
+	Level string `toml:"level"`
+
+	// Modules caps individual modules. Value is a level name; the
+	// special value "silent" suppresses the module entirely.
+	Modules map[string]string `toml:"modules"`
 }
 
 // FetchTuning maps onto snapfetch.Config's tuning fields.
@@ -239,6 +255,7 @@ func Load() (*Config, error) {
 	}
 	c.path = path
 	c.chainsDir = filepath.Join(filepath.Dir(path), "chains")
+	applyLogDefaults(&c.Log)
 	return &c, nil
 }
 
@@ -258,6 +275,7 @@ func (c *Config) Resolve(name string) (Chain, error) {
 		Fetch:     c.Fetch,
 		Import:    c.Import,
 		Bootstrap: c.Bootstrap,
+		Log:       c.Log,
 	}
 
 	chainPath := filepath.Join(c.chainsDir, name+".toml")
@@ -283,6 +301,7 @@ func (c *Config) Resolve(name string) (Chain, error) {
 	applyFetchDefaults(&ch.Fetch)
 	applyImportDefaults(&ch.Import)
 	applyBootstrapDefaults(&ch.Bootstrap)
+	applyLogDefaults(&ch.Log)
 
 	// Relative genesis is resolved against the chain file's directory.
 	// URLs (http://, https://) are passed through unchanged — bootstrap

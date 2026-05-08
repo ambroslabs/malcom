@@ -16,6 +16,7 @@
 package log
 
 import (
+	"fmt"
 	"io"
 	"log/slog"
 	"os"
@@ -23,6 +24,36 @@ import (
 
 	cmtlog "github.com/cometbft/cometbft/libs/log"
 )
+
+// LevelSilent is a sentinel level higher than slog.LevelError used to
+// silence a module entirely. A record at Error (8) is below 100, so
+// the moduleFilter drops it. Used as the per-module value when the
+// operator wants a noisy module (cometbft's p2p / mconnection / pex)
+// suppressed: it's not a real severity, just "no record can clear
+// this threshold."
+const LevelSilent slog.Level = 100
+
+// ParseLevel decodes "debug" / "info" / "warn" / "error" / "silent"
+// (case-insensitive) into the corresponding slog.Level. The empty
+// string returns slog.LevelInfo so a missing config value defaults
+// sensibly. Returns an error on any other input.
+func ParseLevel(s string) (slog.Level, error) {
+	switch strings.ToLower(strings.TrimSpace(s)) {
+	case "":
+		return slog.LevelInfo, nil
+	case "debug":
+		return slog.LevelDebug, nil
+	case "info":
+		return slog.LevelInfo, nil
+	case "warn", "warning":
+		return slog.LevelWarn, nil
+	case "error":
+		return slog.LevelError, nil
+	case "silent", "off":
+		return LevelSilent, nil
+	}
+	return 0, fmt.Errorf("unknown log level %q (want debug/info/warn/error/silent)", s)
+}
 
 // Mode picks the output handler.
 type Mode int
@@ -48,6 +79,57 @@ func ParseMode(s string) (Mode, bool) {
 		return ModeJSON, true
 	}
 	return ModeAuto, false
+}
+
+// Tuning is the operator-facing log configuration. Mirrors the
+// [log] section in malcom's config.toml. Built into Options via
+// BuildOptions.
+type Tuning struct {
+	// Level is the global threshold for modules not listed in Modules.
+	// Empty string → "info".
+	Level string
+
+	// Modules caps individual modules at the named level. Records
+	// emitted at a lower level pass; records at or above pass; no —
+	// wait — the value is the *threshold* for that module, same
+	// semantics as Level. The special value "silent" maps to a high
+	// sentinel that no record can clear, dropping the module.
+	Modules map[string]string
+}
+
+// BuildOptions resolves a Tuning + format mode + -debug flag into an
+// Options ready for New. -debug overrides the global threshold to
+// debug AND bumps every entry in Modules to debug — except entries
+// explicitly set to "silent", which stay silent (operator edits config
+// to surface those).
+func BuildOptions(t Tuning, mode Mode, debug bool, w io.Writer) (Options, error) {
+	level, err := ParseLevel(t.Level)
+	if err != nil {
+		return Options{}, fmt.Errorf("log.level: %w", err)
+	}
+	moduleLevels := make(map[string]slog.Level, len(t.Modules))
+	for name, val := range t.Modules {
+		lv, err := ParseLevel(val)
+		if err != nil {
+			return Options{}, fmt.Errorf("log.modules.%s: %w", name, err)
+		}
+		moduleLevels[name] = lv
+	}
+	if debug {
+		level = slog.LevelDebug
+		for name, lv := range moduleLevels {
+			if lv == LevelSilent {
+				continue // explicit silence wins; operator must edit config to see it
+			}
+			moduleLevels[name] = slog.LevelDebug
+		}
+	}
+	return Options{
+		Writer:       w,
+		Mode:         mode,
+		Level:        level,
+		ModuleLevels: moduleLevels,
+	}, nil
 }
 
 // Options configures New.

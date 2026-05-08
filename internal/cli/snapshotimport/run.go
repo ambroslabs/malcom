@@ -13,7 +13,6 @@ import (
 	"encoding/json"
 	"flag"
 	"fmt"
-	"log/slog"
 	"os"
 	"path/filepath"
 
@@ -52,15 +51,19 @@ func Run(args []string) int {
 		fmt.Fprintf(os.Stderr, "invalid -log %q (want auto/pretty/text/json)\n", *logMode)
 		return 2
 	}
-	level := slog.LevelInfo
-	if *debug {
-		level = slog.LevelDebug
+	// Load config so the logger picks up [log] / [log.modules]. Fall
+	// back to defaults if config is missing (the import path doesn't
+	// strictly require a config — chain id can come from meta.json).
+	var logTuning malcomlog.Tuning
+	if cfg, err := config.Load(); err == nil {
+		logTuning = malcomlog.Tuning{Level: cfg.Log.Level, Modules: cfg.Log.Modules}
 	}
-	logger := malcomlog.New(malcomlog.Options{
-		Writer: os.Stderr,
-		Mode:   mode,
-		Level:  level,
-	})
+	logOpts, err := malcomlog.BuildOptions(logTuning, mode, *debug, os.Stderr)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "log config: %v\n", err)
+		return 2
+	}
+	logger := malcomlog.New(logOpts)
 	log := logger.With("module", "import-cli")
 
 	// Read meta.json if present. The chain id and height are normally

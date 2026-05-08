@@ -122,6 +122,27 @@ func applyImportDefaults(t *ImportTuning) {
 	}
 }
 
+// applyLogDefaults fills in malcom's baseline log policy when both the
+// global and per-chain config omit a [log] section: info threshold,
+// and silence the cometbft modules that emit normal-operation events
+// at Error level (peer churn) or dump packet byte counts at Debug.
+//
+// Operators see these by editing config.toml — `-debug` does NOT
+// override an explicit "silent" entry.
+func applyLogDefaults(t *LogTuning) {
+	if t.Level == "" {
+		t.Level = "info"
+	}
+	if t.Modules == nil {
+		t.Modules = map[string]string{
+			"addrbook":    "error",  // surface real errors, suppress info chatter
+			"p2p":         "silent", // cometbft switch — peer EOFs aren't actionable
+			"mconnection": "silent", // packet byte counts at Debug
+			"pex":         "silent", // PEX gossip noise (covers our pex and cometbft's)
+		}
+	}
+}
+
 func applyBootstrapDefaults(t *BootstrapTuning) {
 	if t.TrustPeriod.Duration() == 0 {
 		t.TrustPeriod = duration(30 * 24 * time.Hour)

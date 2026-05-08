@@ -22,8 +22,6 @@ import (
 	"sort"
 	"strings"
 
-	"log/slog"
-
 	"github.com/cockroachdb/pebble"
 	"github.com/cometbft/cometbft/crypto/merkle"
 
@@ -53,15 +51,22 @@ func Run(args []string) int {
 		fmt.Fprintf(os.Stderr, "invalid -log %q (want auto/pretty/text/json)\n", *logMode)
 		return 2
 	}
-	level := slog.LevelInfo
-	if *debug {
-		level = slog.LevelDebug
+	// Pull [log] from config when available; verify is also runnable
+	// with -rpc and no config, in which case fall back to defaults.
+	var logTuning malcomlog.Tuning
+	if cfg, err := config.Load(); err == nil {
+		if ch, err := cfg.Resolve(*chain); err == nil {
+			logTuning = malcomlog.Tuning{Level: ch.Log.Level, Modules: ch.Log.Modules}
+		} else {
+			logTuning = malcomlog.Tuning{Level: cfg.Log.Level, Modules: cfg.Log.Modules}
+		}
 	}
-	log := malcomlog.New(malcomlog.Options{
-		Writer: os.Stderr,
-		Mode:   mode,
-		Level:  level,
-	}).With("module", "verify")
+	logOpts, err := malcomlog.BuildOptions(logTuning, mode, *debug, os.Stderr)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "log config: %v\n", err)
+		return 2
+	}
+	log := malcomlog.New(logOpts).With("module", "verify")
 
 	// -rpc lets verify run against a single RPC without needing a
 	// chains/<id>.toml — convenient for one-off checks. Only load
