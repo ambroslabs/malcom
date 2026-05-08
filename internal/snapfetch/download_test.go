@@ -563,6 +563,30 @@ func TestChunkSchedulerResumeSweepsStaleTmpFiles(t *testing.T) {
 	}
 }
 
+func TestChunkSchedulerPickPeerProvenSlotsLimited(t *testing.T) {
+	b := newScenario(t)
+	b.target.Chunks = 8
+	s := b.build()
+
+	proven := newFakePeer("proven", "1.1.1.1", 26656)
+	b.sw.peerSet.Add(proven)
+	s.stats[proven.ID()] = &peerStat{}
+
+	// perPeer = 4 in the scenario. pickPeer must hand out at most
+	// perPeer concurrent slots — once inflight reaches the limit the
+	// peer must not be picked again, so dispatch can't bump it past
+	// PerPeerLimit.
+	for i := 0; i < 4; i++ {
+		if pid := s.pickPeer(); pid != proven.ID() {
+			t.Fatalf("pick #%d=%q, want %q", i+1, pid, proven.ID())
+		}
+		s.stats[proven.ID()].addInflight()
+	}
+	if pid := s.pickPeer(); pid != "" {
+		t.Fatalf("pick with proven inflight=perPeer should return empty, got %q", pid)
+	}
+}
+
 func TestChunkSchedulerPickPeerProvisionalSlotsLimited(t *testing.T) {
 	b := newScenario(t)
 	b.target.Chunks = 5
