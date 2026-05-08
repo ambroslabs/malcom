@@ -1,18 +1,5 @@
-# Compiled binary at repo root (the one canonical CLI; everything else
-# under build/ or experimental's stray binaries is also covered below).
+# Compiled binary at repo root (also covered by build/).
 /malcom
-
-# Stray binaries from experimental builds at repo root.
-/cosmos-archive
-/cosmos-block
-/cosmos-blockcache
-/cosmos-crawl
-/cosmos-p2p
-/cosmos-rapid-bootstrap
-/cosmos-snapshot-apply
-/cosmos-snapshot-diff
-/cosmos-snapshot-inspect
-/cosmos-statesync-bench
 
 /bin/
 /build/
