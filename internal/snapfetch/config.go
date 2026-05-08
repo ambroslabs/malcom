@@ -69,6 +69,15 @@ type Config struct {
 	// outbound connection count.
 	MaxOutboundPeers int
 
+	// AllowDuplicateIP permits multiple peers to share one IP at
+	// the cometbft Switch level. Default false (cometbft's
+	// default). Setting true is an eclipse-attack vector — one
+	// attacker IP can populate many outbound slots — but is
+	// sometimes required when the target peer set is dominated by
+	// shared egress (NAT/CGN, cloud regions). Operators who set
+	// this true should run `malcom verify` against a trusted RPC.
+	AllowDuplicateIP bool
+
 	// PEXTargetPeers / PEXMaxPerWave control our PEX auto-dial
 	// reactor's pace. TargetPeers should be < MaxOutboundPeers.
 	PEXTargetPeers int

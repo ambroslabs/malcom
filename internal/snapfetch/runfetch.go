@@ -67,11 +67,14 @@ func RunFetch(ctx context.Context, c Config, outRoot string) error {
 }
 
 // buildP2PConfig centralizes snapfetch-specific overrides to cometbft's
-// default P2PConfig. maxOutbound is the only caller-configurable knob;
-// the rest are stable policy.
-func buildP2PConfig(maxOutbound int) *cfg.P2PConfig {
+// default P2PConfig.
+func buildP2PConfig(maxOutbound int, allowDuplicateIP bool) *cfg.P2PConfig {
 	p := cfg.DefaultP2PConfig()
-	p.AllowDuplicateIP = true            // shared egress IPs are common; default rejection starves the pool
+	// Default false (cometbft default) rejects the eclipse vector
+	// where one attacker IP fills many of our outbound slots.
+	// Operators on shared-egress peer sets can set true via
+	// [chains.<id>.fetch] allow_duplicate_ip.
+	p.AllowDuplicateIP = allowDuplicateIP
 	p.HandshakeTimeout = 5 * time.Second // drop slow peers fast (cometbft default: 20s)
 	p.DialTimeout = 5 * time.Second      // same — fail fast over politeness
 	p.MaxNumOutboundPeers = maxOutbound
