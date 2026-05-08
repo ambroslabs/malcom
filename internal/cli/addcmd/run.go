@@ -24,11 +24,18 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"regexp"
 
 	"github.com/zrbecker/cosmos-p2p/internal/config"
 	"github.com/zrbecker/cosmos-p2p/internal/helpers/nodekey"
 	"github.com/zrbecker/cosmos-p2p/internal/registry"
 )
+
+// chainIDPattern bounds the accepted shape of a <chain-id> argument so
+// it can't smuggle path separators or other surprises into chains/<id>.toml
+// or the per-chain XDG dirs. Real cosmos chain IDs (cosmoshub-4,
+// osmosis-1, neutron-1, gravity-bridge-3, ...) all fit this shape.
+var chainIDPattern = regexp.MustCompile(`^[a-z0-9][a-z0-9._-]*$`)
 
 // Run is the malcom subcommand entry point.
 func Run(args []string) int {
@@ -41,9 +48,14 @@ func Run(args []string) int {
 	rest := fs.Args()
 	if len(rest) != 1 || rest[0] == "" {
 		fmt.Fprintln(os.Stderr, "usage: malcom add [-force] [-offline] <chain-id>")
+		fmt.Fprintln(os.Stderr, "note: flags must precede <chain-id> (e.g. `malcom add -offline cosmoshub-4`)")
 		return 2
 	}
 	chain := rest[0]
+	if !chainIDPattern.MatchString(chain) {
+		fmt.Fprintf(os.Stderr, "invalid chain id %q: must match %s\n", chain, chainIDPattern)
+		return 2
+	}
 
 	cfgPath, err := config.DefaultConfigPath()
 	if err != nil {

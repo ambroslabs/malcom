@@ -1,4 +1,5 @@
-// Default templates emitted by `malcom init`.
+// Default templates: `config.toml` (written by `malcom init`) and
+// `chains/<id>.toml` (written by `malcom add <chain-id>`).
 
 package config
 

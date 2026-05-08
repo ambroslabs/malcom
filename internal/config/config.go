@@ -332,20 +332,6 @@ func fillXDGDefaults(ch *Chain) error {
 	return nil
 }
 
-// DefaultChain returns a Chain with all tuning fields populated to
-// built-in defaults — same values `malcom init` would write to a
-// fresh chains/<id>.toml. ChainID is empty; callers fill it in.
-//
-// Used by subcommands as a fallback when the config file doesn't
-// exist yet, so `-h` still shows real default values.
-func DefaultChain() Chain {
-	var ch Chain
-	applyFetchDefaults(&ch.Fetch)
-	applyImportDefaults(&ch.Import)
-	applyBootstrapDefaults(&ch.Bootstrap)
-	return ch
-}
-
 // IsGenesisURL reports whether s is an http(s) URL (vs a local path).
 // Public so subcommands can branch the same way Resolve does.
 func IsGenesisURL(s string) bool { return isGenesisURL(s) }
