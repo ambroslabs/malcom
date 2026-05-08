@@ -48,6 +48,7 @@ type Chain struct {
 	NodeKey  string `toml:"node_key"`
 	AddrBook string `toml:"addrbook"`
 	Banlist  string `toml:"banlist"`
+	Served   string `toml:"served"`
 
 	Fetch     FetchTuning     `toml:"fetch"`
 	Import    ImportTuning    `toml:"import"`
@@ -98,6 +99,14 @@ type FetchTuning struct {
 	// Higher values find peers faster but generate more outbound
 	// traffic on the network at startup.
 	PEXMaxPerWave int `toml:"pex_max_per_wave"`
+
+	// PEXDisabled puts the fetch in "curated peers only" mode: PEX
+	// gossip is ignored and the connect manager draws warm-fill from
+	// bootstrap_peers only — never from the cometbft addrbook.
+	// Operator workflow: run with PEX enabled to discover serving
+	// peers, then pin those peers in bootstrap_peers and re-run with
+	// pex_disabled = true. Default false.
+	PEXDisabled bool `toml:"pex_disabled"`
 
 	// ChurnGrace is how long a freshly-connected peer has to
 	// advertise a snapshot in [MinHeight, MaxHeight] before
@@ -151,6 +160,10 @@ type FetchTuning struct {
 	PerPeer       int      `toml:"per_peer"`
 	ChunkTimeout  duration `toml:"chunk_timeout"`
 	MaxFetch      duration `toml:"max_fetch"`
+	// PeerFails is the consecutive hash-mismatch strike budget before
+	// a peer is benched for the run. Missing/empty chunks don't count
+	// — they're routed to a per-peer/per-chunk decline set instead, so
+	// peers with partial snapshots can still serve what they have.
 	PeerFails     int      `toml:"peer_fails"`
 	// PeerRedials caps the number of consecutive disconnect/redial
 	// cycles before a peer is permanently banned for the run. 0 =
@@ -309,6 +322,13 @@ func fillXDGDefaults(ch *Chain) error {
 			return err
 		}
 		ch.Banlist = filepath.Join(d, ch.ChainID, "banlist.json")
+	}
+	if ch.Served == "" {
+		d, err := StateDir()
+		if err != nil {
+			return err
+		}
+		ch.Served = filepath.Join(d, ch.ChainID, "served.json")
 	}
 	return nil
 }

@@ -17,6 +17,7 @@ type Config struct {
 	Moniker           string // default "cosmos-p2p-snapfetch"
 	AddrBook          string // path to cometbft PEX-managed addrbook (required)
 	Banlist           string // path to cross-run banlist (required)
+	Served            string // path to cross-run served-peers list (required)
 	BootstrapPeers []string
 
 	DiscoverFor       time.Duration // default 25s
@@ -78,6 +79,15 @@ type Config struct {
 	// reactor's pace. TargetPeers should be < MaxOutboundPeers.
 	PEXTargetPeers int
 	PEXMaxPerWave  int
+
+	// PEXDisabled puts the fetch in "curated peers only" mode: the
+	// PEX reactor does no gossip processing, and the connect manager
+	// draws warm-fill addresses only from the static bootstrap_peers
+	// list (never from the cometbft addrbook). Use when the operator
+	// has identified a known-good peer set from prior runs and wants
+	// to avoid the noise of dialing the broader gossip-discovered
+	// pool. Default false.
+	PEXDisabled bool
 
 	// ChurnGrace is how long a connected peer has to advertise a
 	// useful snapshot before being dropped. See walkBackward.

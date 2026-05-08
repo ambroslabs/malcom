@@ -296,6 +296,83 @@ func TestManagerPinnedConnectedPeerSkipped(t *testing.T) {
 	}
 }
 
+// A peer that connects briefly (less than StabilityWindow) and then
+// disconnects must NOT have its backoff schedule wiped. Without this,
+// fast-flappers (EOF in <RefreshTick) could keep redialing without
+// ever accumulating exponential backoff or hitting MaxRedials.
+func TestManagerFastFlapperKeepsBackoff(t *testing.T) {
+	sw := newFakeSwitch()
+	pid := p2p.ID("0123456789abcdef0123456789abcdef01234567")
+	peer := newFakePeer(string(pid), "1.2.3.4", 26656)
+
+	m := newManagerForTest(t, sw, Config{
+		WarmTarget:      0,
+		Backoff:         100 * time.Millisecond,
+		StabilityWindow: time.Hour, // long window so we never cross it in this test
+	})
+	m.Pin(pid, string(pid)+"@1.2.3.4:26656")
+
+	// Seed an existing backoff schedule (peer has already disconnected
+	// once and is waiting for the next dial).
+	m.mu.Lock()
+	m.backoffs[pid] = &peerBackoff{disconnects: 2, nextDialAt: time.Now().Add(time.Hour)}
+	m.mu.Unlock()
+
+	// Peer briefly appears in the switch — what fast-flappers look like
+	// to the poll-based tick.
+	sw.peerSet.add(peer)
+	m.tick()
+
+	// Backoff schedule must still be intact. Without the stability
+	// window, the old code would have deleted it here.
+	m.mu.Lock()
+	bo, ok := m.backoffs[pid]
+	m.mu.Unlock()
+	if !ok {
+		t.Fatalf("backoff schedule wiped on first connected observation; want preserved until StabilityWindow elapses")
+	}
+	if bo.disconnects != 2 {
+		t.Fatalf("disconnects=%d, want 2 (schedule should be preserved)", bo.disconnects)
+	}
+	if bo.connectedSince.IsZero() {
+		t.Fatalf("connectedSince not set on first connected observation")
+	}
+}
+
+// A peer that has been continuously connected for >= StabilityWindow
+// SHOULD have its backoff schedule wiped. This is what allows a peer
+// that survived a flap to reclaim a fresh redial budget.
+func TestManagerStableConnectionWipesBackoff(t *testing.T) {
+	sw := newFakeSwitch()
+	pid := p2p.ID("0123456789abcdef0123456789abcdef01234567")
+	peer := newFakePeer(string(pid), "1.2.3.4", 26656)
+
+	m := newManagerForTest(t, sw, Config{
+		WarmTarget:      0,
+		Backoff:         100 * time.Millisecond,
+		StabilityWindow: 10 * time.Millisecond, // short for test speed
+	})
+	m.Pin(pid, string(pid)+"@1.2.3.4:26656")
+
+	// Seed a backoff schedule and a connectedSince well past the window.
+	m.mu.Lock()
+	m.backoffs[pid] = &peerBackoff{
+		disconnects:    3,
+		connectedSince: time.Now().Add(-time.Hour),
+	}
+	m.mu.Unlock()
+
+	sw.peerSet.add(peer)
+	m.tick()
+
+	m.mu.Lock()
+	_, ok := m.backoffs[pid]
+	m.mu.Unlock()
+	if ok {
+		t.Fatalf("backoff schedule preserved after stability window elapsed; want wiped")
+	}
+}
+
 func TestManagerMaxRedialsAutoBans(t *testing.T) {
 	sw := newFakeSwitch()
 	book := newFakeBook()
@@ -348,6 +425,34 @@ func TestManagerWarmFillDrawsFromPool(t *testing.T) {
 
 	m.tick()
 	sw.waitForDials(t, 2, 500*time.Millisecond)
+}
+
+// BookDisabled: warm-fill must NOT draw from the book even when the
+// pool is empty. Curated-peers mode locks dialing to bootstrap_peers.
+func TestManagerWarmFillBookDisabledIgnoresBook(t *testing.T) {
+	sw := newFakeSwitch()
+	book := newFakeBook()
+	// Seed the book with an address that PickAddress would otherwise
+	// hand out.
+	addr, _ := p2p.NewNetAddressString("0123456789abcdef0123456789abcdef01234567@7.7.7.7:26656")
+	book.pickQueue = append(book.pickQueue, addr)
+
+	m := newManagerForTest(t, sw, Config{
+		Book:         book,
+		WarmTarget:   8,
+		DialBatch:    4,
+		BookDisabled: true,
+		// No Pool: forces the only candidate source to be the (now-disabled) book.
+	})
+
+	m.tick()
+
+	if sw.dialCount() != 0 {
+		t.Fatalf("BookDisabled manager dialed %d addresses; want 0", sw.dialCount())
+	}
+	if len(book.picks) != 0 {
+		t.Fatalf("BookDisabled manager called PickAddress %d times; want 0", len(book.picks))
+	}
 }
 
 func TestManagerWarmFillFallsBackToBookWhenPoolEmpty(t *testing.T) {

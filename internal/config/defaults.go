@@ -31,13 +31,13 @@ func applyFetchDefaults(t *FetchTuning) {
 		t.PerHeightTimeout = duration(10 * time.Second)
 	}
 	if t.MaxOutboundPeers == 0 {
-		t.MaxOutboundPeers = 128
+		t.MaxOutboundPeers = 192
 	}
 	if t.PEXTargetPeers == 0 {
-		t.PEXTargetPeers = 96
+		t.PEXTargetPeers = 128
 	}
 	if t.PEXMaxPerWave == 0 {
-		t.PEXMaxPerWave = 12
+		t.PEXMaxPerWave = 64
 	}
 	if t.ChurnGrace.Duration() == 0 {
 		t.ChurnGrace = duration(10 * time.Second)
@@ -46,7 +46,7 @@ func applyFetchDefaults(t *FetchTuning) {
 		t.AddrBookBanDuration = duration(time.Hour)
 	}
 	if t.ProvisionalProbeStrikes == 0 {
-		t.ProvisionalProbeStrikes = 1
+		t.ProvisionalProbeStrikes = 2
 	}
 	if t.ProvisionalProbeInflight == 0 {
 		t.ProvisionalProbeInflight = 1
@@ -90,7 +90,7 @@ func applyFetchDefaults(t *FetchTuning) {
 		t.PeerFails = 3
 	}
 	if t.PeerRedials == 0 {
-		t.PeerRedials = 5
+		t.PeerRedials = 4
 	}
 	if t.RedialBackoff.Duration() == 0 {
 		t.RedialBackoff = duration(5 * time.Second)

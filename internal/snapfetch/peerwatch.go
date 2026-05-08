@@ -48,6 +48,11 @@ type peerWatch struct {
 	mu        sync.Mutex
 	firstSeen map[p2p.ID]time.Time
 	useful    map[p2p.ID]bool
+	// outOfRange is set when the peer has advertised at least one
+	// snapshot whose height < minHeight. tick() benches the peer on
+	// the next sweep if no in-range offer arrives in the meantime.
+	// Cleared on disconnect so a reconnect gets fresh state.
+	outOfRange map[p2p.ID]bool
 	// banned is the set of peers we've benched — by peerWatch's own
 	// tick (channel filter or no-useful-offer-in-window) or by
 	// download's misbehavior path (probe timeout, hash mismatch,
@@ -66,11 +71,21 @@ func newPeerWatch(ctx context.Context, sw watchSwitch, book pexcb.AddrBook, mgr 
 		grace:                   grace,
 		banDuration:             banDuration,
 		requireStateSyncChannel: requireStateSyncChannel,
-		log:                     logctx.From(ctx),
+		log:                     logctx.From(ctx).With("module", "peerwatch"),
 		firstSeen:               map[p2p.ID]time.Time{},
 		useful:                  map[p2p.ID]bool{},
+		outOfRange:              map[p2p.ID]bool{},
 		banned:                  map[p2p.ID]bool{},
 	}
+}
+
+// markOutOfRange records that the peer offered a snapshot below
+// minHeight. tick() benches them on the next sweep unless an in-range
+// offer arrives first. Safe to call from any goroutine.
+func (w *peerWatch) markOutOfRange(peerID p2p.ID) {
+	w.mu.Lock()
+	w.outOfRange[peerID] = true
+	w.mu.Unlock()
 }
 
 // isBanned reports whether the peer was benched by any path —
@@ -142,11 +157,12 @@ func (w *peerWatch) onConnect(id p2p.ID) {
 	w.mu.Unlock()
 }
 
-// onDisconnect handles a Removed event. Clears firstSeen so a
-// reconnect gets a fresh grace window.
+// onDisconnect handles a Removed event. Clears firstSeen and the
+// out-of-range flag so a reconnect gets a fresh grace window.
 func (w *peerWatch) onDisconnect(id p2p.ID) {
 	w.mu.Lock()
 	delete(w.firstSeen, id)
+	delete(w.outOfRange, id)
 	w.mu.Unlock()
 }
 
@@ -190,6 +206,14 @@ func (w *peerWatch) tick() {
 				}
 			}
 		}
+		// Positive evidence the peer can't help: they offered a
+		// snapshot below minHeight and never followed up with an
+		// in-range offer. Bench immediately rather than waiting out
+		// the full churn-grace window.
+		if w.outOfRange[id] {
+			pending = append(pending, evict{id, "offered only out-of-range snapshot"})
+			continue
+		}
 		if now.Sub(first) < w.grace {
 			continue
 		}
@@ -227,6 +251,8 @@ func (w *peerWatch) run(ctx context.Context, ctrl <-chan statesync.Event) {
 			case ev.Snapshot != nil:
 				if w.minHeight == 0 || ev.Snapshot.Height >= w.minHeight {
 					w.markUseful(p2p.ID(ev.PeerID))
+				} else {
+					w.markOutOfRange(p2p.ID(ev.PeerID))
 				}
 			}
 		}
