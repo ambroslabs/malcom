@@ -181,6 +181,7 @@ func Run(args []string) int {
 		SnapshotInterval:         ch.Fetch.SnapshotInterval,
 		PerHeightTimeout:         ch.Fetch.PerHeightTimeout.Duration(),
 		MaxOutboundPeers:         ch.Fetch.MaxOutboundPeers,
+		AllowDuplicateIP:         ch.Fetch.AllowDuplicateIP,
 		PEXTargetPeers:           ch.Fetch.PEXTargetPeers,
 		PEXMaxPerWave:            ch.Fetch.PEXMaxPerWave,
 		ChurnGrace:               ch.Fetch.ChurnGrace.Duration(),

@@ -141,7 +141,7 @@ func newFetchSession(ctx context.Context, c Config) (*fetchSession, func(), erro
 	log.Info("addrbook ready", "path", c.AddrBook,
 		"added", res.Added, "skipped_banned", res.SkippedBanned)
 
-	sw := p2p.NewSwitch(buildP2PConfig(c.MaxOutboundPeers), transport)
+	sw := p2p.NewSwitch(buildP2PConfig(c.MaxOutboundPeers, c.AllowDuplicateIP), transport)
 	sw.SetLogger(log.With("module", "p2p"))
 	sw.SetNodeKey(nodeKey)
 	sw.SetNodeInfo(nodeInfo)

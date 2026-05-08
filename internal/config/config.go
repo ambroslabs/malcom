@@ -82,6 +82,13 @@ type FetchTuning struct {
 	// addrbooks dominated by non-snapshot peers, then churn.
 	MaxOutboundPeers int `toml:"max_outbound_peers"`
 
+	// AllowDuplicateIP lets multiple peers share one IP. Default
+	// false rejects the eclipse vector where one attacker IP fills
+	// many outbound slots. Enable only when the target peer set is
+	// dominated by shared egress (NAT/CGN, cloud regions) and
+	// `malcom verify` is part of the operator's pipeline.
+	AllowDuplicateIP bool `toml:"allow_duplicate_ip"`
+
 	// PEXTargetPeers is the connected-outbound count our PEX dial
 	// loop aims for. Must be ≤ MaxOutboundPeers; the gap is
 	// headroom for churn.

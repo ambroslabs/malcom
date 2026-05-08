@@ -66,6 +66,17 @@ churn_grace = "10s"
 # peers we can prove won't help us (relayers, blocksync-only nodes).
 require_state_sync_channel = true
 
+# Permit multiple peers behind one IP. Default false (cometbft
+# default) rejects the eclipse vector where one attacker IP fills
+# many of our outbound slots. p2p delivery is internally consistent
+# (offer.Hash is checked against the downloaded chunks) but not
+# anchored to a trusted root, so a peer set controlled by one
+# attacker can still serve a forged-but-consistent snapshot. Set
+# true only when the peer set is dominated by shared egress
+# (NAT/CGN, cloud regions) and 'malcom verify' against a trusted
+# RPC is part of the operator's pipeline.
+# allow_duplicate_ip = false
+
 # How long misbehaving peers are barred from PEX rotation via
 # book.MarkBad.
 addrbook_ban_duration = "1h"

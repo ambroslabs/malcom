@@ -69,6 +69,11 @@ type Config struct {
 	// outbound connection count.
 	MaxOutboundPeers int
 
+	// AllowDuplicateIP permits multiple peers to share one IP at
+	// the cometbft Switch level. See FetchTuning.AllowDuplicateIP
+	// in internal/config for the user-facing trade-off.
+	AllowDuplicateIP bool
+
 	// PEXTargetPeers / PEXMaxPerWave control our PEX auto-dial
 	// reactor's pace. TargetPeers should be < MaxOutboundPeers.
 	PEXTargetPeers int
