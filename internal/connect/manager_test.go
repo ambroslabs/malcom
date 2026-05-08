@@ -436,6 +436,50 @@ type dialError struct{}
 
 func (*dialError) Error() string { return "dial fail" }
 
+// ErrCurrentlyDialingOrExistingAddress comes back from cometbft when a
+// concurrent dial is already in flight (TOCTOU between the
+// IsDialingOrExistingAddress gate and DialPeerWithAddress, or pinned-
+// redial racing warm-fill). It must NOT count toward MaxDialFailures —
+// otherwise a healthy peer can be evicted from the addrbook and added
+// to the persistent banlist purely from internal dial racing.
+func TestManagerCurrentlyDialingErrorNotCountedAsFailure(t *testing.T) {
+	sw := newFakeSwitch()
+	sw.dialErr = p2p.ErrCurrentlyDialingOrExistingAddress{Addr: "1.1.1.1:26656"}
+
+	book := newFakeBook()
+	bans := newFakeBanlist()
+
+	addr := "0123456789abcdef0123456789abcdef01234567@1.1.1.1:26656"
+	na, err := p2p.NewNetAddressString(addr)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	m := newManagerForTest(t, sw, Config{
+		Book:            book,
+		Banlist:         bans,
+		MaxDialFailures: 2,
+	})
+
+	// Drive dial well past MaxDialFailures.
+	for i := 0; i < 5; i++ {
+		m.dial(na)
+	}
+
+	m.mu.Lock()
+	count := m.dialFail[na.String()]
+	m.mu.Unlock()
+	if count != 0 {
+		t.Fatalf("dialFail[%s]=%d after ErrCurrentlyDialingOrExistingAddress, want 0", na, count)
+	}
+	if book.removed[na.String()] != 0 {
+		t.Fatalf("book.RemoveAddress called on currently-dialing race")
+	}
+	if _, banned := bans.added[na.String()]; banned {
+		t.Fatalf("banlist.Add called on currently-dialing race")
+	}
+}
+
 // buildPool must keep bootstrap-sourced entries at the front of the
 // pool. Without that, dialFromPool's cursor takes thousands of dial
 // ticks to reach the seeds — the walk's per-height timeout fires
