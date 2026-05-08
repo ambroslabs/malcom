@@ -179,7 +179,12 @@ func (w *peerWatch) tick() {
 		}
 		if w.requireStateSyncChannel {
 			if peer := w.sw.Peers().Get(id); peer != nil {
-				if !peer.NodeInfo().(p2p.DefaultNodeInfo).HasChannel(statesync.SnapshotChannel) {
+				di, ok := peer.NodeInfo().(p2p.DefaultNodeInfo)
+				if !ok {
+					pending = append(pending, evict{id, "non-default NodeInfo"})
+					continue
+				}
+				if !di.HasChannel(statesync.SnapshotChannel) {
 					pending = append(pending, evict{id, "no state-sync channel"})
 					continue
 				}

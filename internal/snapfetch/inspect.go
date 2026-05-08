@@ -9,6 +9,7 @@ import (
 
 	cmtlog "github.com/cometbft/cometbft/libs/log"
 
+	"github.com/zrbecker/cosmos-p2p/internal/humanbytes"
 	"github.com/zrbecker/cosmos-p2p/internal/snapshotinspect"
 )
 
@@ -46,7 +47,7 @@ func InspectAndEnrich(dir string, logger cmtlog.Logger) error {
 	}
 	current["inspected_at"] = time.Now().UTC()
 	current["decompressed_bytes"] = res.DecompressedBytes
-	current["decompressed_bytes_human"] = snapshotinspect.HumanBytes(res.DecompressedBytes)
+	current["decompressed_bytes_human"] = humanbytes.Format(res.DecompressedBytes)
 	current["total_items"] = res.TotalItems
 	current["stores"] = res.Stores
 	current["extensions"] = res.Extensions
@@ -67,7 +68,7 @@ func InspectAndEnrich(dir string, logger cmtlog.Logger) error {
 	if logger != nil {
 		logger.Info("inspect complete",
 			"items", res.TotalItems,
-			"decompressed", snapshotinspect.HumanBytes(res.DecompressedBytes),
+			"decompressed", humanbytes.Format(res.DecompressedBytes),
 			"stores", len(res.Stores),
 			"extensions", len(res.Extensions),
 			"elapsed", time.Since(t0).Truncate(time.Millisecond))

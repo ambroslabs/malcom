@@ -28,7 +28,7 @@ type Config struct {
 	ChunkTimeout      time.Duration // default 45s
 	MaxFetchTime      time.Duration // default 60m
 	PeerFailLimit     int           // default 3 (hash-mismatch / missing-chunk strikes before ban)
-	MaxRedials        int           // default 5 (consecutive disconnect/redial cycles before benching). 0 = unlimited.
+	MaxRedials        int           // default 5 (consecutive disconnect/redial cycles before benching).
 	PeerRedialBackoff time.Duration // default 5s — base backoff between redial attempts; doubles on each retry up to MaxRedialBackoff
 
 	// MaxRedialBackoff caps the exponential backoff between redial

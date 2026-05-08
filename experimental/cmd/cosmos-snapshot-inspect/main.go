@@ -18,6 +18,7 @@ import (
 	"sort"
 	"time"
 
+	"github.com/zrbecker/cosmos-p2p/internal/humanbytes"
 	"github.com/zrbecker/cosmos-p2p/internal/snapshotinspect"
 )
 
@@ -73,7 +74,7 @@ func Run(dir string, verbose bool) error {
 	}
 	// Compute bytes_total_human in case the original write predated it.
 	if meta.BytesTotalHuman == "" {
-		meta.BytesTotalHuman = snapshotinspect.HumanBytes(meta.BytesTotal)
+		meta.BytesTotalHuman = humanbytes.Format(meta.BytesTotal)
 	}
 
 	// Decode chunk_hashes from metadata.bin.
@@ -100,7 +101,7 @@ func Run(dir string, verbose bool) error {
 
 	meta.InspectedAt = time.Now().UTC()
 	meta.DecompressedBytes = res.DecompressedBytes
-	meta.DecompressedBytesHuman = snapshotinspect.HumanBytes(res.DecompressedBytes)
+	meta.DecompressedBytesHuman = humanbytes.Format(res.DecompressedBytes)
 	meta.TotalItems = res.TotalItems
 	meta.Stores = res.Stores
 	meta.Extensions = res.Extensions

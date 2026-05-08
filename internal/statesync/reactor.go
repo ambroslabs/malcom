@@ -78,10 +78,6 @@ type Reactor struct {
 	bytesSent  atomic.Int64
 	dropsCtrl  atomic.Int64
 	dropsChunk atomic.Int64
-
-	// AskOnAdd, when true, sends SnapshotsRequest to every peer on AddPeer.
-	// Defaults to true.
-	AskOnAdd bool
 }
 
 const outChunksCapacity = 8
@@ -91,7 +87,6 @@ func NewReactor(logger log.Logger) *Reactor {
 		logger:    logger,
 		Out:       make(chan Event, 256),
 		OutChunks: make(chan Event, outChunksCapacity),
-		AskOnAdd:  true,
 	}
 	r.BaseReactor = *p2p.NewBaseReactor("statesync-probe", r)
 	r.BaseReactor.SetLogger(logger)
@@ -136,9 +131,6 @@ func (r *Reactor) AddPeer(peer p2p.Peer) {
 		r.dropsCtrl.Add(1)
 		r.logger.Error("connect Out channel full; dropping", "peer", peerID)
 	}
-	if !r.AskOnAdd {
-		return
-	}
 	req := &ssproto.SnapshotsRequest{}
 	if peer.Send(p2p.Envelope{ChannelID: SnapshotChannel, Message: req}) {
 		r.bytesSent.Add(int64(proto.Size(req)))
@@ -178,7 +170,7 @@ func (r *Reactor) Receive(env p2p.Envelope) {
 	peerID := string(env.Src.ID())
 	switch m := env.Message.(type) {
 	case *ssproto.SnapshotsResponse:
-		r.logger.Info("snapshot offered",
+		r.logger.Debug("snapshot offered",
 			"peer", peerID, "height", m.Height, "format", m.Format,
 			"chunks", m.Chunks, "metadata_bytes", len(m.Metadata))
 		select {

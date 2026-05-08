@@ -204,14 +204,21 @@ func Run(args []string) int {
 	rootCtx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	rootCtx = logctx.With(rootCtx, logger)
-	sigCh := make(chan os.Signal, 1)
+	sigCh := make(chan os.Signal, 2)
 	signal.Notify(sigCh, os.Interrupt, syscall.SIGTERM)
 	var interrupted atomic.Bool
 	go func() {
 		<-sigCh
 		interrupted.Store(true)
-		fetchLog.Info("interrupted, shutting down")
+		fetchLog.Info("interrupted, shutting down (press Ctrl-C again to force exit)")
 		cancel()
+		// A second signal forces immediate exit, skipping deferred
+		// cleanup (addrbook/banlist saves). Without this, the user has
+		// no escape hatch if shutdown stalls — SIGKILL is the only
+		// alternative. Exit 130 = 128 + SIGINT, by bash convention.
+		<-sigCh
+		fmt.Fprintln(os.Stderr, "snapfetch: forced exit on second signal")
+		os.Exit(130)
 	}()
 
 	if err := snapfetch.RunFetch(rootCtx, scfg, *out); err != nil {

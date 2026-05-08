@@ -21,6 +21,8 @@ import (
 	"time"
 
 	"github.com/cockroachdb/pebble"
+
+	"github.com/zrbecker/cosmos-p2p/internal/humanbytes"
 )
 
 // CleanupCompact opens a pebble DB at dir with default options,
@@ -87,31 +89,13 @@ func printLSM(label string, m *pebble.Metrics) {
 	var parts []string
 	for i, l := range m.Levels {
 		if l.NumFiles > 0 || l.Size > 0 {
-			parts = append(parts, fmt.Sprintf("L%d=%d/%s", i, l.NumFiles, humanBytes(uint64(l.Size))))
+			parts = append(parts, fmt.Sprintf("L%d=%d/%s", i, l.NumFiles, humanbytes.Format(uint64(l.Size))))
 			totalFiles += l.NumFiles
 			totalSize += l.Size
 		}
 	}
 	fmt.Printf("[pebble-%s] %s | total=%d/%s in_progress=%d (%s)\n",
 		label, strings.Join(parts, " "),
-		totalFiles, humanBytes(uint64(totalSize)),
-		m.Compact.NumInProgress, humanBytes(uint64(m.Compact.InProgressBytes)))
-}
-
-func humanBytes(n uint64) string {
-	const (
-		k = 1024
-		m = k * 1024
-		g = m * 1024
-	)
-	switch {
-	case n >= g:
-		return fmt.Sprintf("%.2f GB", float64(n)/float64(g))
-	case n >= m:
-		return fmt.Sprintf("%.1f MB", float64(n)/float64(m))
-	case n >= k:
-		return fmt.Sprintf("%.1f KB", float64(n)/float64(k))
-	default:
-		return fmt.Sprintf("%d B", n)
-	}
+		totalFiles, humanbytes.Format(uint64(totalSize)),
+		m.Compact.NumInProgress, humanbytes.Format(uint64(m.Compact.InProgressBytes)))
 }

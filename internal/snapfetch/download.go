@@ -10,7 +10,6 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
-	"sync/atomic"
 	"time"
 
 	cmtlog "github.com/cometbft/cometbft/libs/log"
@@ -149,7 +148,7 @@ type chunkScheduler struct {
 	completed    []bool
 	inflight     map[uint32]inflightEntry
 	stats        map[p2p.ID]*peerStat
-	bytesTotal   atomic.Uint64
+	bytesTotal   uint64
 	doneCount    uint32
 	hadEvent     bool
 	diskFails    int
@@ -308,7 +307,7 @@ func (s *chunkScheduler) resumeFromDisk() (resumed, removed int) {
 		if bytes.Equal(h[:], s.chunkHashes[idx]) {
 			s.completed[idx] = true
 			s.pending[idx] = false
-			s.bytesTotal.Add(uint64(len(data)))
+			s.bytesTotal += uint64(len(data))
 			s.doneCount++
 			resumed++
 			continue
@@ -331,20 +330,20 @@ func (s *chunkScheduler) run(ctx context.Context, sub *subscription) (uint64, er
 	N := s.target.Chunks
 	for s.doneCount < N {
 		if s.maxDiskFails > 0 && s.diskFails >= s.maxDiskFails {
-			return s.bytesTotal.Load(),
+			return s.bytesTotal,
 				fmt.Errorf("%w: %d chunk write failures hit limit (%d) — likely disk full or I/O error: %w",
 					ErrDiskFailed, s.diskFails, s.maxDiskFails, s.firstDiskErr)
 		}
 		alive, connected := s.peerCounts()
 		if alive == 0 {
-			return s.bytesTotal.Load(),
+			return s.bytesTotal,
 				fmt.Errorf("%w: all peers banned (done %d/%d) — %s",
 					ErrDownloadFailed, s.doneCount, N, hintAllPeersBanned(s.chainID))
 		}
 
 		select {
 		case <-ctx.Done():
-			return s.bytesTotal.Load(), ctx.Err()
+			return s.bytesTotal, ctx.Err()
 		case <-timeoutTicker.C:
 			now := time.Now()
 			s.onTimeoutTick(now)
@@ -361,9 +360,9 @@ func (s *chunkScheduler) run(ctx context.Context, sub *subscription) (uint64, er
 		}
 	}
 	s.log.Info("download finished",
-		"chunks", N, "bytes", s.bytesTotal.Load(),
+		"chunks", N, "bytes", s.bytesTotal,
 		"elapsed", time.Since(s.startTime))
-	return s.bytesTotal.Load(), nil
+	return s.bytesTotal, nil
 }
 
 // peerCounts returns (alive, connected). alive = stats entries not
@@ -429,7 +428,7 @@ func (s *chunkScheduler) logProgress(now time.Time, alive, connected int) {
 	dropsCtrl, dropsChunk := s.ssR.Drops()
 	s.log.Info("download progress",
 		"chunks", fmt.Sprintf("%d/%d", s.doneCount, s.target.Chunks),
-		"MB", s.bytesTotal.Load()>>20,
+		"MB", s.bytesTotal>>20,
 		"chunks_per_s", fmt.Sprintf("%.1f", rate),
 		"peers", fmt.Sprintf("%d/%d", connected, alive),
 		"inflight", len(s.inflight),
@@ -554,7 +553,7 @@ func (s *chunkScheduler) onChunk(ev statesync.Event) {
 	}
 	s.completed[idx] = true
 	s.doneCount++
-	s.bytesTotal.Add(uint64(len(ev.Chunk.Bytes)))
+	s.bytesTotal += uint64(len(ev.Chunk.Bytes))
 	s.dispatch()
 }
 

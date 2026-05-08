@@ -22,6 +22,7 @@ import (
 	"github.com/zrbecker/cosmos-p2p/internal/helpers/addrbook"
 	"github.com/zrbecker/cosmos-p2p/internal/helpers/banlist"
 	"github.com/zrbecker/cosmos-p2p/internal/helpers/nodekey"
+	"github.com/zrbecker/cosmos-p2p/internal/humanbytes"
 	"github.com/zrbecker/cosmos-p2p/internal/logctx"
 	localpex "github.com/zrbecker/cosmos-p2p/internal/pex"
 	"github.com/zrbecker/cosmos-p2p/internal/statesync"
@@ -219,23 +220,27 @@ func newFetchSession(ctx context.Context, c Config) (*fetchSession, func(), erro
 
 	// Cleanup matches the shutdown order we used to express via stacked
 	// defers (LIFO). Order matters: watchCancel first so the watch
-	// goroutine settles before the mux closes; bans/book saves before
+	// goroutine settles before the mux closes; book/bans saves before
 	// switch stop so persistence wins regardless of how long sw.Stop
-	// takes; sw.Stop bounded by a 1s deadline because cometbft's clean
-	// per-peer disconnect can take 5-10s and the OS reaps sockets on
-	// process exit anyway — without the bound, fail-fast paths (walk
-	// finds nothing, ctx cancelled mid-run) look like a hang; manager
-	// last because it polls the switch and we want it quiet during
-	// shutdown.
+	// takes; book before bans because the addrbook is the primary
+	// source of dial candidates — losing the banlist on a save error
+	// is a soft regression (PEX gossip will re-introduce stale peers
+	// for one MaxDialFailures cycle), losing the addrbook is a cold
+	// restart; sw.Stop bounded by a 1s deadline because cometbft's
+	// clean per-peer disconnect can take 5-10s and the OS reaps
+	// sockets on process exit anyway — without the bound, fail-fast
+	// paths (walk finds nothing, ctx cancelled mid-run) look like a
+	// hang; manager last because it polls the switch and we want it
+	// quiet during shutdown.
 	cleanup := func() {
 		watchCancel()
 		mux.stop()
+		book.Save()
 		if err := bans.Save(); err != nil {
 			log.Error("save banlist failed", "path", c.Banlist, "err", err)
 		} else {
 			log.Info("banlist saved", "path", c.Banlist, "size", bans.Len())
 		}
-		book.Save()
 		stopped := make(chan struct{})
 		go func() { _ = sw.Stop(); close(stopped) }()
 		select {
@@ -390,7 +395,7 @@ func (s *fetchSession) writeMeta(snapDir string, offer *snapshotOffer, good []p2
 		OfferedBy:       offered,
 		DownloadedAt:    time.Now().UTC(),
 		BytesTotal:      bytesTotal,
-		BytesTotalHuman: humanBytes(bytesTotal),
+		BytesTotalHuman: humanbytes.Format(bytesTotal),
 	}
 	if err := writeJSONAtomic(filepath.Join(snapDir, "meta.json"), meta); err != nil {
 		return fmt.Errorf("%w: write meta.json: %w", ErrDiskFailed, err)
@@ -410,6 +415,6 @@ func (s *fetchSession) writeMeta(snapDir string, offer *snapshotOffer, good []p2
 	s.log.Info("snapshot saved", "dir", snapDir)
 	s.log.Info("download complete",
 		"height", offer.Height, "format", offer.Format,
-		"chunks", offer.Chunks, "bytes", humanBytes(bytesTotal))
+		"chunks", offer.Chunks, "bytes", humanbytes.Format(bytesTotal))
 	return nil
 }

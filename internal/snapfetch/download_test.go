@@ -190,8 +190,8 @@ func TestChunkSchedulerVerifiedChunkPromotesAndWrites(t *testing.T) {
 	if s.doneCount != 1 {
 		t.Fatalf("doneCount=%d, want 1", s.doneCount)
 	}
-	if s.bytesTotal.Load() != uint64(len(b.chunkBytes)) {
-		t.Fatalf("bytesTotal=%d, want %d", s.bytesTotal.Load(), len(b.chunkBytes))
+	if s.bytesTotal != uint64(len(b.chunkBytes)) {
+		t.Fatalf("bytesTotal=%d, want %d", s.bytesTotal, len(b.chunkBytes))
 	}
 	// File on disk.
 	written, err := os.ReadFile(filepath.Join(b.snapDir, "chunk_00000.bin"))
@@ -515,7 +515,7 @@ func TestChunkSchedulerResumeAllValidChunksSkipsDispatch(t *testing.T) {
 	if s.doneCount != 3 {
 		t.Fatalf("doneCount=%d, want 3", s.doneCount)
 	}
-	if got := s.bytesTotal.Load(); got != totalBytes {
+	if got := s.bytesTotal; got != totalBytes {
 		t.Fatalf("bytesTotal=%d, want %d", got, totalBytes)
 	}
 
@@ -548,7 +548,7 @@ func TestChunkSchedulerResumeRemovesMismatchedChunk(t *testing.T) {
 	if s.doneCount != 0 {
 		t.Fatalf("doneCount=%d, want 0", s.doneCount)
 	}
-	if got := s.bytesTotal.Load(); got != 0 {
+	if got := s.bytesTotal; got != 0 {
 		t.Fatalf("bytesTotal=%d, want 0", got)
 	}
 }
@@ -578,7 +578,7 @@ func TestChunkSchedulerResumePartialMix(t *testing.T) {
 		t.Fatalf("doneCount=%d, want 2", s.doneCount)
 	}
 	wantBytes := uint64(len(bodies[0]) + len(bodies[2]))
-	if got := s.bytesTotal.Load(); got != wantBytes {
+	if got := s.bytesTotal; got != wantBytes {
 		t.Fatalf("bytesTotal=%d, want %d", got, wantBytes)
 	}
 	// Mismatched file removed; missing one stays missing.
@@ -699,7 +699,7 @@ func TestChunkSchedulerWriteFailureNotMarkedCompleted(t *testing.T) {
 	if s.doneCount != 0 {
 		t.Fatalf("doneCount=%d, want 0 (write failed)", s.doneCount)
 	}
-	if got := s.bytesTotal.Load(); got != 0 {
+	if got := s.bytesTotal; got != 0 {
 		t.Fatalf("bytesTotal=%d, want 0", got)
 	}
 	if s.diskFails != 1 {
