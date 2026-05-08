@@ -471,7 +471,7 @@ func (s *chunkScheduler) logFinalSummary() {
 		} else if !r.prov {
 			role = "promoted"
 		}
-		s.log.Info("peer detail",
+		s.log.Debug("peer detail",
 			"peer", string(r.pid),
 			"role", role,
 			"chunks", r.chunks,
