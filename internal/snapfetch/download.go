@@ -570,7 +570,7 @@ func (s *chunkScheduler) pickPeer() p2p.ID {
 			bestProven = pid
 		}
 	}
-	if bestProvenInflight <= s.perPeer {
+	if bestProvenInflight < s.perPeer {
 		return bestProven
 	}
 	if bestProvisInflight <= s.provisionalInflight {
