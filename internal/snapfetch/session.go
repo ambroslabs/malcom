@@ -22,6 +22,7 @@ import (
 	"github.com/zrbecker/cosmos-p2p/internal/helpers/addrbook"
 	"github.com/zrbecker/cosmos-p2p/internal/helpers/banlist"
 	"github.com/zrbecker/cosmos-p2p/internal/helpers/nodekey"
+	"github.com/zrbecker/cosmos-p2p/internal/helpers/served"
 	"github.com/zrbecker/cosmos-p2p/internal/humanbytes"
 	"github.com/zrbecker/cosmos-p2p/internal/logctx"
 	localpex "github.com/zrbecker/cosmos-p2p/internal/pex"
@@ -39,6 +40,7 @@ type fetchSession struct {
 	ssR       *statesync.Reactor
 	book      pexcb.AddrBook
 	bans      *banlist.Set
+	srv       *served.Set
 	mgr       *connect.Manager
 	mux       *eventMux
 	watch     *peerWatch
@@ -120,8 +122,16 @@ func newFetchSession(ctx context.Context, c Config) (*fetchSession, func(), erro
 	if err != nil {
 		return nil, nil, fmt.Errorf("banlist: %w", err)
 	}
+	// Served-peers list: peers that have served verified chunks across
+	// prior runs. Loaded into the dial pool below + Pinned with the
+	// manager so they get redial priority from t=0.
+	srv, err := served.New(c.Served)
+	if err != nil {
+		return nil, nil, fmt.Errorf("served: %w", err)
+	}
 	log.Info("addrbook loaded", "path", c.AddrBook, "size", addrbookCount)
 	log.Info("banlist loaded", "path", c.Banlist, "size", bans.Len())
+	log.Info("served loaded", "path", c.Served, "size", srv.Len())
 
 	// Don't dial ourselves.
 	if selfAddr, err := p2p.NewNetAddressString(p2p.IDAddressString(nodeKey.ID(), listenAddr.DialString())); err == nil {
@@ -159,11 +169,26 @@ func newFetchSession(ctx context.Context, c Config) (*fetchSession, func(), erro
 	// Constructed before the PEX reactor so we can hand it in as the
 	// gossip Kicker — every non-empty PexAddrs triggers an immediate
 	// dial wave instead of waiting for the next RefreshTick.
+	// Prepend served-peers entries to the dial pool. The pool's cursor
+	// walks bootstrap entries first (their head-of-pool position is
+	// preserved by buildPool); served entries go even further ahead so
+	// the very first dial wave hits known chunk-servers.
+	//
+	// srv.All() returns entries newest-first by LastSeenAt. We preserve
+	// that order so the manager's cursor dials the most recently-useful
+	// peers before older ones.
+	servedAll := srv.All()
+	prefix := make([]addrbook.PeerAddr, 0, len(servedAll))
+	for _, e := range servedAll {
+		prefix = append(prefix, addrbook.PeerAddr{Addr: e.Addr, Source: addrbook.SourceBootstrap})
+	}
+	pool := append(prefix, peerAddrs...)
+
 	mgr := connect.New(ctx, connect.Config{
 		Switch:          sw,
 		Book:            book,
 		Banlist:         bans,
-		Pool:            peerAddrs,
+		Pool:            pool,
 		WarmTarget:      c.PEXTargetPeers,
 		DialBatch:       c.PEXMaxPerWave,
 		RefreshTick:     c.WarmRefreshInterval,
@@ -173,19 +198,37 @@ func newFetchSession(ctx context.Context, c Config) (*fetchSession, func(), erro
 		MaxRedials:      c.MaxRedials,
 		MaxDialFailures: c.MaxDialFailures,
 		BanDuration:     c.AddrBookBanDuration,
+		BookDisabled:    c.PEXDisabled,
 	})
+
+	// Pin served peers so the manager actively redials them on every
+	// disconnect — same priority as walk-discovered "good" peers, but
+	// from t=0. New peers learned during the run get pinned via the
+	// existing addProvisional path.
+	for _, e := range srv.All() {
+		mgr.Pin(p2p.ID(e.ID), e.Addr)
+	}
 
 	// PEX reactor: sends PexRequest on every AddPeer and writes
 	// banlist-filtered PexAddrs into the book. Dialing is owned by
 	// connect.Manager — this reactor is gossip-only, but it kicks
 	// the manager after each gossip so freshly-learned addrs get
 	// dialed before the next 5s tick.
-	pexR := localpex.NewAutoReactor(book, localpex.AutoConfig{
-		Banlist: bans,
-		Kicker:  mgr,
-	}, log.With("module", "pex"))
-
-	sw.AddReactor("PEX", pexR)
+	//
+	// In curated-peers mode (PEXDisabled), we skip wiring the PEX
+	// reactor entirely: no outbound PexRequest, no PexAddrs gossip
+	// processed, no addrbook growth. The manager's BookDisabled flag
+	// also blocks warm-fill from drawing book entries, so the only
+	// dial source is the static bootstrap_peers pool.
+	if !c.PEXDisabled {
+		pexR := localpex.NewAutoReactor(book, localpex.AutoConfig{
+			Banlist: bans,
+			Kicker:  mgr,
+		}, log.With("module", "pex"))
+		sw.AddReactor("PEX", pexR)
+	} else {
+		log.Info("pex disabled (curated-peers mode): warm-fill draws only from bootstrap_peers")
+	}
 	sw.AddReactor("STATESYNC", ssR)
 
 	if err := sw.Start(); err != nil {
@@ -211,6 +254,7 @@ func newFetchSession(ctx context.Context, c Config) (*fetchSession, func(), erro
 		ssR:       ssR,
 		book:      book,
 		bans:      bans,
+		srv:       srv,
 		mgr:       mgr,
 		mux:       mux,
 		watch:     watch,
@@ -241,6 +285,11 @@ func newFetchSession(ctx context.Context, c Config) (*fetchSession, func(), erro
 		} else {
 			log.Info("banlist saved", "path", c.Banlist, "size", bans.Len())
 		}
+		if err := srv.Save(); err != nil {
+			log.Error("save served failed", "path", c.Served, "err", err)
+		} else {
+			log.Info("served saved", "path", c.Served, "size", srv.Len())
+		}
 		stopped := make(chan struct{})
 		go func() { _ = sw.Stop(); close(stopped) }()
 		select {
@@ -256,8 +305,15 @@ func newFetchSession(ctx context.Context, c Config) (*fetchSession, func(), erro
 // buildPeerAddrs loads addrs from a previous addrbook.json and prepends
 // any user-supplied bootstrap_peers CSV entries. Errors if the
 // combined list is empty.
+//
+// In curated-peers mode (PEXDisabled), the addrbook is intentionally
+// excluded so the manager's static dial pool is exactly bootstrap_peers
+// — nothing more.
 func buildPeerAddrs(ctx context.Context, c Config) ([]addrbook.PeerAddr, error) {
-	peerAddrs := loadAddrbookPeers(ctx, c.AddrBook)
+	var peerAddrs []addrbook.PeerAddr
+	if !c.PEXDisabled {
+		peerAddrs = loadAddrbookPeers(ctx, c.AddrBook)
+	}
 	for _, s := range c.BootstrapPeers {
 		s = strings.TrimSpace(s)
 		if s != "" {
@@ -324,7 +380,7 @@ func (s *fetchSession) download(ctx context.Context, offer *snapshotOffer, good 
 		s.cfg.PerPeerLimit, s.cfg.ChunkTimeout, s.cfg.PeerFailLimit,
 		s.cfg.ProvisionalProbeStrikes, s.cfg.ProvisionalProbeInflight,
 		s.cfg.MaxDiskWriteFailures,
-		s.watch, s.mgr)
+		s.watch, s.mgr, s.srv)
 }
 
 // verifySnapshotHash recomputes the wire-level snapshot hash from the

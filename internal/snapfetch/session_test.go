@@ -265,3 +265,98 @@ func statIno(t *testing.T, fi os.FileInfo) uint64 {
 	}
 	return st.Ino
 }
+
+// writeTestAddrbook drops a minimal cometbft-shaped addrbook.json at
+// path with one entry per (id, ip, port) triple.
+func writeTestAddrbook(t *testing.T, path string, entries []struct{ ID, IP string; Port int }) {
+	t.Helper()
+	type addr struct {
+		ID   string `json:"id"`
+		IP   string `json:"ip"`
+		Port int    `json:"port"`
+	}
+	type item struct {
+		Addr addr `json:"addr"`
+	}
+	type book struct {
+		Key   string `json:"key"`
+		Addrs []item `json:"addrs"`
+	}
+	b := book{Key: "test"}
+	for _, e := range entries {
+		b.Addrs = append(b.Addrs, item{Addr: addr{ID: e.ID, IP: e.IP, Port: e.Port}})
+	}
+	data, err := json.Marshal(b)
+	if err != nil {
+		t.Fatalf("marshal addrbook: %v", err)
+	}
+	if err := os.WriteFile(path, data, 0o644); err != nil {
+		t.Fatalf("write addrbook: %v", err)
+	}
+}
+
+// With PEXDisabled=false (default), buildPeerAddrs returns bootstrap
+// peers AND addrbook entries. With PEXDisabled=true, it returns ONLY
+// bootstrap peers — no addrbook is loaded. The pool the connect
+// manager dials from depends on this entirely.
+func TestBuildPeerAddrsPEXDisabledSkipsAddrbook(t *testing.T) {
+	dir := t.TempDir()
+	addrbookPath := filepath.Join(dir, "addrbook.json")
+	writeTestAddrbook(t, addrbookPath, []struct {
+		ID, IP string
+		Port   int
+	}{
+		// Valid 40-char hex peer IDs are required for cometbft to
+		// accept the entry — short hand-rolled IDs would be filtered.
+		{ID: "1111111111111111111111111111111111111111", IP: "10.0.0.1", Port: 26656},
+		{ID: "2222222222222222222222222222222222222222", IP: "10.0.0.2", Port: 26656},
+	})
+	bootstrap := []string{
+		"3333333333333333333333333333333333333333@10.0.0.3:26656",
+	}
+
+	t.Run("pex enabled: addrbook + bootstrap", func(t *testing.T) {
+		c := Config{
+			AddrBook:       addrbookPath,
+			BootstrapPeers: bootstrap,
+			PEXDisabled:    false,
+		}
+		got, err := buildPeerAddrs(context.Background(), c)
+		if err != nil {
+			t.Fatalf("buildPeerAddrs: %v", err)
+		}
+		if len(got) != 3 {
+			t.Fatalf("len=%d, want 3 (1 bootstrap + 2 addrbook)", len(got))
+		}
+	})
+
+	t.Run("pex disabled: bootstrap only", func(t *testing.T) {
+		c := Config{
+			AddrBook:       addrbookPath,
+			BootstrapPeers: bootstrap,
+			PEXDisabled:    true,
+		}
+		got, err := buildPeerAddrs(context.Background(), c)
+		if err != nil {
+			t.Fatalf("buildPeerAddrs: %v", err)
+		}
+		if len(got) != 1 {
+			t.Fatalf("len=%d, want 1 (bootstrap only — addrbook must be skipped)", len(got))
+		}
+		if !strings.Contains(got[0].Addr, "10.0.0.3") {
+			t.Fatalf("got[0]=%q, want bootstrap entry", got[0].Addr)
+		}
+	})
+
+	t.Run("pex disabled with no bootstrap: ErrNoPeers", func(t *testing.T) {
+		c := Config{
+			AddrBook:       addrbookPath,
+			BootstrapPeers: nil,
+			PEXDisabled:    true,
+		}
+		_, err := buildPeerAddrs(context.Background(), c)
+		if !errors.Is(err, ErrNoPeers) {
+			t.Fatalf("err=%v, want ErrNoPeers (curated mode + no bootstrap = nothing to dial)", err)
+		}
+	})
+}

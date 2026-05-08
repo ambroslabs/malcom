@@ -241,14 +241,15 @@ func newManagerForTest(t *testing.T, sw managerSwitch, c Config) *Manager {
 	c.Switch = sw
 	c.defaults()
 	m := &Manager{
-		cfg:      c,
-		log:      cmtlog.NewNopLogger(),
-		pinned:   map[p2p.ID]string{},
-		backoffs: map[p2p.ID]*peerBackoff{},
-		banned:   map[p2p.ID]bool{},
-		dialFail: map[string]int{},
-		pool:     append([]addrbook.PeerAddr(nil), c.Pool...),
-		cancel:   func() {}, // no goroutine started
+		cfg:        c,
+		log:        cmtlog.NewNopLogger(),
+		pinned:     map[p2p.ID]string{},
+		backoffs:   map[p2p.ID]*peerBackoff{},
+		banned:     map[p2p.ID]bool{},
+		banReasons: map[p2p.ID]string{},
+		dialFail:   map[string]int{},
+		pool:       append([]addrbook.PeerAddr(nil), c.Pool...),
+		cancel:     func() {}, // no goroutine started
 	}
 	return m
 }
@@ -296,6 +297,83 @@ func TestManagerPinnedConnectedPeerSkipped(t *testing.T) {
 	}
 }
 
+// A peer that connects briefly (less than StabilityWindow) and then
+// disconnects must NOT have its backoff schedule wiped. Without this,
+// fast-flappers (EOF in <RefreshTick) could keep redialing without
+// ever accumulating exponential backoff or hitting MaxRedials.
+func TestManagerFastFlapperKeepsBackoff(t *testing.T) {
+	sw := newFakeSwitch()
+	pid := p2p.ID("0123456789abcdef0123456789abcdef01234567")
+	peer := newFakePeer(string(pid), "1.2.3.4", 26656)
+
+	m := newManagerForTest(t, sw, Config{
+		WarmTarget:      0,
+		Backoff:         100 * time.Millisecond,
+		StabilityWindow: time.Hour, // long window so we never cross it in this test
+	})
+	m.Pin(pid, string(pid)+"@1.2.3.4:26656")
+
+	// Seed an existing backoff schedule (peer has already disconnected
+	// once and is waiting for the next dial).
+	m.mu.Lock()
+	m.backoffs[pid] = &peerBackoff{disconnects: 2, nextDialAt: time.Now().Add(time.Hour)}
+	m.mu.Unlock()
+
+	// Peer briefly appears in the switch — what fast-flappers look like
+	// to the poll-based tick.
+	sw.peerSet.add(peer)
+	m.tick()
+
+	// Backoff schedule must still be intact. Without the stability
+	// window, the old code would have deleted it here.
+	m.mu.Lock()
+	bo, ok := m.backoffs[pid]
+	m.mu.Unlock()
+	if !ok {
+		t.Fatalf("backoff schedule wiped on first connected observation; want preserved until StabilityWindow elapses")
+	}
+	if bo.disconnects != 2 {
+		t.Fatalf("disconnects=%d, want 2 (schedule should be preserved)", bo.disconnects)
+	}
+	if bo.connectedSince.IsZero() {
+		t.Fatalf("connectedSince not set on first connected observation")
+	}
+}
+
+// A peer that has been continuously connected for >= StabilityWindow
+// SHOULD have its backoff schedule wiped. This is what allows a peer
+// that survived a flap to reclaim a fresh redial budget.
+func TestManagerStableConnectionWipesBackoff(t *testing.T) {
+	sw := newFakeSwitch()
+	pid := p2p.ID("0123456789abcdef0123456789abcdef01234567")
+	peer := newFakePeer(string(pid), "1.2.3.4", 26656)
+
+	m := newManagerForTest(t, sw, Config{
+		WarmTarget:      0,
+		Backoff:         100 * time.Millisecond,
+		StabilityWindow: 10 * time.Millisecond, // short for test speed
+	})
+	m.Pin(pid, string(pid)+"@1.2.3.4:26656")
+
+	// Seed a backoff schedule and a connectedSince well past the window.
+	m.mu.Lock()
+	m.backoffs[pid] = &peerBackoff{
+		disconnects:    3,
+		connectedSince: time.Now().Add(-time.Hour),
+	}
+	m.mu.Unlock()
+
+	sw.peerSet.add(peer)
+	m.tick()
+
+	m.mu.Lock()
+	_, ok := m.backoffs[pid]
+	m.mu.Unlock()
+	if ok {
+		t.Fatalf("backoff schedule preserved after stability window elapsed; want wiped")
+	}
+}
+
 func TestManagerMaxRedialsAutoBans(t *testing.T) {
 	sw := newFakeSwitch()
 	book := newFakeBook()
@@ -333,6 +411,53 @@ func TestManagerMaxRedialsAutoBans(t *testing.T) {
 	}
 }
 
+// BanReason returns the reason an explicit Ban() recorded.
+func TestManagerBanReasonRecordsExplicitReason(t *testing.T) {
+	sw := newFakeSwitch()
+	m := newManagerForTest(t, sw, Config{WarmTarget: 0})
+
+	pid := p2p.ID("0123456789abcdef0123456789abcdef01234567")
+	m.Ban(pid, "chunk hash mismatch")
+
+	if got := m.BanReason(pid); got != "chunk hash mismatch" {
+		t.Fatalf("BanReason=%q, want 'chunk hash mismatch'", got)
+	}
+	// Unbanned peer returns empty.
+	other := p2p.ID("ffffffffffffffffffffffffffffffffffffffff")
+	if got := m.BanReason(other); got != "" {
+		t.Fatalf("BanReason for unbanned peer=%q, want empty", got)
+	}
+}
+
+// BanReason returns "max-redials" for peers auto-banned via the
+// MaxRedials path in tick().
+func TestManagerBanReasonMaxRedialsPath(t *testing.T) {
+	sw := newFakeSwitch()
+	book := newFakeBook()
+	bans := newFakeBanlist()
+
+	pid := p2p.ID("0123456789abcdef0123456789abcdef01234567")
+	addr := string(pid) + "@1.2.3.4:26656"
+
+	m := newManagerForTest(t, sw, Config{
+		Book:        book,
+		Banlist:     bans,
+		WarmTarget:  0,
+		MaxRedials:  2,
+		BanDuration: time.Hour,
+	})
+	m.Pin(pid, addr)
+	m.mu.Lock()
+	m.backoffs[pid] = &peerBackoff{disconnects: 2}
+	m.mu.Unlock()
+
+	m.tick()
+
+	if got := m.BanReason(pid); got != "max-redials" {
+		t.Fatalf("BanReason after auto-ban=%q, want 'max-redials'", got)
+	}
+}
+
 func TestManagerWarmFillDrawsFromPool(t *testing.T) {
 	sw := newFakeSwitch()
 	pool := []addrbook.PeerAddr{
@@ -348,6 +473,34 @@ func TestManagerWarmFillDrawsFromPool(t *testing.T) {
 
 	m.tick()
 	sw.waitForDials(t, 2, 500*time.Millisecond)
+}
+
+// BookDisabled: warm-fill must NOT draw from the book even when the
+// pool is empty. Curated-peers mode locks dialing to bootstrap_peers.
+func TestManagerWarmFillBookDisabledIgnoresBook(t *testing.T) {
+	sw := newFakeSwitch()
+	book := newFakeBook()
+	// Seed the book with an address that PickAddress would otherwise
+	// hand out.
+	addr, _ := p2p.NewNetAddressString("0123456789abcdef0123456789abcdef01234567@7.7.7.7:26656")
+	book.pickQueue = append(book.pickQueue, addr)
+
+	m := newManagerForTest(t, sw, Config{
+		Book:         book,
+		WarmTarget:   8,
+		DialBatch:    4,
+		BookDisabled: true,
+		// No Pool: forces the only candidate source to be the (now-disabled) book.
+	})
+
+	m.tick()
+
+	if sw.dialCount() != 0 {
+		t.Fatalf("BookDisabled manager dialed %d addresses; want 0", sw.dialCount())
+	}
+	if len(book.picks) != 0 {
+		t.Fatalf("BookDisabled manager called PickAddress %d times; want 0", len(book.picks))
+	}
 }
 
 func TestManagerWarmFillFallsBackToBookWhenPoolEmpty(t *testing.T) {

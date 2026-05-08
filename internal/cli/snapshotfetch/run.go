@@ -86,11 +86,24 @@ func Run(args []string) int {
 	// serialization, and we need the *os.File for TTY detection.
 	logger := malcomlog.New(os.Stderr)
 	if *debug {
-		logger = cmtlog.NewFilter(logger, cmtlog.AllowDebug())
+		// -debug on cmtlog.AllowDebug() lets through cometbft's
+		// mconnection packet-byte dumps (gigabytes per minute) and
+		// drowns the malcom-relevant lines. Keep cometbft modules at
+		// error+ and bump only our own modules to debug.
+		logger = cmtlog.NewFilter(logger, cmtlog.AllowError(),
+			cmtlog.AllowDebugWith("module", "fetch-cli"),
+			cmtlog.AllowDebugWith("module", "fetch"),
+			cmtlog.AllowDebugWith("module", "connect"),
+			cmtlog.AllowDebugWith("module", "pex"),
+			cmtlog.AllowDebugWith("module", "peerwatch"),
+			cmtlog.AllowDebugWith("module", "addrbook"),
+			cmtlog.AllowDebugWith("module", "statesync"),
+		)
 	} else {
 		logger = cmtlog.NewFilter(logger,
 			cmtlog.AllowInfoWith("module", "fetch-cli"),
 			cmtlog.AllowInfoWith("module", "fetch"),
+			cmtlog.AllowInfoWith("module", "peerwatch"),
 			cmtlog.AllowErrorWith("module", "addrbook"),
 			// pex / p2p / mconnection silenced by default
 		)
@@ -163,6 +176,7 @@ func Run(args []string) int {
 		Moniker:           ch.Fetch.Moniker,
 		AddrBook:          ch.AddrBook,
 		Banlist:           ch.Banlist,
+		Served:            ch.Served,
 		BootstrapPeers:    ch.Fetch.BootstrapPeers,
 		DiscoverFor:       ch.Fetch.Discover.Duration(),
 		DialParallel:      ch.Fetch.DialParallel,
@@ -184,6 +198,7 @@ func Run(args []string) int {
 		AllowDuplicateIP:         ch.Fetch.AllowDuplicateIP,
 		PEXTargetPeers:           ch.Fetch.PEXTargetPeers,
 		PEXMaxPerWave:            ch.Fetch.PEXMaxPerWave,
+		PEXDisabled:              ch.Fetch.PEXDisabled,
 		ChurnGrace:               ch.Fetch.ChurnGrace.Duration(),
 		RequireStateSyncChannel:  ch.Fetch.RequireStateSyncChannel,
 		AddrBookBanDuration:      ch.Fetch.AddrBookBanDuration.Duration(),

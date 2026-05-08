@@ -234,34 +234,44 @@ func TestChunkSchedulerHashMismatchSingleStrikeBansProvisional(t *testing.T) {
 	}
 }
 
-func TestChunkSchedulerProvenPeerNeedsThreeStrikesToBan(t *testing.T) {
+// Missing/empty chunks are data-availability, not misbehaviour: they
+// add the chunk index to the peer's `declined` set and re-flag the
+// chunk as pending, but they do NOT count toward the strike budget
+// and do NOT ban. The peer stays in the rotation for chunks they
+// haven't declined.
+func TestChunkSchedulerMissingChunkDoesNotBan(t *testing.T) {
 	b := newScenario(t)
+	b.target.Chunks = 3
 	s := b.build()
 
 	peer := newFakePeer("peer-A", "1.1.1.1", 26656)
 	b.sw.peerSet.Add(peer)
 	s.stats[peer.ID()] = &peerStat{} // proven (provisional=false)
 
-	// Seed the first assignment; onChunk's redispatch sets up the
-	// next two iterations naturally, mirroring production flow.
-	assignInflight(s, peer.ID(), 0, time.Now())
-	for i := 0; i < 3; i++ {
-		ev := b.chunkEvent(peer.ID(), 0, nil, true) // missing
+	for _, idx := range []uint32{0, 1, 2} {
+		assignInflight(s, peer.ID(), idx, time.Now())
+		ev := b.chunkEvent(peer.ID(), idx, nil, true) // missing
 		s.onChunk(ev)
 	}
 
-	if !s.stats[peer.ID()].banned {
-		t.Fatalf("proven peer not banned after 3 strikes")
+	st := s.stats[peer.ID()]
+	if st.banned {
+		t.Fatalf("peer banned after 3 missing chunks; missing should never ban")
 	}
-	if b.mgr.banReason(peer.ID()) == "" {
-		t.Fatalf("manager.Ban not invoked")
+	if got := b.mgr.banReason(peer.ID()); got != "" {
+		t.Fatalf("manager.Ban invoked with reason=%q; want no ban for missing chunks", got)
 	}
-	// After ban, the failed assignment must be released, not leaked.
-	if _, still := s.inflight[0]; still {
-		t.Fatalf("inflight[0] leaked after final strike")
+	for _, idx := range []uint32{0, 1, 2} {
+		if !st.declined[idx] {
+			t.Fatalf("declined[%d] not set; pickPeer would re-ask this peer for it", idx)
+		}
+		if !s.pending[idx] {
+			t.Fatalf("chunk %d not re-pending after missing response", idx)
+		}
 	}
-	if !s.pending[0] {
-		t.Fatalf("chunk not re-pending after final strike")
+	// Inflight cleared, no leak.
+	if len(s.inflight) != 0 {
+		t.Fatalf("inflight=%v after misses; want empty", s.inflight)
 	}
 }
 
@@ -452,9 +462,69 @@ func TestChunkSchedulerPickPeerSkipsBanned(t *testing.T) {
 	s.stats[bad.ID()] = &peerStat{banned: true}
 
 	for i := 0; i < 5; i++ {
-		if pid := s.pickPeer(nil); pid != good.ID() {
+		if pid := s.pickPeer(0, nil); pid != good.ID() {
 			t.Fatalf("pickPeer=%q, want %q (banned should never be picked)", pid, good.ID())
 		}
+	}
+}
+
+// pickPeer must skip a peer that previously declined the requested
+// chunk index, even if the peer is otherwise eligible. Other chunks
+// should still route to that peer.
+func TestChunkSchedulerPickPeerSkipsDeclinedChunk(t *testing.T) {
+	b := newScenario(t)
+	s := b.build()
+
+	a := newFakePeer("a", "1.1.1.1", 26656)
+	bb := newFakePeer("b", "2.2.2.2", 26656)
+	b.sw.peerSet.Add(a)
+	b.sw.peerSet.Add(bb)
+
+	s.stats[a.ID()] = &peerStat{declined: map[uint32]bool{7: true}}
+	s.stats[bb.ID()] = &peerStat{}
+
+	if pid := s.pickPeer(7, nil); pid != bb.ID() {
+		t.Fatalf("pickPeer(chunk=7)=%q, want %q (peer a declined chunk 7)", pid, bb.ID())
+	}
+	// A different chunk index — peer a is fine.
+	if pid := s.pickPeer(8, nil); pid == "" {
+		t.Fatalf("pickPeer(chunk=8) returned empty; want either peer eligible")
+	}
+}
+
+// A verified chunk must reset the peer's consecutive-failure counter.
+// A peer that misses one chunk, then serves another, then misses two
+// more in a row should NOT be banned (limit=3 not reached because the
+// success in between cleared the counter).
+func TestPeerStatRecordSuccessResetsFailures(t *testing.T) {
+	st := &peerStat{}
+	limit := 3
+
+	// 1st miss
+	if banned := st.recordFailure(limit); banned {
+		t.Fatalf("banned at failures=1; want false")
+	}
+	if st.failures != 1 {
+		t.Fatalf("failures=%d, want 1", st.failures)
+	}
+
+	// Verified chunk arrives — code does st.failures = 0 inline.
+	st.failures = 0
+
+	// Two more misses — still under limit because counter reset.
+	if banned := st.recordFailure(limit); banned {
+		t.Fatalf("banned at failures=1 (post-reset); want false")
+	}
+	if banned := st.recordFailure(limit); banned {
+		t.Fatalf("banned at failures=2 (post-reset); want false")
+	}
+	if st.failures != 2 {
+		t.Fatalf("failures=%d, want 2 post-reset", st.failures)
+	}
+
+	// 3rd consecutive miss — limit hit.
+	if banned := st.recordFailure(limit); !banned {
+		t.Fatalf("banned at failures=3 (post-reset)=%v; want true", banned)
 	}
 }
 
@@ -643,12 +713,12 @@ func TestChunkSchedulerPickPeerProvenSlotsLimited(t *testing.T) {
 	// peer must not be picked again, so dispatch can't bump it past
 	// PerPeerLimit.
 	for i := 0; i < 4; i++ {
-		if pid := s.pickPeer(nil); pid != proven.ID() {
+		if pid := s.pickPeer(0, nil); pid != proven.ID() {
 			t.Fatalf("pick #%d=%q, want %q", i+1, pid, proven.ID())
 		}
 		s.stats[proven.ID()].addInflight()
 	}
-	if pid := s.pickPeer(nil); pid != "" {
+	if pid := s.pickPeer(0, nil); pid != "" {
 		t.Fatalf("pick with proven inflight=perPeer should return empty, got %q", pid)
 	}
 }
@@ -669,7 +739,7 @@ func TestChunkSchedulerPickPeerProvisionalSlotsLimited(t *testing.T) {
 	// is the actual "no more slots" state.
 	s.stats[prov.ID()].addInflight()
 	s.stats[prov.ID()].addInflight()
-	if pid := s.pickPeer(nil); pid != "" {
+	if pid := s.pickPeer(0, nil); pid != "" {
 		t.Fatalf("pick with provisional inflight=2 should return empty, got %q", pid)
 	}
 }

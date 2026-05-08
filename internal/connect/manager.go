@@ -88,10 +88,29 @@ type Config struct {
 	// pinned peer before auto-Ban. 0 = unlimited.
 	MaxRedials int
 
+	// StabilityWindow is how long a pinned peer must be continuously
+	// connected before its backoff schedule is wiped. Without this,
+	// fast-flappers (peers that EOF in <RefreshTick) defeat the
+	// exponential backoff: a tick that observes them connected for
+	// even a few ms would clear the backoff state. Default 30s —
+	// long enough to outlast any plausible state-sync handshake +
+	// gossip exchange that ends in EOF, short enough that a stable
+	// peer reclaims a clean redial budget within one tick after
+	// crossing the window. 0 = use default.
+	StabilityWindow time.Duration
+
 	// MaxDialFailures caps consecutive failed dials against any addr
 	// (pinned or book-sourced) before book.RemoveAddress + Banlist.Add.
 	// 0 disables.
 	MaxDialFailures int
+
+	// BookDisabled forbids warm-fill from drawing addresses out of
+	// the cometbft addrbook (Book). When true, the only dial source
+	// for warm-fill is the static Pool (= bootstrap_peers). Used by
+	// the operator's "curated peers" workflow alongside PEXDisabled
+	// in snapfetch — the operator pins down the peer set explicitly
+	// and the manager never expands beyond it.
+	BookDisabled bool
 
 	// BanDuration is the TTL passed to book.MarkBad when auto-banning
 	// a pinned peer that hits MaxRedials.
@@ -117,19 +136,31 @@ func (c *Config) defaults() {
 	if c.BanDuration == 0 {
 		c.BanDuration = time.Hour
 	}
+	if c.StabilityWindow == 0 {
+		c.StabilityWindow = 30 * time.Second
+	}
 }
 
 type Manager struct {
 	cfg Config
 	log cmtlog.Logger
 
-	mu       sync.Mutex
-	pinned   map[p2p.ID]string       // pid → addr (id@host:port)
-	backoffs map[p2p.ID]*peerBackoff // pid → schedule state (pinned peers)
-	banned   map[p2p.ID]bool         // never-redial within this run
-	dialFail map[string]int          // addr → consecutive failed dials
-	pool     []addrbook.PeerAddr     // shuffled at New()
-	cursor   int
+	mu          sync.Mutex
+	pinned      map[p2p.ID]string       // pid → addr (id@host:port)
+	backoffs    map[p2p.ID]*peerBackoff // pid → schedule state (pinned peers)
+	banned      map[p2p.ID]bool         // never-redial within this run
+	banReasons  map[p2p.ID]string       // pid → reason at time of ban
+	dialFail    map[string]int          // addr → consecutive failed dials
+	pool        []addrbook.PeerAddr     // shuffled at New()
+	cursor      int
+
+	// Cumulative counters for end-of-run reporting. All under m.mu.
+	dialsFired    int
+	dialSuccesses int
+	dialFailures  int
+	addrBans      int // banned addr (max dial failures)
+	peerBans      int // auto-banning pinned peer (max redials)
+	manualBans    int // Ban() invoked externally
 
 	// kickCh signals an immediate tick. Buffered=1 so multiple kicks
 	// in quick succession coalesce into one extra tick.
@@ -138,9 +169,44 @@ type Manager struct {
 	cancel context.CancelFunc
 }
 
+// Stats is a point-in-time snapshot of Manager activity. Safe to call
+// any time; values are cumulative across the manager's lifetime except
+// Pinned/Banned which are current-state.
+type Stats struct {
+	DialsFired    int
+	DialSuccesses int
+	DialFailures  int
+	AddrBans      int
+	PeerBans      int
+	ManualBans    int
+	Pinned        int
+	Banned        int
+}
+
+// Stats returns a Stats snapshot. Cheap; safe to call at end-of-run.
+func (m *Manager) Stats() Stats {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return Stats{
+		DialsFired:    m.dialsFired,
+		DialSuccesses: m.dialSuccesses,
+		DialFailures:  m.dialFailures,
+		AddrBans:      m.addrBans,
+		PeerBans:      m.peerBans,
+		ManualBans:    m.manualBans,
+		Pinned:        len(m.pinned),
+		Banned:        len(m.banned),
+	}
+}
+
 type peerBackoff struct {
 	disconnects int
 	nextDialAt  time.Time
+	// connectedSince tracks when we last observed the peer in
+	// sw.Peers() for the stability check. Zero when disconnected.
+	// Set by tick on the first connected observation; reset on the
+	// first disconnected observation thereafter.
+	connectedSince time.Time
 }
 
 // New constructs a Manager and starts its dial loop. Returns
@@ -153,15 +219,16 @@ func New(ctx context.Context, c Config) *Manager {
 	pool := buildPool(c.Pool)
 
 	m := &Manager{
-		cfg:      c,
-		log:      logctx.From(ctx).With("module", "connect"),
-		pinned:   map[p2p.ID]string{},
-		backoffs: map[p2p.ID]*peerBackoff{},
-		banned:   map[p2p.ID]bool{},
-		dialFail: map[string]int{},
-		pool:     pool,
-		kickCh:   make(chan struct{}, 1),
-		cancel:   cancel,
+		cfg:        c,
+		log:        logctx.From(ctx).With("module", "connect"),
+		pinned:     map[p2p.ID]string{},
+		backoffs:   map[p2p.ID]*peerBackoff{},
+		banned:     map[p2p.ID]bool{},
+		banReasons: map[p2p.ID]string{},
+		dialFail:   map[string]int{},
+		pool:       pool,
+		kickCh:     make(chan struct{}, 1),
+		cancel:     cancel,
 	}
 	go m.loop(loopCtx)
 	return m
@@ -221,7 +288,9 @@ func (m *Manager) Unpin(pid p2p.ID) {
 }
 
 // Ban marks pid as never-redial within this run. Removes any
-// existing pin. Idempotent. The reason is logged.
+// existing pin. Idempotent. The reason is logged and stored so
+// callers (e.g. download's end-of-run summary) can recover it via
+// BanReason later.
 func (m *Manager) Ban(pid p2p.ID, reason string) {
 	m.mu.Lock()
 	if _, already := m.banned[pid]; already {
@@ -229,6 +298,8 @@ func (m *Manager) Ban(pid p2p.ID, reason string) {
 		return
 	}
 	m.banned[pid] = true
+	m.banReasons[pid] = reason
+	m.manualBans++
 	delete(m.pinned, pid)
 	delete(m.backoffs, pid)
 	m.mu.Unlock()
@@ -241,6 +312,18 @@ func (m *Manager) IsBanned(pid p2p.ID) bool {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	return m.banned[pid]
+}
+
+// BanReason returns the reason associated with pid's ban, or empty
+// string if pid is not banned. Used by download's end-of-run summary
+// to label every banned peer with a real cause (peerWatch evictions,
+// max-redials auto-bans, and download-side strikes all populate this
+// — only the dial-failure path bypasses it because dial-fails ban an
+// addr, not a peer ID).
+func (m *Manager) BanReason(pid p2p.ID) string {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.banReasons[pid]
 }
 
 func (m *Manager) loop(ctx context.Context) {
@@ -280,16 +363,41 @@ func (m *Manager) tick() {
 	// 1. Pinned redials.
 	for pid, addr := range pinned {
 		if sw.Peers().Get(pid) != nil {
-			// Connected — clear any backoff and reset dial-fail counter.
+			// Connected — only wipe the backoff schedule once the
+			// peer has been continuously connected for at least
+			// StabilityWindow. Fast-flappers (EOF in <RefreshTick)
+			// don't get to reset their schedule just because tick
+			// caught them mid-handshake.
 			m.mu.Lock()
-			delete(m.backoffs, pid)
-			delete(m.dialFail, addr)
+			bo := m.backoffs[pid]
+			if bo == nil {
+				// No schedule yet — first connection. Nothing to
+				// reset, but always clear the per-addr dial-fail
+				// counter on a successful connect.
+				delete(m.dialFail, addr)
+				m.mu.Unlock()
+				continue
+			}
+			if bo.connectedSince.IsZero() {
+				bo.connectedSince = now
+			}
+			if now.Sub(bo.connectedSince) >= m.cfg.StabilityWindow {
+				delete(m.backoffs, pid)
+				delete(m.dialFail, addr)
+			}
 			m.mu.Unlock()
 			continue
 		}
 
 		m.mu.Lock()
 		bo, ok := m.backoffs[pid]
+		if ok {
+			// Disconnected. If we had marked the peer as connected
+			// on a previous tick, that observation is now stale —
+			// reset the timer so the next reconnect starts a fresh
+			// stability count.
+			bo.connectedSince = time.Time{}
+		}
 		if ok && now.Before(bo.nextDialAt) {
 			m.mu.Unlock()
 			continue
@@ -299,6 +407,8 @@ func (m *Manager) tick() {
 			delete(m.pinned, pid)
 			delete(m.backoffs, pid)
 			m.banned[pid] = true
+			m.banReasons[pid] = "max-redials"
+			m.peerBans++
 			m.mu.Unlock()
 			m.markBadByAddr(addr)
 			m.log.Debug("auto-banning pinned peer (max redials)",
@@ -346,8 +456,12 @@ func (m *Manager) tick() {
 	// thousands of entries so dialFromPool never reports fired < need
 	// and the fallback never triggers.
 	poolShare := need - need/2
+	if m.cfg.BookDisabled {
+		// Curated-peer mode: only the static pool is allowed.
+		poolShare = need
+	}
 	fired := m.dialFromPool(sw, poolShare)
-	if m.cfg.Book != nil {
+	if m.cfg.Book != nil && !m.cfg.BookDisabled {
 		fired += m.dialFromBook(sw, need-fired)
 	}
 	if fired > 0 {
@@ -448,9 +562,13 @@ func (m *Manager) fireDial(addr string) {
 // path racing warm-fill). Counting it as a failure can evict a healthy
 // peer purely on internal racing.
 func (m *Manager) dial(na *p2p.NetAddress) {
+	m.mu.Lock()
+	m.dialsFired++
+	m.mu.Unlock()
 	err := m.cfg.Switch.DialPeerWithAddress(na)
 	if err == nil {
 		m.mu.Lock()
+		m.dialSuccesses++
 		delete(m.dialFail, na.String())
 		m.mu.Unlock()
 		return
@@ -466,6 +584,7 @@ func (m *Manager) recordDialFail(na *p2p.NetAddress, dialErr error) {
 	key := na.String()
 	m.mu.Lock()
 	m.dialFail[key]++
+	m.dialFailures++
 	count := m.dialFail[key]
 	m.mu.Unlock()
 	m.log.Debug("dial failed", "addr", na, "err", dialErr, "consecutive_fails", count)
@@ -479,6 +598,7 @@ func (m *Manager) recordDialFail(na *p2p.NetAddress, dialErr error) {
 		}
 		m.mu.Lock()
 		delete(m.dialFail, key)
+		m.addrBans++
 		m.mu.Unlock()
 		m.log.Debug("banned addr (max dial failures)", "addr", na, "fails", count)
 	}

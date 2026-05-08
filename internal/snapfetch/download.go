@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -16,15 +17,24 @@ import (
 	"github.com/cometbft/cometbft/p2p"
 
 	"github.com/zrbecker/cosmos-p2p/internal/connect"
+	"github.com/zrbecker/cosmos-p2p/internal/helpers/served"
 	"github.com/zrbecker/cosmos-p2p/internal/logctx"
 	"github.com/zrbecker/cosmos-p2p/internal/statesync"
 )
 
 type peerStat struct {
 	inflight    int
-	failures    int  // missing=true or hash-mismatch responses (real misbehaviour)
+	failures    int  // consecutive hash-mismatch responses since the peer's last verified chunk; reset to 0 on success. Missing chunks no longer increment this — they're tracked in `declined` instead.
 	banned      bool // permanently benched (PeerFailLimit hit, or peerWatch eviction)
 	provisional bool // true until peer responds with first verified chunk; provisional peers get one in-flight slot and a single-strike ban budget
+	chunks      int  // verified chunks served by this peer (post-hash-check)
+	wasGood     bool // peer was in the snapshot offer's "good" set at init
+	banReason   string
+	// declined tracks chunk indices the peer reported as missing.
+	// pickPeer skips peers that already declined the chunk being
+	// dispatched, so we never re-ask a peer for data they told us
+	// they don't have. Persistent for the run.
+	declined map[uint32]bool
 }
 
 func (st *peerStat) addInflight() { st.inflight++ }
@@ -114,6 +124,8 @@ type schedulerManager interface {
 	Pin(pid p2p.ID, addr string)
 	Ban(pid p2p.ID, reason string)
 	IsBanned(pid p2p.ID) bool
+	BanReason(pid p2p.ID) string
+	Stats() connect.Stats
 }
 
 type chunkScheduler struct {
@@ -122,6 +134,7 @@ type chunkScheduler struct {
 	ssR   schedulerReactor
 	mgr   schedulerManager
 	watch *peerWatch
+	srv   *served.Set
 	log   cmtlog.Logger
 
 	// writeFile is the chunk-write hook. Production wires writeFileAtomic;
@@ -169,7 +182,7 @@ func download(ctx context.Context, sw *p2p.Switch, ssR *statesync.Reactor,
 	good []p2p.ID, snapDir string,
 	perPeer int, chunkTimeout time.Duration, peerFailLimit int,
 	provisionalStrikes, provisionalInflight, maxDiskFails int,
-	watch *peerWatch, mgr *connect.Manager) (uint64, error) {
+	watch *peerWatch, mgr *connect.Manager, srv *served.Set) (uint64, error) {
 
 	N := target.Chunks
 	pending := make([]bool, N)
@@ -183,6 +196,7 @@ func download(ctx context.Context, sw *p2p.Switch, ssR *statesync.Reactor,
 		ssR:                 ssR,
 		mgr:                 mgr,
 		watch:               watch,
+		srv:                 srv,
 		log:                 logctx.From(ctx),
 		writeFile:           writeFileAtomic,
 		chainID:             chainID,
@@ -211,7 +225,7 @@ func download(ctx context.Context, sw *p2p.Switch, ssR *statesync.Reactor,
 // provisional. Final initial dispatch fires before the main loop.
 func (s *chunkScheduler) init(good []p2p.ID) {
 	for _, p := range good {
-		s.stats[p] = &peerStat{}
+		s.stats[p] = &peerStat{wasGood: true}
 	}
 	// Pin good peers up front so the manager redials them if any drop.
 	if s.mgr != nil {
@@ -362,7 +376,123 @@ func (s *chunkScheduler) run(ctx context.Context, sub *subscription) (uint64, er
 	s.log.Info("download finished",
 		"chunks", N, "bytes", s.bytesTotal,
 		"elapsed", time.Since(s.startTime))
+	s.logFinalSummary()
 	return s.bytesTotal, nil
+}
+
+// logFinalSummary emits aggregate + per-peer info-level lines at end
+// of download. Aggregates reflect the chunkScheduler's view; manager
+// summary covers all dialing across walk + download.
+func (s *chunkScheduler) logFinalSummary() {
+	// Mirror any straggler manager bans into stats so the summary
+	// classifies them correctly. For peers banned via paths the
+	// scheduler doesn't observe directly (peerWatch evictions,
+	// max-redials auto-bans), recover the reason from the manager
+	// so every banned row in the summary has a real cause string.
+	if s.mgr != nil {
+		for pid, st := range s.stats {
+			if !st.banned && s.mgr.IsBanned(pid) {
+				st.banned = true
+			}
+			if st.banned && st.banReason == "" {
+				if r := s.mgr.BanReason(pid); r != "" {
+					st.banReason = r
+				}
+			}
+		}
+	}
+
+	type row struct {
+		pid       p2p.ID
+		chunks    int
+		failures  int
+		good      bool
+		prov      bool
+		banned    bool
+		reason    string
+		connected bool
+	}
+	rows := make([]row, 0, len(s.stats))
+	var (
+		totalTracked     int
+		totalServed      int
+		totalBanned      int
+		totalConnectedNow int
+		totalGood        int
+		totalGoodServed  int
+		totalProvServed  int
+	)
+	for pid, st := range s.stats {
+		conn := s.sw.Peers().Get(pid) != nil
+		rows = append(rows, row{
+			pid: pid, chunks: st.chunks, failures: st.failures,
+			good: st.wasGood, prov: st.provisional,
+			banned: st.banned, reason: st.banReason, connected: conn,
+		})
+		totalTracked++
+		if st.banned {
+			totalBanned++
+		}
+		if st.chunks > 0 {
+			totalServed++
+			if st.wasGood {
+				totalGoodServed++
+			} else {
+				totalProvServed++
+			}
+		}
+		if st.wasGood {
+			totalGood++
+		}
+		if conn {
+			totalConnectedNow++
+		}
+	}
+
+	s.log.Info("peer summary",
+		"tracked", totalTracked,
+		"served_chunks", totalServed,
+		"banned", totalBanned,
+		"connected_now", totalConnectedNow,
+		"good_seed", totalGood,
+		"good_served", totalGoodServed,
+		"provisional_served", totalProvServed)
+
+	sort.Slice(rows, func(i, j int) bool {
+		if rows[i].chunks != rows[j].chunks {
+			return rows[i].chunks > rows[j].chunks
+		}
+		return rows[i].pid < rows[j].pid
+	})
+	for _, r := range rows {
+		role := "provisional"
+		if r.good {
+			role = "good"
+		} else if !r.prov {
+			role = "promoted"
+		}
+		s.log.Info("peer detail",
+			"peer", string(r.pid),
+			"role", role,
+			"chunks", r.chunks,
+			"failures", r.failures,
+			"banned", r.banned,
+			"ban_reason", r.reason,
+			"connected", r.connected)
+	}
+
+	if s.mgr != nil {
+		st := s.mgr.Stats()
+		s.log.Info("manager summary",
+			"dials_fired", st.DialsFired,
+			"dial_successes", st.DialSuccesses,
+			"dial_failures", st.DialFailures,
+			"addr_bans_max_dial_fails", st.AddrBans,
+			"peer_bans_max_redials", st.PeerBans,
+			"manual_bans", st.ManualBans,
+			"pinned_now", st.Pinned,
+			"banned_total", st.Banned)
+	}
 }
 
 // peerCounts returns (alive, connected). alive = stats entries not
@@ -501,11 +631,20 @@ func (s *chunkScheduler) onChunk(ev statesync.Event) {
 	limit := st.failureLimit(s.peerFailLimit, s.provisionalStrikes)
 
 	if ev.Chunk.Missing || len(ev.Chunk.Bytes) == 0 {
-		if st.recordFailure(limit) {
-			s.log.Debug("benching peer",
-				"peer", string(peer), "failures", st.failures, "provisional", st.provisional)
-			s.banAndDrop(peer, "missing/empty chunk")
+		// Peer told us they don't have this chunk. Two effects:
+		//   1. Record the decline so pickPeer never re-asks them
+		//      for this index.
+		//   2. Re-flag the chunk as pending so the dispatcher picks
+		//      a different peer that hasn't declined it.
+		// We do NOT count this against the peer's strike budget —
+		// "missing chunk" is data-availability, not misbehaviour.
+		// A peer with a partial snapshot still serves the chunks
+		// they do have. Hash-mismatch (forgery) is the only path
+		// that calls recordFailure now.
+		if st.declined == nil {
+			st.declined = map[uint32]bool{}
 		}
+		st.declined[idx] = true
 		s.pending[idx] = true
 		s.dispatch()
 		return
@@ -528,6 +667,34 @@ func (s *chunkScheduler) onChunk(ev statesync.Event) {
 	// Verified chunk — promote a provisional peer to proven.
 	if st.promote() {
 		s.log.Info("peer promoted from provisional", "peer", string(peer))
+	}
+	st.chunks++
+	// Reset the failure counter: failures count consecutive
+	// hash-mismatch responses since the peer's last verified chunk.
+	// A peer that occasionally returns a bad chunk but otherwise
+	// serves cleanly should not accumulate strikes across the
+	// whole run.
+	//
+	// Trade-off worth noting: a forger can interleave good chunks
+	// with hash-mismatch chunks indefinitely without ever hitting
+	// PeerFailLimit, since each verified chunk wipes the strike
+	// budget. Mitigations if this becomes a real attack: (a) require
+	// N consecutive successes before reset, (b) keep a separate
+	// cumulative-mismatch counter with a higher cap, or (c) ban
+	// outright on the first hash mismatch (the strict pre-PR
+	// behaviour for provisionals — was a single strike). Verified
+	// downloads still pass the snapshot.Hash check at the end, so a
+	// forger has to produce hash-valid forged chunks for every chunk
+	// they serve to actually corrupt the output — interleaving real
+	// and forged is detected by the per-chunk hash check, just at
+	// the cost of extra retry latency.
+	st.failures = 0
+	// Record the peer as a chunk-server in the cross-run list so
+	// future fetches can pin them up front.
+	if s.srv != nil {
+		if p := s.sw.Peers().Get(peer); p != nil {
+			s.srv.Record(string(peer), p.SocketAddr().String())
+		}
 	}
 
 	// Write the verified chunk to disk. Failures are treated like a
@@ -581,7 +748,12 @@ func (s *chunkScheduler) addProvisional(peer p2p.Peer) {
 // (inflight <= provisionalInflight) so dispatch's post-pick addInflight
 // gives the probe one slot of headroom — enough to surface a hash or
 // timeout strike before the peer either gets proven or banned.
-func (s *chunkScheduler) pickPeer(skip map[p2p.ID]bool) p2p.ID {
+//
+// chunkIdx is the chunk being dispatched. Peers that previously
+// declined that exact index (returned missing/empty for it) are
+// skipped so we don't re-ask them for data they told us they don't
+// have.
+func (s *chunkScheduler) pickPeer(chunkIdx uint32, skip map[p2p.ID]bool) p2p.ID {
 	var bestProven, bestProvis p2p.ID
 	bestProvenInflight := s.perPeer + 1
 	bestProvisInflight := s.provisionalInflight + 1
@@ -590,6 +762,9 @@ func (s *chunkScheduler) pickPeer(skip map[p2p.ID]bool) p2p.ID {
 			continue
 		}
 		if skip[pid] {
+			continue
+		}
+		if st.declined[chunkIdx] {
 			continue
 		}
 		if s.sw.Peers().Get(pid) == nil {
@@ -630,7 +805,7 @@ func (s *chunkScheduler) dispatch() int {
 		if !s.pending[i] {
 			continue
 		}
-		pid := s.pickPeer(skip)
+		pid := s.pickPeer(i, skip)
 		if pid == "" {
 			return dispatched
 		}
@@ -657,6 +832,9 @@ func (s *chunkScheduler) dispatch() int {
 // banAndDrop is the misbehavior path: tell the manager to stop
 // redialing AND have peerWatch disconnect + addrbook-MarkBad.
 func (s *chunkScheduler) banAndDrop(pid p2p.ID, reason string) {
+	if st, ok := s.stats[pid]; ok && st.banReason == "" {
+		st.banReason = reason
+	}
 	if s.mgr != nil {
 		s.mgr.Ban(pid, reason)
 	}

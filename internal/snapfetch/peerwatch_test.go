@@ -291,6 +291,45 @@ func TestPeerWatchTickReclaimsFirstSeenForGonePeers(t *testing.T) {
 	}
 }
 
+// markOutOfRange + tick → bench, even before grace expires.
+func TestPeerWatchOutOfRangeOfferBenchesImmediately(t *testing.T) {
+	b := newPeerWatchScenario(t)
+	w := b.build(100, time.Hour, false) // long grace — bench should fire on out-of-range, not grace.
+
+	peer := newFakePeer("peer-A", "1.1.1.1", 26656)
+	b.sw.peerSet.Add(peer)
+	w.onConnect(peer.ID())
+	w.markOutOfRange(peer.ID())
+
+	w.tick()
+
+	if !b.sw.wasStopped(peer.ID()) {
+		t.Fatalf("peer with out-of-range offer was not evicted on tick")
+	}
+	if b.mgr.banReason(peer.ID()) != "offered only out-of-range snapshot" {
+		t.Fatalf("manager.Ban reason=%q, want 'offered only out-of-range snapshot'",
+			b.mgr.banReason(peer.ID()))
+	}
+}
+
+// Out-of-range followed by an in-range offer: peer is useful, no bench.
+func TestPeerWatchInRangeOfferOverridesOutOfRange(t *testing.T) {
+	b := newPeerWatchScenario(t)
+	w := b.build(100, time.Hour, false)
+
+	peer := newFakePeer("peer-A", "1.1.1.1", 26656)
+	b.sw.peerSet.Add(peer)
+	w.onConnect(peer.ID())
+	w.markOutOfRange(peer.ID())
+	w.markUseful(peer.ID())
+
+	w.tick()
+
+	if b.sw.wasStopped(peer.ID()) {
+		t.Fatalf("peer with both out-of-range AND in-range offers was evicted; useful flag should win")
+	}
+}
+
 func TestPeerWatchIsBannedAfterEviction(t *testing.T) {
 	b := newPeerWatchScenario(t)
 	w := b.build(100, 0, false)
