@@ -8,6 +8,10 @@
 // Tuning knobs (timeouts, parallelism, peer-selection rules) live in
 // the [chains.<id>.fetch] section of config.toml; only operational
 // flags survive on the CLI.
+//
+// Run returns one of the documented Exit* codes so wrapping
+// orchestrators can distinguish failure modes (retry vs. pivot vs.
+// escalate). See exit.go for the contract.
 package snapshotfetch
 
 import (
@@ -23,6 +27,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -45,13 +50,13 @@ func Run(args []string) int {
 	noVerifyHash := fs.Bool("no-verify-hash", false, "skip the post-download SHA256(chunks) == offer.Hash check; per-chunk hashes are still verified against metadata. Run `malcom verify` afterwards if you skip.")
 	debug := fs.Bool("debug", false, "verbose snapfetch logging")
 	if err := fs.Parse(args); err != nil {
-		return 2
+		return ExitConfig
 	}
 
 	cfg, err := config.Load()
 	if err != nil {
 		fmt.Fprintln(os.Stderr, err)
-		return 1
+		return ExitConfig
 	}
 	chainName := *chain
 	if chainName == "" {
@@ -60,18 +65,18 @@ func Run(args []string) int {
 	ch, err := cfg.Resolve(chainName)
 	if err != nil {
 		fmt.Fprintln(os.Stderr, err)
-		return 1
+		return ExitConfig
 	}
 
 	if err := os.MkdirAll(*out, 0o755); err != nil {
 		fmt.Fprintf(os.Stderr, "mkdir out: %v\n", err)
-		return 1
+		return ExitDiskFailed
 	}
 	// Ensure node key + cache dirs exist (config.Resolve gave us paths
 	// but didn't create them).
 	if err := os.MkdirAll(filepath.Dir(ch.NodeKey), 0o755); err != nil {
 		fmt.Fprintf(os.Stderr, "mkdir node-key dir: %v\n", err)
-		return 1
+		return ExitDiskFailed
 	}
 
 	// Default mode silences cometbft's per-peer EOF spam — the p2p
@@ -111,13 +116,13 @@ func Run(args []string) int {
 		if len(ch.RPCs) == 0 {
 			fetchLog.Error("config has no rpcs; pass -target-height or -max-height, or fix chains config",
 				"chain", ch.ChainID)
-			return 1
+			return ExitConfig
 		}
 		h, src, err := fetchCurrentHeightVerbose(ch.RPCs, fetchLog)
 		if err != nil {
 			fetchLog.Error("all rpcs failed; cannot determine chain head (use -max-height to override)",
 				"chain", ch.ChainID, "rpc_count", len(ch.RPCs))
-			return 1
+			return ExitGeneric
 		}
 		maxHeight = h
 		heightSource = src
@@ -189,18 +194,20 @@ func Run(args []string) int {
 	rootCtx = logctx.With(rootCtx, logger)
 	sigCh := make(chan os.Signal, 1)
 	signal.Notify(sigCh, os.Interrupt, syscall.SIGTERM)
+	var interrupted atomic.Bool
 	go func() {
 		<-sigCh
+		interrupted.Store(true)
 		fetchLog.Info("interrupted, shutting down")
 		cancel()
 	}()
 
 	if err := snapfetch.RunFetch(rootCtx, scfg, *out); err != nil {
 		fmt.Fprintf(os.Stderr, "snapfetch: %v\n", err)
-		return 1
+		return mapExitCode(err, interrupted.Load())
 	}
 	fetchLog.Info("WARNING: snapshot contents are not authenticated by p2p — run `malcom verify` against a trusted RPC before using this snapshot in production")
-	return 0
+	return ExitSuccess
 }
 
 // fetchCurrentHeightVerbose is fetchCurrentHeight with per-URL

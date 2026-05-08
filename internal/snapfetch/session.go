@@ -260,7 +260,7 @@ func buildPeerAddrs(ctx context.Context, c Config) ([]addrbook.PeerAddr, error) 
 		}
 	}
 	if len(peerAddrs) == 0 {
-		return nil, fmt.Errorf("no peer addrs available — %s", hintNoPeerAddrs(c.ChainID))
+		return nil, fmt.Errorf("%w: no peer addrs available — %s", ErrNoPeers, hintNoPeerAddrs(c.ChainID))
 	}
 	return peerAddrs, nil
 }
@@ -287,12 +287,12 @@ func (s *fetchSession) prepareSnapshotDir(outRoot string, offer *snapshotOffer) 
 	}
 	snapDir := filepath.Join(outRoot, fmt.Sprintf("snapshot_%s_%d", s.cfg.ChainID, offer.Height))
 	if err := os.MkdirAll(snapDir, 0o755); err != nil {
-		return "", nil, fmt.Errorf("mkdir snapshot dir: %w", err)
+		return "", nil, fmt.Errorf("%w: mkdir snapshot dir: %w", ErrDiskFailed, err)
 	}
 	// Make outRoot's directory entry for snapDir durable, so post-reboot
 	// `ls outRoot` agrees with the durable contents inside snapDir.
 	if err := fsyncDir(outRoot); err != nil {
-		return "", nil, fmt.Errorf("fsync outRoot: %w", err)
+		return "", nil, fmt.Errorf("%w: fsync outRoot: %w", ErrDiskFailed, err)
 	}
 	// Reuse a matching metadata.bin from a prior partial fetch: if the
 	// on-disk content already equals offer.Metadata byte-for-byte, the
@@ -302,7 +302,7 @@ func (s *fetchSession) prepareSnapshotDir(outRoot string, offer *snapshotOffer) 
 	mdPath := filepath.Join(snapDir, "metadata.bin")
 	if existing, err := os.ReadFile(mdPath); err != nil || !bytes.Equal(existing, offer.Metadata) {
 		if err := writeFileAtomic(mdPath, offer.Metadata, 0o644); err != nil {
-			return "", nil, fmt.Errorf("write metadata.bin: %w", err)
+			return "", nil, fmt.Errorf("%w: write metadata.bin: %w", ErrDiskFailed, err)
 		}
 	}
 	return snapDir, chunkHashes, nil
@@ -344,14 +344,14 @@ func verifySnapshotHash(ctx context.Context, snapDir string, offer *snapshotOffe
 		path := filepath.Join(snapDir, fmt.Sprintf("chunk_%05d.bin", i))
 		f, err := os.Open(path)
 		if err != nil {
-			return fmt.Errorf("open chunk %d: %w", i, err)
+			return fmt.Errorf("%w: open chunk %d: %w", ErrDiskFailed, i, err)
 		}
 		if _, err := io.CopyBuffer(h, f, buf); err != nil {
 			f.Close()
-			return fmt.Errorf("read chunk %d: %w", i, err)
+			return fmt.Errorf("%w: read chunk %d: %w", ErrDiskFailed, i, err)
 		}
 		if err := f.Close(); err != nil {
-			return fmt.Errorf("close chunk %d: %w", i, err)
+			return fmt.Errorf("%w: close chunk %d: %w", ErrDiskFailed, i, err)
 		}
 	}
 	got := h.Sum(nil)
@@ -390,19 +390,19 @@ func (s *fetchSession) writeMeta(snapDir string, offer *snapshotOffer, good []p2
 		BytesTotalHuman: humanBytes(bytesTotal),
 	}
 	if err := writeJSONAtomic(filepath.Join(snapDir, "meta.json"), meta); err != nil {
-		return fmt.Errorf("write meta.json: %w", err)
+		return fmt.Errorf("%w: write meta.json: %w", ErrDiskFailed, err)
 	}
 	// Make every prior rename in snapDir (chunks, metadata.bin, meta.json)
 	// durable before .complete lands, so a crash can never leave the
 	// sentinel present alongside a torn predecessor.
 	if err := fsyncDir(snapDir); err != nil {
-		return fmt.Errorf("fsync snapshot dir: %w", err)
+		return fmt.Errorf("%w: fsync snapshot dir: %w", ErrDiskFailed, err)
 	}
 	if err := writeFileAtomic(filepath.Join(snapDir, ".complete"), nil, 0o644); err != nil {
-		return fmt.Errorf("mark complete: %w", err)
+		return fmt.Errorf("%w: mark complete: %w", ErrDiskFailed, err)
 	}
 	if err := fsyncDir(snapDir); err != nil {
-		return fmt.Errorf("fsync snapshot dir after .complete: %w", err)
+		return fmt.Errorf("%w: fsync snapshot dir after .complete: %w", ErrDiskFailed, err)
 	}
 	s.log.Info("snapshot saved", "dir", snapDir)
 	s.log.Info("download complete",
