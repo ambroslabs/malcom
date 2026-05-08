@@ -3,12 +3,13 @@
 //
 // Layout (under $XDG_CONFIG_HOME/malcom/):
 //
-//	config.toml         shared defaults: default_chain, [fetch], [import], [bootstrap]
+//	config.toml         shared defaults: [fetch], [import], [bootstrap]
 //	chains/<id>.toml    per-chain identity (chain_id, genesis, rpcs) plus optional
 //	                    [fetch] / [import] / [bootstrap] sections that override defaults
 //
 // Resolve(id) returns a Chain with all sections layered in priority
-// chain-file > config.toml > built-in defaults.
+// chain-file > config.toml > built-in defaults. Chains are added to a
+// fresh tree with `malcom add <chain-id>`.
 package config
 
 import (
@@ -21,11 +22,9 @@ import (
 	"github.com/BurntSushi/toml"
 )
 
-// Config is the on-disk shape of config.toml: a default_chain pointer
-// plus the global default tuning sections.
+// Config is the on-disk shape of config.toml: the global default
+// tuning sections shared across chains.
 type Config struct {
-	DefaultChain string `toml:"default_chain"`
-
 	// Default tuning sections. Per-chain files can override individual
 	// fields by including their own [fetch] / [import] / [bootstrap]
 	// blocks.
@@ -250,10 +249,7 @@ func Load() (*Config, error) {
 //  4. XDG-derived defaults for blank node_key / addrbook.
 func (c *Config) Resolve(name string) (Chain, error) {
 	if name == "" {
-		name = c.DefaultChain
-	}
-	if name == "" {
-		return Chain{}, fmt.Errorf("no chain specified and default_chain is unset in %s", c.path)
+		return Chain{}, fmt.Errorf("no chain specified — pass -chain <id> (added via `malcom add <id>`)")
 	}
 
 	// Pre-fill the chain struct with the global tuning defaults so
@@ -267,6 +263,9 @@ func (c *Config) Resolve(name string) (Chain, error) {
 	chainPath := filepath.Join(c.chainsDir, name+".toml")
 	md, err := toml.DecodeFile(chainPath, &ch)
 	if err != nil {
+		if os.IsNotExist(err) {
+			return Chain{}, fmt.Errorf("no chain config at %s — run `malcom add %s` to add it", chainPath, name)
+		}
 		return Chain{}, fmt.Errorf("read chain config %s: %w", chainPath, err)
 	}
 	if undecoded := md.Undecoded(); len(undecoded) > 0 {
@@ -346,10 +345,6 @@ func DefaultChain() Chain {
 	applyBootstrapDefaults(&ch.Bootstrap)
 	return ch
 }
-
-// DefaultChainID is the chain `malcom init` configures by default
-// and what subcommands assume when no config is loaded.
-const DefaultChainID = "cosmoshub-4"
 
 // IsGenesisURL reports whether s is an http(s) URL (vs a local path).
 // Public so subcommands can branch the same way Resolve does.

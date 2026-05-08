@@ -42,7 +42,7 @@ import (
 // Run is the malcom subcommand entry point.
 func Run(args []string) int {
 	fs := flag.NewFlagSet("malcom snapshot fetch", flag.ContinueOnError)
-	chain := fs.String("chain", "", fmt.Sprintf("chain id (default %q; override in config.default_chain)", config.DefaultChainID))
+	chain := fs.String("chain", "", "chain id (required; must have been added with `malcom add <chain-id>`)")
 	out := fs.String("out", ".", "parent dir for the snapshot output (subdir snapshot_<chain>_<height>/ created inside)")
 	targetHeight := fs.Uint64("target-height", 0, "lock to this exact height; otherwise pick the best candidate")
 	maxHeightFlag := fs.Uint64("max-height", 0, "upper bound for snapshot selection; skips the RPC /status lookup (useful when RPCs are stale or unreachable). Defaults to the chain's current height.")
@@ -53,16 +53,16 @@ func Run(args []string) int {
 		return ExitConfig
 	}
 
+	if *chain == "" {
+		fmt.Fprintln(os.Stderr, "required: -chain <id>")
+		return ExitConfig
+	}
 	cfg, err := config.Load()
 	if err != nil {
 		fmt.Fprintln(os.Stderr, err)
 		return ExitConfig
 	}
-	chainName := *chain
-	if chainName == "" {
-		chainName = cfg.DefaultChain
-	}
-	ch, err := cfg.Resolve(chainName)
+	ch, err := cfg.Resolve(*chain)
 	if err != nil {
 		fmt.Fprintln(os.Stderr, err)
 		return ExitConfig

@@ -37,7 +37,7 @@ import (
 // code (0 on success).
 func Run(args []string) int {
 	fs := flag.NewFlagSet("malcom bootstrap", flag.ContinueOnError)
-	chain := fs.String("chain", "", fmt.Sprintf("chain id (default %q; override in config.default_chain)", config.DefaultChainID))
+	chain := fs.String("chain", "", "chain id (required; must have been added with `malcom add <chain-id>`)")
 	appdb := fs.String("appdb", "", "directory containing application.db/ and extensions/ (output of `malcom snapshot import`)")
 	height := fs.Int64("height", 0, "snapshot height (must match application.db)")
 	out := fs.String("out", ".", "parent dir for the gaia home (subdir gaia_<chain>_<height>/ created inside)")
@@ -49,16 +49,16 @@ func Run(args []string) int {
 		return 2
 	}
 
+	if *chain == "" {
+		fmt.Fprintln(os.Stderr, "required: -chain <id>")
+		return 2
+	}
 	cfgFile, err := config.Load()
 	if err != nil {
 		fmt.Fprintln(os.Stderr, err)
 		return 1
 	}
-	chainName := *chain
-	if chainName == "" {
-		chainName = cfgFile.DefaultChain
-	}
-	ch, err := cfgFile.Resolve(chainName)
+	ch, err := cfgFile.Resolve(*chain)
 	if err != nil {
 		fmt.Fprintln(os.Stderr, err)
 		return 1
