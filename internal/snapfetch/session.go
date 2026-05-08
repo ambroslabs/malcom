@@ -260,7 +260,7 @@ func buildPeerAddrs(ctx context.Context, c Config) ([]addrbook.PeerAddr, error) 
 		}
 	}
 	if len(peerAddrs) == 0 {
-		return nil, fmt.Errorf("no peer addrs available")
+		return nil, fmt.Errorf("no peer addrs available — %s", hintNoPeerAddrs(c.ChainID))
 	}
 	return peerAddrs, nil
 }
@@ -312,7 +312,7 @@ func (s *fetchSession) prepareSnapshotDir(outRoot string, offer *snapshotOffer) 
 // download its own subscription so it doesn't share an event channel
 // with peerWatch / walk.
 func (s *fetchSession) download(ctx context.Context, offer *snapshotOffer, good []p2p.ID, chunkHashes [][]byte, snapDir string) (uint64, error) {
-	return download(ctx, s.sw, s.ssR, s.mux.subscribe(),
+	return download(ctx, s.sw, s.ssR, s.mux.subscribe(), s.cfg.ChainID,
 		offer, chunkHashes, good, snapDir,
 		s.cfg.PerPeerLimit, s.cfg.ChunkTimeout, s.cfg.PeerFailLimit,
 		s.cfg.ProvisionalProbeStrikes, s.cfg.ProvisionalProbeInflight,
@@ -356,8 +356,9 @@ func verifySnapshotHash(ctx context.Context, snapDir string, offer *snapshotOffe
 	}
 	got := h.Sum(nil)
 	if !bytes.Equal(got, offer.Hash) {
-		return fmt.Errorf("snapshot hash mismatch: got %s, want %s",
-			hex.EncodeToString(got), hex.EncodeToString(offer.Hash))
+		return fmt.Errorf("snapshot hash mismatch: got %s, want %s — %s",
+			hex.EncodeToString(got), hex.EncodeToString(offer.Hash),
+			hintHashMismatch)
 	}
 	return nil
 }
