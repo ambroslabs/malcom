@@ -1,6 +1,8 @@
 // malcom is the cosmos-p2p-toolkit CLI for managing the gaiad
 // snapshot→bootstrap workflow:
 //
+//	malcom init               seed XDG dirs + shared config.toml
+//	malcom add <chain-id>     register a chain (chain config + node key)
 //	malcom snapshot fetch     download a state-sync snapshot
 //	malcom snapshot import    snapshot dir → application.db + extensions/
 //	malcom bootstrap          assemble a runnable gaiad home dir
@@ -15,6 +17,7 @@ import (
 	"fmt"
 	"os"
 
+	"github.com/zrbecker/cosmos-p2p/internal/cli/addcmd"
 	"github.com/zrbecker/cosmos-p2p/internal/cli/bootstrap"
 	"github.com/zrbecker/cosmos-p2p/internal/cli/cleancmd"
 	"github.com/zrbecker/cosmos-p2p/internal/cli/compact"
@@ -33,6 +36,8 @@ func main() {
 	switch os.Args[1] {
 	case "init":
 		os.Exit(initcmd.Run(rest))
+	case "add":
+		os.Exit(addcmd.Run(rest))
 	case "clean":
 		os.Exit(cleancmd.Run(rest))
 	case "snapshot":
@@ -79,9 +84,10 @@ func usage() {
 usage: malcom <command> [args...]
 
 commands:
-  init               seed XDG dirs + config.toml + p2p node key
+  init               seed XDG dirs + shared config.toml
+  add <chain-id>     register a chain (chain config + node key + per-chain dirs)
   clean              back up (or -clobber) the XDG malcom dirs
-  snapshot fetch     download a cosmoshub state-sync snapshot
+  snapshot fetch     download a state-sync snapshot
   snapshot import    convert a snapshot dir into application.db + extensions/
   bootstrap          assemble a runnable gaiad home directory
   verify             check the imported AppHash against a cometbft RPC

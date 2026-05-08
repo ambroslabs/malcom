@@ -1,4 +1,5 @@
-// Default templates emitted by `malcom init`.
+// Default templates: `config.toml` (written by `malcom init`) and
+// `chains/<id>.toml` (written by `malcom add <chain-id>`).
 
 package config
 
@@ -9,13 +10,13 @@ import (
 	"github.com/zrbecker/cosmos-p2p/internal/registry"
 )
 
-// GlobalTemplate returns the body of the top-level config.toml: a
-// default_chain pointer plus the [fetch] / [import] / [bootstrap]
-// sections that are shared across chains.
-func GlobalTemplate(defaultChain string) string {
-	return fmt.Sprintf(`# Shared defaults. Per-chain overrides live in chains/<chain>.toml.
-
-default_chain = %q
+// GlobalTemplate returns the body of the top-level config.toml: the
+// [fetch] / [import] / [bootstrap] sections shared across chains.
+// Per-chain config (chain_id, genesis, rpcs, peers) is added by
+// `malcom add <chain-id>`, which writes chains/<chain-id>.toml.
+func GlobalTemplate() string {
+	return `# Shared defaults. Per-chain overrides live in chains/<chain>.toml.
+# Chains are added with `+"`malcom add <chain-id>`"+`.
 
 [fetch]
 # Per-chunk download tuning. The walking algorithm uses
@@ -125,7 +126,7 @@ cmt_db_backend = "goleveldb"
 place_wasm     = true     # extract wasm payloads to the gaia home's expected paths
 write_configs  = true     # emit minimal app.toml/config.toml/client.toml
 moniker        = "bootstrap-node"
-`, defaultChain)
+`
 }
 
 // ChainTemplate returns the body of chains/<chainID>.toml.

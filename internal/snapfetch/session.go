@@ -442,6 +442,7 @@ func (s *fetchSession) writeMeta(snapDir string, offer *snapshotOffer, good []p2
 	sort.Strings(goodStr)
 
 	meta := savedMeta{
+		ChainID:         s.cfg.ChainID,
 		Height:          offer.Height,
 		Format:          offer.Format,
 		Chunks:          offer.Chunks,

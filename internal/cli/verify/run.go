@@ -31,45 +31,33 @@ import (
 // Run is the malcom subcommand entry point.
 func Run(args []string) int {
 	fs := flag.NewFlagSet("malcom verify", flag.ContinueOnError)
-	chain := fs.String("chain", "", fmt.Sprintf("chain id (default %q; override in config.default_chain)", config.DefaultChainID))
+	chain := fs.String("chain", "", "chain id (required)")
 	appdb := fs.String("appdb", "", "path to the application.db parent dir (required)")
 	height := fs.Int64("height", 0, "snapshot height committed to application.db (required)")
-	rpcURL := fs.String("rpc", "", "cometbft RPC endpoint (defaults to first config.chains.<id>.rpcs entry)")
+	rpcURL := fs.String("rpc", "", "cometbft RPC endpoint (defaults to first chains/<id>.toml rpcs entry)")
 	if err := fs.Parse(args); err != nil {
 		return 2
 	}
-	if *appdb == "" || *height == 0 {
+	if *appdb == "" || *height == 0 || *chain == "" {
 		fs.Usage()
 		return 2
 	}
 
 	// -rpc lets verify run against a single RPC without needing a
 	// chains/<id>.toml — convenient for one-off checks. Only load
-	// config if we need it (no explicit -rpc, or -chain not given).
+	// config if we need it (no explicit -rpc).
 	rpc := *rpcURL
 	var ch config.Chain
-	if rpc == "" || *chain == "" {
+	if rpc == "" {
 		cfg, err := config.Load()
 		if err != nil {
-			if rpc != "" {
-				// -rpc passed but config still failed; run with a
-				// minimal Chain populated from -chain (which may be
-				// empty — Resolve isn't needed in this branch).
-				ch.ChainID = *chain
-			} else {
-				fmt.Fprintln(os.Stderr, err)
-				return 1
-			}
-		} else {
-			chainName := *chain
-			if chainName == "" {
-				chainName = cfg.DefaultChain
-			}
-			ch, err = cfg.Resolve(chainName)
-			if err != nil {
-				fmt.Fprintln(os.Stderr, err)
-				return 1
-			}
+			fmt.Fprintln(os.Stderr, err)
+			return 1
+		}
+		ch, err = cfg.Resolve(*chain)
+		if err != nil {
+			fmt.Fprintln(os.Stderr, err)
+			return 1
 		}
 	} else {
 		ch.ChainID = *chain

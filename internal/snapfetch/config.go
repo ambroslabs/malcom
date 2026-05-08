@@ -239,6 +239,7 @@ type snapshotOffer struct {
 // savedMeta is the JSON shape written to <dir>/meta.json after a
 // successful fetch.
 type savedMeta struct {
+	ChainID         string    `json:"chain_id"`
 	Height          uint64    `json:"height"`
 	Format          uint32    `json:"format"`
 	Chunks          uint32    `json:"chunks"`
