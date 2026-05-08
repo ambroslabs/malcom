@@ -112,6 +112,19 @@ type Config struct {
 	// during download regardless. Skipping is reasonable when the
 	// operator follows up with `malcom verify` against a trusted RPC.
 	SkipVerifyHash bool
+
+	// MaxDiskWriteFailures aborts the download once cumulative
+	// chunk-write failures cross this count. The counter does not
+	// reset on intervening successful writes, so a long fetch over
+	// a flaky disk that recovers between transients can still trip
+	// the cap — operators on cloud volumes prone to brief stalls
+	// should raise this. Any verified-but-unwriteable chunk
+	// (ENOSPC, EIO, EROFS) leaves pending=true so a retry attempts
+	// it again; the cap surfaces a sustained disk problem as a
+	// typed ErrDiskFailed instead of dragging through a bogus
+	// "success" that fails at import with a confusing zlib error.
+	// Default 3.
+	MaxDiskWriteFailures int
 }
 
 // applyDefaults fills in zero-valued fields with defaults. Mutates cfg.
@@ -196,6 +209,9 @@ func (c *Config) applyDefaults() {
 	}
 	if c.ChurnGrace == 0 {
 		c.ChurnGrace = 3 * time.Second
+	}
+	if c.MaxDiskWriteFailures == 0 {
+		c.MaxDiskWriteFailures = 3
 	}
 }
 

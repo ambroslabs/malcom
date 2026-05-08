@@ -54,6 +54,9 @@ func applyFetchDefaults(t *FetchTuning) {
 	if t.MaxDialFailures == 0 {
 		t.MaxDialFailures = 3
 	}
+	if t.MaxDiskWriteFailures == 0 {
+		t.MaxDiskWriteFailures = 3
+	}
 	// RequireStateSyncChannel is a bool — the zero value (false) is a
 	// valid user-set value, so we don't override here. The template
 	// sets it true; a config that omits the key gets the Go default

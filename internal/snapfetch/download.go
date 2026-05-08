@@ -124,6 +124,11 @@ type chunkScheduler struct {
 	watch *peerWatch
 	log   cmtlog.Logger
 
+	// writeFile is the chunk-write hook. Production wires writeFileAtomic;
+	// tests inject a failing stub to drive the disk-failure path without
+	// fiddling with filesystem permissions.
+	writeFile func(path string, data []byte, mode os.FileMode) error
+
 	// job
 	chainID     string
 	target      *snapshotOffer
@@ -136,15 +141,18 @@ type chunkScheduler struct {
 	peerFailLimit       int
 	provisionalStrikes  int
 	provisionalInflight int
+	maxDiskFails        int
 
 	// state
-	pending    []bool
-	completed  []bool
-	inflight   map[uint32]inflightEntry
-	stats      map[p2p.ID]*peerStat
-	bytesTotal uint64
-	doneCount  uint32
-	hadEvent   bool
+	pending      []bool
+	completed    []bool
+	inflight     map[uint32]inflightEntry
+	stats        map[p2p.ID]*peerStat
+	bytesTotal   uint64
+	doneCount    uint32
+	hadEvent     bool
+	diskFails    int
+	firstDiskErr error
 
 	// progress
 	startTime    time.Time
@@ -160,7 +168,7 @@ func download(ctx context.Context, sw *p2p.Switch, ssR *statesync.Reactor,
 	sub *subscription, chainID string, target *snapshotOffer, chunkHashes [][]byte,
 	good []p2p.ID, snapDir string,
 	perPeer int, chunkTimeout time.Duration, peerFailLimit int,
-	provisionalStrikes, provisionalInflight int,
+	provisionalStrikes, provisionalInflight, maxDiskFails int,
 	watch *peerWatch, mgr *connect.Manager) (uint64, error) {
 
 	N := target.Chunks
@@ -176,6 +184,7 @@ func download(ctx context.Context, sw *p2p.Switch, ssR *statesync.Reactor,
 		mgr:                 mgr,
 		watch:               watch,
 		log:                 logctx.From(ctx),
+		writeFile:           writeFileAtomic,
 		chainID:             chainID,
 		target:              target,
 		chunkHashes:         chunkHashes,
@@ -185,6 +194,7 @@ func download(ctx context.Context, sw *p2p.Switch, ssR *statesync.Reactor,
 		peerFailLimit:       peerFailLimit,
 		provisionalStrikes:  provisionalStrikes,
 		provisionalInflight: provisionalInflight,
+		maxDiskFails:        maxDiskFails,
 		pending:             pending,
 		completed:           make([]bool, N),
 		inflight:            map[uint32]inflightEntry{},
@@ -319,6 +329,11 @@ func (s *chunkScheduler) run(ctx context.Context, sub *subscription) (uint64, er
 
 	N := s.target.Chunks
 	for s.doneCount < N {
+		if s.maxDiskFails > 0 && s.diskFails >= s.maxDiskFails {
+			return s.bytesTotal,
+				fmt.Errorf("%w: %d chunk write failures hit limit (%d) — likely disk full or I/O error: %w",
+					ErrDiskFailed, s.diskFails, s.maxDiskFails, s.firstDiskErr)
+		}
 		alive, connected := s.peerCounts()
 		if alive == 0 {
 			return s.bytesTotal,
@@ -515,15 +530,26 @@ func (s *chunkScheduler) onChunk(ev statesync.Event) {
 		s.log.Info("peer promoted from provisional", "peer", string(peer))
 	}
 
-	// Write the verified chunk to disk. Errors are logged and ignored
-	// so a transient disk hiccup doesn't abort the whole fetch — if
-	// the file is missing later, the import step surfaces it. The
-	// write is atomic (tmp + fsync + rename) so a crash mid-write
+	// Write the verified chunk to disk. Failures are treated like a
+	// hash-mismatch from the chunk's perspective: leave pending=true
+	// so the dispatcher retries it, don't bump doneCount/bytesTotal,
+	// and bump diskFails. The run loop aborts with ErrDiskFailed once
+	// diskFails crosses maxDiskFails — counting "" as missing/half-
+	// written chunks would otherwise sneak past finalization and
+	// surface much later as a confusing zlib error during import.
+	// The write is atomic (tmp + fsync + rename) so a crash mid-write
 	// can't leave a half-written chunk_NNNNN.bin in the dir; the
 	// snapDir itself is fsynced once at finalize time in writeMeta.
 	chunkPath := filepath.Join(s.snapDir, fmt.Sprintf("chunk_%05d.bin", idx))
-	if err := writeFileAtomic(chunkPath, ev.Chunk.Bytes, 0o644); err != nil {
+	if err := s.writeFile(chunkPath, ev.Chunk.Bytes, 0o644); err != nil {
 		s.log.Error("write chunk", "idx", idx, "err", err)
+		if s.firstDiskErr == nil {
+			s.firstDiskErr = err
+		}
+		s.diskFails++
+		s.pending[idx] = true
+		s.dispatch()
+		return
 	}
 	s.completed[idx] = true
 	s.doneCount++
