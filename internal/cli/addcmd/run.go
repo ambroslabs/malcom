@@ -10,21 +10,30 @@
 //	$XDG_CACHE_HOME/malcom/<id>/                 ephemeral cache (block snapshots, etc.)
 //	$XDG_DATA_HOME/malcom/<id>/                  data dir (genesis lands here lazily)
 //
-// Unless -offline is passed, add populates the chain's RPC and peer list
-// from the cosmos chain-registry. Genesis is NOT downloaded here —
-// bootstrap fetches it lazily so add stays fast + network-light.
+// Unless -offline is passed, add resolves the chain id against the
+// cached cosmos chain-registry snapshot under
+// $XDG_CACHE_HOME/malcom/chain-registry/. The cache auto-syncs on
+// first add and whenever it's older than registry.DefaultIndexMaxAge.
+// `malcom registry refresh` forces a re-sync. Unknown chain ids fail
+// with a clear error rather than silently writing a blank or
+// mis-attributed config. Genesis is NOT downloaded here — bootstrap
+// fetches it lazily so add stays fast.
 //
 // Subsequent runs are a no-op: existing files are kept. -force
 // overwrites chains/<id>.toml (the node key is never overwritten).
 package addcmd
 
 import (
+	"context"
 	"errors"
 	"flag"
 	"fmt"
 	"os"
+	"os/signal"
 	"path/filepath"
 	"regexp"
+	"syscall"
+	"time"
 
 	"github.com/zrbecker/cosmos-p2p/internal/config"
 	"github.com/zrbecker/cosmos-p2p/internal/helpers/nodekey"
@@ -105,18 +114,19 @@ func Run(args []string) int {
 
 	var info *registry.ChainInfo
 	if !*offline {
-		i, err := registry.Fetch(chain)
+		regCacheDir, err := config.RegistryCacheDir()
 		if err != nil {
-			if errors.Is(err, registry.ErrNotFound) {
-				fmt.Printf("[add] %s: not in cosmos chain-registry — leaving rpcs/peers blank\n", chain)
-			} else {
-				fmt.Printf("[add] %s: chain-registry fetch failed (%v) — leaving rpcs/peers blank\n", chain, err)
-			}
-		} else {
-			info = i
-			fmt.Printf("[add] %s: registry rpcs=%d peers=%d\n",
-				chain, len(info.RPCs), len(info.PersistentPeers)+len(info.Seeds))
+			fmt.Fprintf(os.Stderr, "resolve registry cache dir: %v\n", err)
+			return 1
 		}
+		i, lerr := lookupChain(regCacheDir, chain)
+		if lerr != nil {
+			fmt.Fprintln(os.Stderr, lerr.Error())
+			return 1
+		}
+		info = i
+		fmt.Printf("[add] %s: registry rpcs=%d peers=%d\n",
+			chain, len(info.RPCs), len(info.PersistentPeers)+len(info.Seeds))
 	}
 
 	defaultGenesis := registry.HardcodedGenesisURLs[chain]
@@ -162,4 +172,61 @@ func writeIfMissing(path, body string, force bool) (bool, error) {
 		return false, nil
 	}
 	return true, os.WriteFile(path, []byte(body), 0o644)
+}
+
+// lookupChain resolves chain via the cached chain-registry index,
+// auto-syncing the cache if it's missing or older than
+// registry.DefaultIndexMaxAge. Errors are returned formatted for
+// direct stderr output by the caller.
+func lookupChain(cacheDir, chain string) (*registry.ChainInfo, error) {
+	age, err := registry.IndexAge(cacheDir)
+	switch {
+	case errors.Is(err, registry.ErrIndexMissing):
+		fmt.Printf("[add] no chain-registry cache yet — syncing\n")
+		if err := syncRegistry(cacheDir); err != nil {
+			return nil, fmt.Errorf("sync chain-registry: %w", err)
+		}
+	case err != nil:
+		return nil, fmt.Errorf("read chain-registry index: %w", err)
+	case age > registry.DefaultIndexMaxAge:
+		fmt.Printf("[add] chain-registry cache is %s old — refreshing (override with `malcom registry refresh`)\n",
+			age.Truncate(time.Minute))
+		if err := syncRegistry(cacheDir); err != nil {
+			return nil, fmt.Errorf("sync chain-registry: %w", err)
+		}
+	}
+
+	info, err := registry.Lookup(cacheDir, chain)
+	if err == nil {
+		return info, nil
+	}
+	if errors.Is(err, registry.ErrNotFound) {
+		return nil, fmt.Errorf(
+			"chain id %q is not in the cached chain-registry index\n"+
+				"  - if upstream added it recently, run `malcom registry refresh`\n"+
+				"  - if you don't want a registry lookup, re-run with -offline (you'll need to fill in chains/%s.toml by hand)",
+			chain, chain)
+	}
+	return nil, fmt.Errorf("registry lookup: %w", err)
+}
+
+// syncRegistry runs registry.Sync against cacheDir, surfacing collisions
+// to stderr. Cancellable via SIGINT/SIGTERM.
+func syncRegistry(cacheDir string) error {
+	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer cancel()
+	res, err := registry.Sync(ctx, cacheDir)
+	if err != nil {
+		return err
+	}
+	fmt.Printf("[add] chain-registry synced: indexed=%d killed=%d filtered=%d\n",
+		res.IndexedChains, res.DroppedKilled, res.DroppedFiltered)
+	if len(res.Collisions) > 0 {
+		fmt.Fprintf(os.Stderr, "[add] note: %d chain_id(s) advertised by multiple live registry entries — excluded:\n",
+			len(res.Collisions))
+		for _, c := range res.Collisions {
+			fmt.Fprintf(os.Stderr, "  %s: %v\n", c.ChainID, c.Paths)
+		}
+	}
+	return nil
 }

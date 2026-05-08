@@ -57,6 +57,17 @@ func DefaultConfigPath() (string, error) {
 	return filepath.Join(d, "config.toml"), nil
 }
 
+// RegistryCacheDir returns the on-disk cache root for the
+// chain-registry tarball + index. Lives under CacheDir() so it
+// participates in `malcom clean`.
+func RegistryCacheDir() (string, error) {
+	d, err := CacheDir()
+	if err != nil {
+		return "", err
+	}
+	return filepath.Join(d, "chain-registry"), nil
+}
+
 func xdgDir(envVar, homeRel string) (string, error) {
 	if v := os.Getenv(envVar); v != "" {
 		return filepath.Join(v, AppName), nil
