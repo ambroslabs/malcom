@@ -21,6 +21,7 @@ import (
 	"flag"
 	"fmt"
 	"io"
+	"log/slog"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -31,6 +32,7 @@ import (
 	"github.com/cometbft/cometbft/node"
 
 	"github.com/zrbecker/cosmos-p2p/internal/config"
+	malcomlog "github.com/zrbecker/cosmos-p2p/internal/log"
 )
 
 // Run is the malcom subcommand entry point. Returns the process exit
@@ -45,36 +47,53 @@ func Run(args []string) int {
 	trustHashHex := fs.String("trust-hash", "", "trust block hash (hex) at -trust-height; auto-fetched from RPC if empty")
 	overwrite := fs.Bool("overwrite", false, "wipe gaia home's data/ before bootstrapping")
 	skipAppCopy := fs.Bool("skip-app-copy", false, "skip cloning <appdb>/application.db into the gaia home; assume it's already there")
+	logMode := fs.String("log", "", "log output: auto (default), pretty, text, json")
+	debug := fs.Bool("debug", false, "verbose logging")
 	if err := fs.Parse(args); err != nil {
 		return 2
 	}
 
+	mode, ok := malcomlog.ParseMode(*logMode)
+	if !ok {
+		fmt.Fprintf(os.Stderr, "invalid -log %q (want auto/pretty/text/json)\n", *logMode)
+		return 2
+	}
+	level := slog.LevelInfo
+	if *debug {
+		level = slog.LevelDebug
+	}
+	log := malcomlog.New(malcomlog.Options{
+		Writer: os.Stderr, Mode: mode, Level: level,
+	}).With("module", "bootstrap")
+
 	if *chain == "" {
-		fmt.Fprintln(os.Stderr, "required: -chain <id>")
+		log.Error("required: -chain <id>")
 		return 2
 	}
 	cfgFile, err := config.Load()
 	if err != nil {
-		fmt.Fprintln(os.Stderr, err)
+		log.Error("config load", "err", err)
 		return 1
 	}
 	ch, err := cfgFile.Resolve(*chain)
 	if err != nil {
-		fmt.Fprintln(os.Stderr, err)
+		log.Error("resolve chain", "err", err, "chain", *chain)
 		return 1
 	}
 
 	if *appdb == "" || *height == 0 {
-		fmt.Fprintln(os.Stderr, "required: -appdb -height")
+		log.Error("required: -appdb -height")
 		return 2
 	}
-	genesis, err := resolveGenesis(ch)
+	genesis, err := resolveGenesis(ch, log)
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "%v (set chains.%s.genesis in %s)\n", err, ch.ChainID, cfgFile.Path())
+		log.Error("resolve genesis",
+			"err", err, "chain", ch.ChainID, "config", cfgFile.Path(),
+			"hint", fmt.Sprintf("set chains.%s.genesis in %s", ch.ChainID, cfgFile.Path()))
 		return 1
 	}
 	if len(ch.RPCs) == 0 {
-		fmt.Fprintf(os.Stderr, "config %s: chains.%s.rpcs is empty\n", cfgFile.Path(), ch.ChainID)
+		log.Error("chains.<id>.rpcs is empty", "chain", ch.ChainID, "config", cfgFile.Path())
 		return 1
 	}
 
@@ -84,7 +103,7 @@ func Run(args []string) int {
 		// Duplicate the single URL — works in practice for our use case
 		// where we trust the operator's RPC choice.
 		rpcs = append(rpcs, rpcs[0])
-		fmt.Fprintln(os.Stderr, "[bootstrap] note: only 1 RPC URL configured; duplicating for cometbft light-client (it requires >=2)")
+		log.Warn("only 1 RPC URL configured; duplicating for cometbft light-client (requires >=2)")
 	}
 
 	outRoot := filepath.Join(*out, fmt.Sprintf("gaia_%s_%d", ch.ChainID, *height))
@@ -95,12 +114,12 @@ func Run(args []string) int {
 	placeWasmFlag := ch.Bootstrap.PlaceWasm
 	writeConfigsFlag := ch.Bootstrap.WriteConfigs
 
-	fmt.Printf("[bootstrap] config:    %s\n", cfgFile.Path())
-	fmt.Printf("[bootstrap] chain:     %s\n", ch.ChainID)
-	fmt.Printf("[bootstrap] out:       %s\n", outRoot)
-	fmt.Printf("[bootstrap] appdb in:  %s\n", *appdb)
-	fmt.Printf("[bootstrap] height:    %d\n", *height)
-	fmt.Println()
+	log.Info("starting",
+		"config", cfgFile.Path(),
+		"chain", ch.ChainID,
+		"out", outRoot,
+		"appdb", *appdb,
+		"height", *height)
 
 	if *trustHeight == 0 {
 		*trustHeight = *height
@@ -109,7 +128,7 @@ func Run(args []string) int {
 	configDir := filepath.Join(outRoot, "config")
 	dataDir := filepath.Join(outRoot, "data")
 	if err := os.MkdirAll(configDir, 0o755); err != nil {
-		fmt.Fprintf(os.Stderr, "mkdir config: %v\n", err)
+		log.Error("mkdir config failed", "err", err)
 		return 1
 	}
 	if *overwrite {
@@ -119,49 +138,49 @@ func Run(args []string) int {
 		_ = os.RemoveAll(filepath.Join(dataDir, "wasm-payloads"))
 	}
 	if err := os.MkdirAll(dataDir, 0o755); err != nil {
-		fmt.Fprintf(os.Stderr, "mkdir data: %v\n", err)
+		log.Error("mkdir data failed", "err", err)
 		return 1
 	}
 
 	// 1. Copy genesis.json into <out>/config/.
 	gPath := filepath.Join(configDir, "genesis.json")
-	fmt.Printf("[bootstrap] genesis  %s -> %s\n", genesis, gPath)
+	log.Info("genesis copy", "src", genesis, "dst", gPath)
 	srcAbs, _ := filepath.Abs(genesis)
 	dstAbs, _ := filepath.Abs(gPath)
 	if srcAbs != dstAbs {
 		if err := copyFile(genesis, gPath); err != nil {
-			fmt.Fprintf(os.Stderr, "copy genesis: %v\n", err)
+			log.Error("copy genesis failed", "err", err)
 			return 1
 		}
 	} else {
-		fmt.Printf("[bootstrap] genesis: src == dst, skipping copy\n")
+		log.Info("genesis: src == dst, skipping copy")
 	}
 
 	// 2. Resolve trust hash if missing.
 	if *trustHashHex == "" {
-		fmt.Printf("[bootstrap] fetching trust hash from %s at height %d\n", rpcs[0], *trustHeight)
+		log.Info("fetching trust hash", "rpc", rpcs[0], "height", *trustHeight)
 		bh, err := fetchBlockHash(rpcs[0], *trustHeight)
 		if err != nil {
-			fmt.Fprintf(os.Stderr, "fetch trust hash: %v\n", err)
+			log.Error("fetch trust hash failed", "err", err)
 			return 1
 		}
 		*trustHashHex = bh
 	}
-	fmt.Printf("[bootstrap] trust    height=%d hash=%s\n", *trustHeight, *trustHashHex)
+	log.Info("trust", "height", *trustHeight, "hash", *trustHashHex)
 
 	// 3. Fetch the appHash for safety: state after block H is in block H+1's
 	//    AppHash field.
 	appHashHex, err := fetchAppHash(rpcs[0], *height+1)
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "fetch app hash: %v\n", err)
+		log.Error("fetch app hash failed", "err", err)
 		return 1
 	}
 	appHash, err := hex.DecodeString(appHashHex)
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "decode app hash: %v\n", err)
+		log.Error("decode app hash failed", "err", err)
 		return 1
 	}
-	fmt.Printf("[bootstrap] AppHash  %s (state after block %d)\n", appHashHex, *height)
+	log.Info("apphash", "apphash", appHashHex, "after_block", *height)
 
 	// 4. Build cometbft config rooted at <out>.
 	c := cfg.DefaultConfig()
@@ -174,13 +193,13 @@ func Run(args []string) int {
 	c.StateSync.TrustPeriod = trustPeriod
 	c.StateSync.Enable = false
 
-	fmt.Printf("[bootstrap] running cometbft offline state-sync bootstrap (height=%d)...\n", *height)
+	log.Info("running cometbft offline state-sync bootstrap", "height", *height)
 	t0 := time.Now()
 	if err := node.BootstrapState(context.Background(), c, cfg.DefaultDBProvider, uint64(*height), appHash); err != nil {
-		fmt.Fprintf(os.Stderr, "BootstrapState: %v\n", err)
+		log.Error("BootstrapState failed", "err", err)
 		return 1
 	}
-	fmt.Printf("[bootstrap] cometbft bootstrap done in %s\n", time.Since(t0).Truncate(time.Second))
+	log.Info("cometbft bootstrap done", "elapsed", time.Since(t0).Truncate(time.Second))
 
 	// 5. Copy application.db into the gaia data dir as an independent
 	// tree so the source stays untouched across reruns. See cloneTree
@@ -188,33 +207,33 @@ func Run(args []string) int {
 	srcApp := filepath.Join(*appdb, "application.db")
 	dstApp := filepath.Join(dataDir, "application.db")
 	if *skipAppCopy {
-		fmt.Printf("[bootstrap] application.db: -skip-app-copy set; expecting it at %s\n", dstApp)
+		log.Info("application.db: -skip-app-copy set; expecting it in place", "path", dstApp)
 		if _, err := os.Stat(dstApp); err != nil {
-			fmt.Fprintf(os.Stderr, "skip-app-copy: %s missing: %v\n", dstApp, err)
+			log.Error("skip-app-copy target missing", "path", dstApp, "err", err)
 			return 1
 		}
 	} else {
-		fmt.Printf("[bootstrap] application.db %s -> %s\n", srcApp, dstApp)
+		log.Info("application.db copy", "src", srcApp, "dst", dstApp)
 		t0 = time.Now()
 		if err := cloneTree(srcApp, dstApp); err != nil {
-			fmt.Fprintf(os.Stderr, "place application.db: %v\n", err)
+			log.Error("place application.db failed", "err", err)
 			return 1
 		}
-		fmt.Printf("[bootstrap] application.db placed in %s\n", time.Since(t0).Truncate(time.Millisecond))
+		log.Info("application.db placed", "elapsed", time.Since(t0).Truncate(time.Millisecond))
 	}
 
 	// 6. Place wasm extension payloads.
 	srcExt := filepath.Join(*appdb, "extensions")
 	if _, err := os.Stat(srcExt); err == nil {
 		dstExt := filepath.Join(dataDir, "wasm-payloads")
-		fmt.Printf("[bootstrap] extensions  %s -> %s\n", srcExt, dstExt)
+		log.Info("extensions copy", "src", srcExt, "dst", dstExt)
 		if err := cloneTree(srcExt, dstExt); err != nil {
-			fmt.Fprintf(os.Stderr, "place extensions: %v\n", err)
+			log.Error("place extensions failed", "err", err)
 			return 1
 		}
 		if placeWasmFlag {
-			if err := placeWasmPayloads(srcExt, outRoot); err != nil {
-				fmt.Fprintf(os.Stderr, "place wasm payloads: %v\n", err)
+			if err := placeWasmPayloads(srcExt, outRoot, log); err != nil {
+				log.Error("place wasm payloads failed", "err", err)
 				return 1
 			}
 		}
@@ -223,19 +242,19 @@ func Run(args []string) int {
 	// 7. Optionally write minimal config files.
 	if writeConfigsFlag {
 		if err := writeConfigFiles(outRoot, moniker, appDBBackend, cmtDBBackend); err != nil {
-			fmt.Fprintf(os.Stderr, "write configs: %v\n", err)
+			log.Error("write configs failed", "err", err)
 			return 1
 		}
-		fmt.Printf("[bootstrap] wrote %s/config/{app,config,client}.toml\n", outRoot)
+		log.Info("config files written", "dir", filepath.Join(outRoot, "config"))
 	}
 
-	fmt.Println()
-	fmt.Println("[bootstrap] done. layout:")
-	fmt.Printf("  %s/config/genesis.json\n", outRoot)
-	fmt.Printf("  %s/data/application.db/   (from %s)\n", outRoot, srcApp)
-	fmt.Printf("  %s/data/state.db/         (fresh, height=%d)\n", outRoot, *height)
-	fmt.Printf("  %s/data/blockstore.db/    (seen commit at %d, offline-sync height set)\n", outRoot, *height)
-	fmt.Printf("  %s/data/wasm-payloads/    (parking — install under data/wasm/ when you wire up gaiad)\n", outRoot)
+	log.Info("done",
+		"genesis", filepath.Join(outRoot, "config/genesis.json"),
+		"appdb", filepath.Join(outRoot, "data/application.db"),
+		"state_db", filepath.Join(outRoot, "data/state.db"),
+		"blockstore_db", filepath.Join(outRoot, "data/blockstore.db"),
+		"wasm_payloads", filepath.Join(outRoot, "data/wasm-payloads"),
+		"height", *height)
 	return 0
 }
 
@@ -341,20 +360,20 @@ func sha256sum(b []byte) []byte {
 //	<root>/data/08-light-client/state/wasm/<hex_checksum>  (IBC 08-wasm)
 //
 // wasmvm compiles on first invocation, so we only place raw bytecode.
-func placeWasmPayloads(extDir, gaiaRoot string) error {
-	if err := placeOneExt(filepath.Join(extDir, "wasm"), filepath.Join(gaiaRoot, "wasm", "state", "wasm")); err != nil {
+func placeWasmPayloads(extDir, gaiaRoot string, log *slog.Logger) error {
+	if err := placeOneExt(filepath.Join(extDir, "wasm"), filepath.Join(gaiaRoot, "wasm", "state", "wasm"), log); err != nil {
 		return fmt.Errorf("wasm extension: %w", err)
 	}
 	if _, err := os.Stat(filepath.Join(extDir, "08-wasm")); err == nil {
 		dst := filepath.Join(gaiaRoot, "data", "08-light-client", "state", "wasm")
-		if err := placeOneExt(filepath.Join(extDir, "08-wasm"), dst); err != nil {
+		if err := placeOneExt(filepath.Join(extDir, "08-wasm"), dst, log); err != nil {
 			return fmt.Errorf("08-wasm extension: %w", err)
 		}
 	}
 	return nil
 }
 
-func placeOneExt(srcDir, dstDir string) error {
+func placeOneExt(srcDir, dstDir string, log *slog.Logger) error {
 	if _, err := os.Stat(srcDir); err != nil {
 		return nil
 	}
@@ -385,7 +404,7 @@ func placeOneExt(srcDir, dstDir string) error {
 		}
 		count++
 	}
-	fmt.Printf("[bootstrap] placed %d wasm bytecode files in %s\n", count, dstDir)
+	log.Info("placed wasm bytecode files", "count", count, "dir", dstDir)
 	return nil
 }
 

@@ -17,25 +17,26 @@ package pebbleutil
 
 import (
 	"fmt"
-	"strings"
+	"log/slog"
 	"time"
 
 	"github.com/cockroachdb/pebble"
-
-	"github.com/zrbecker/cosmos-p2p/internal/humanbytes"
 )
 
 // CleanupCompact opens a pebble DB at dir with default options,
-// flushes, runs a full-keyspace compaction, and closes. See package
-// docs for when to use it.
-func CleanupCompact(dir string) error {
+// flushes, runs a full-keyspace compaction, and closes. log may be
+// nil for silent operation.
+func CleanupCompact(dir string, log *slog.Logger) error {
+	if log == nil {
+		log = slog.New(slog.DiscardHandler)
+	}
 	db, err := pebble.Open(dir, &pebble.Options{
 		MaxConcurrentCompactions: func() int { return 8 },
 	})
 	if err != nil {
 		return fmt.Errorf("open: %w", err)
 	}
-	if err := compactWithMetrics(db, "cleanup"); err != nil {
+	if err := compactWithMetrics(db, "cleanup", log); err != nil {
 		_ = db.Close()
 		return err
 	}
@@ -44,9 +45,9 @@ func CleanupCompact(dir string) error {
 
 // compactWithMetrics flushes the memtable and runs a full-keyspace
 // compaction on db. While Compact is running, a background goroutine
-// polls db.Metrics() every 15s and prints per-level file counts +
+// polls db.Metrics() every 15s and emits per-level file counts +
 // sizes plus in-progress compaction state.
-func compactWithMetrics(db *pebble.DB, label string) error {
+func compactWithMetrics(db *pebble.DB, label string, log *slog.Logger) error {
 	if err := db.Flush(); err != nil {
 		return fmt.Errorf("pebble flush: %w", err)
 	}
@@ -55,7 +56,7 @@ func compactWithMetrics(db *pebble.DB, label string) error {
 	pollerDone := make(chan struct{})
 	go func() {
 		defer close(pollerDone)
-		printLSM(label+"-start", db.Metrics())
+		emitLSM(log, label+"-start", db.Metrics())
 		t := time.NewTicker(15 * time.Second)
 		defer t.Stop()
 		for {
@@ -63,7 +64,7 @@ func compactWithMetrics(db *pebble.DB, label string) error {
 			case <-stopCh:
 				return
 			case <-t.C:
-				printLSM(label, db.Metrics())
+				emitLSM(log, label, db.Metrics())
 			}
 		}
 	}()
@@ -77,25 +78,31 @@ func compactWithMetrics(db *pebble.DB, label string) error {
 	if err != nil {
 		return fmt.Errorf("pebble compact: %w", err)
 	}
-	printLSM(label+"-done", db.Metrics())
+	emitLSM(log, label+"-done", db.Metrics())
 	return nil
 }
 
-// printLSM emits a single line summarising per-level file counts,
-// sizes, total size, and any in-progress compaction work.
-func printLSM(label string, m *pebble.Metrics) {
+// emitLSM logs a "lsm metrics" event with per-level file counts,
+// sizes, totals, and in-progress compaction work as structured attrs.
+// The pretty handler renders bytes via the "size"/"_bytes" key
+// convention; JSON consumers get raw numbers.
+func emitLSM(log *slog.Logger, label string, m *pebble.Metrics) {
+	attrs := []any{"phase", label}
 	var totalFiles int64
 	var totalSize int64
-	var parts []string
 	for i, l := range m.Levels {
 		if l.NumFiles > 0 || l.Size > 0 {
-			parts = append(parts, fmt.Sprintf("L%d=%d/%s", i, l.NumFiles, humanbytes.Format(uint64(l.Size))))
+			attrs = append(attrs,
+				fmt.Sprintf("L%d_files", i), l.NumFiles,
+				fmt.Sprintf("L%d_size", i), uint64(l.Size))
 			totalFiles += l.NumFiles
 			totalSize += l.Size
 		}
 	}
-	fmt.Printf("[pebble-%s] %s | total=%d/%s in_progress=%d (%s)\n",
-		label, strings.Join(parts, " "),
-		totalFiles, humanbytes.Format(uint64(totalSize)),
-		m.Compact.NumInProgress, humanbytes.Format(uint64(m.Compact.InProgressBytes)))
+	attrs = append(attrs,
+		"total_files", totalFiles,
+		"total_size", uint64(totalSize),
+		"compactions_in_progress", m.Compact.NumInProgress,
+		"in_progress_bytes", uint64(m.Compact.InProgressBytes))
+	log.Info("lsm metrics", attrs...)
 }

@@ -10,7 +10,7 @@ import (
 	"testing"
 	"time"
 
-	cmtlog "github.com/cometbft/cometbft/libs/log"
+	"log/slog"
 	"github.com/cometbft/cometbft/p2p"
 
 	"github.com/zrbecker/cosmos-p2p/internal/statesync"
@@ -62,7 +62,7 @@ func (b *scenarioBuilder) build() *chunkScheduler {
 		ssR:         b.reactor,
 		mgr:         b.mgr,
 		watch:       nil, // banAndDrop falls through to mgr.Ban only
-		log:         cmtlog.NewNopLogger(),
+		log:         slog.New(slog.DiscardHandler),
 		writeFile:   writeFileAtomic,
 		target:      b.target,
 		chunkHashes: hashes,

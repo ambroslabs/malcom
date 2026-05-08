@@ -28,6 +28,7 @@ import (
 	"errors"
 	"flag"
 	"fmt"
+	"log/slog"
 	"os"
 	"os/signal"
 	"path/filepath"
@@ -37,6 +38,7 @@ import (
 
 	"github.com/zrbecker/cosmos-p2p/internal/config"
 	"github.com/zrbecker/cosmos-p2p/internal/helpers/nodekey"
+	malcomlog "github.com/zrbecker/cosmos-p2p/internal/log"
 	"github.com/zrbecker/cosmos-p2p/internal/registry"
 )
 
@@ -51,6 +53,7 @@ func Run(args []string) int {
 	fs := flag.NewFlagSet("malcom add", flag.ContinueOnError)
 	force := fs.Bool("force", false, "overwrite existing chains/<id>.toml (node key is never overwritten)")
 	offline := fs.Bool("offline", false, "skip cosmos chain-registry fetch; write a blank chain template")
+	logMode := fs.String("log", "", "log output: auto (default), pretty, text, json")
 	if err := fs.Parse(args); err != nil {
 		return 2
 	}
@@ -66,34 +69,43 @@ func Run(args []string) int {
 		return 2
 	}
 
+	mode, ok := malcomlog.ParseMode(*logMode)
+	if !ok {
+		fmt.Fprintf(os.Stderr, "invalid -log %q (want auto/pretty/text/json)\n", *logMode)
+		return 2
+	}
+	log := malcomlog.New(malcomlog.Options{
+		Writer: os.Stderr, Mode: mode, Level: slog.LevelInfo,
+	}).With("module", "add", "chain", chain)
+
 	cfgPath, err := config.DefaultConfigPath()
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "resolve config path: %v\n", err)
+		log.Error("resolve config path", "err", err)
 		return 1
 	}
 	if _, err := os.Stat(cfgPath); err != nil {
 		if os.IsNotExist(err) {
-			fmt.Fprintf(os.Stderr, "no malcom config at %s — run `malcom init` first\n", cfgPath)
+			log.Error("no malcom config — run `malcom init` first", "path", cfgPath)
 			return 1
 		}
-		fmt.Fprintf(os.Stderr, "stat %s: %v\n", cfgPath, err)
+		log.Error("stat config", "path", cfgPath, "err", err)
 		return 1
 	}
 	chainsDir := filepath.Join(filepath.Dir(cfgPath), "chains")
 
 	stateDir, err := config.StateDir()
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "resolve state dir: %v\n", err)
+		log.Error("resolve state dir", "err", err)
 		return 1
 	}
 	cacheDir, err := config.CacheDir()
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "resolve cache dir: %v\n", err)
+		log.Error("resolve cache dir", "err", err)
 		return 1
 	}
 	dataDir, err := config.DataDir()
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "resolve data dir: %v\n", err)
+		log.Error("resolve data dir", "err", err)
 		return 1
 	}
 
@@ -105,63 +117,61 @@ func Run(args []string) int {
 
 	for _, d := range []string{chainsDir, chainStateDir, chainCacheDir, chainDataDir} {
 		if err := os.MkdirAll(d, 0o755); err != nil {
-			fmt.Fprintf(os.Stderr, "mkdir %s: %v\n", d, err)
+			log.Error("mkdir failed", "dir", d, "err", err)
 			return 1
 		}
 	}
-
-	fmt.Printf("[add] === chain %s ===\n", chain)
 
 	var info *registry.ChainInfo
 	if !*offline {
 		regCacheDir, err := config.RegistryCacheDir()
 		if err != nil {
-			fmt.Fprintf(os.Stderr, "resolve registry cache dir: %v\n", err)
+			log.Error("resolve registry cache dir", "err", err)
 			return 1
 		}
-		i, lerr := lookupChain(regCacheDir, chain)
+		i, lerr := lookupChain(regCacheDir, chain, log)
 		if lerr != nil {
-			fmt.Fprintln(os.Stderr, lerr.Error())
+			log.Error("registry lookup failed", "err", lerr)
 			return 1
 		}
 		info = i
-		fmt.Printf("[add] %s: registry rpcs=%d peers=%d\n",
-			chain, len(info.RPCs), len(info.PersistentPeers)+len(info.Seeds))
+		log.Info("registry lookup",
+			"rpcs", len(info.RPCs),
+			"peers", len(info.PersistentPeers)+len(info.Seeds))
 	}
 
 	defaultGenesis := registry.HardcodedGenesisURLs[chain]
 	body := config.ChainTemplate(chain, info, defaultGenesis)
 	written, err := writeIfMissing(chainCfgPath, body, *force)
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "write %s: %v\n", chainCfgPath, err)
+		log.Error("write chain config failed", "path", chainCfgPath, "err", err)
 		return 1
 	}
 	switch {
 	case !written:
-		fmt.Printf("[add] chain config exists at %s — keeping (pass -force to overwrite)\n", chainCfgPath)
+		log.Info("chain config exists, keeping (pass -force to overwrite)", "path", chainCfgPath)
 	case *force:
-		fmt.Printf("[add] wrote chain %s (forced)\n", chainCfgPath)
+		log.Info("chain config written (forced)", "path", chainCfgPath)
 	default:
-		fmt.Printf("[add] wrote chain %s\n", chainCfgPath)
+		log.Info("chain config written", "path", chainCfgPath)
 	}
 
 	if _, err := os.Stat(nodeKeyPath); err == nil {
-		fmt.Printf("[add] %s: node key exists at %s — keeping\n", chain, nodeKeyPath)
+		log.Info("node key exists, keeping", "path", nodeKeyPath)
 	} else {
 		if _, err := nodekey.LoadOrGen(nodeKeyPath); err != nil {
-			fmt.Fprintf(os.Stderr, "%s: generate node key: %v\n", chain, err)
+			log.Error("generate node key failed", "err", err)
 			return 1
 		}
-		fmt.Printf("[add] %s: generated node key %s\n", chain, nodeKeyPath)
+		log.Info("generated node key", "path", nodeKeyPath)
 	}
 
-	fmt.Println()
-	fmt.Printf("[add] done. layout for %s:\n", chain)
-	fmt.Printf("  chain config: %s\n", chainCfgPath)
-	fmt.Printf("  node key:     %s\n", nodeKeyPath)
-	fmt.Printf("  state:        %s/\n", chainStateDir)
-	fmt.Printf("  cache:        %s/\n", chainCacheDir)
-	fmt.Printf("  data:         %s/\n", chainDataDir)
+	log.Info("layout",
+		"chain_config", chainCfgPath,
+		"node_key", nodeKeyPath,
+		"state", chainStateDir,
+		"cache", chainCacheDir,
+		"data", chainDataDir)
 	return 0
 }
 
@@ -176,22 +186,22 @@ func writeIfMissing(path, body string, force bool) (bool, error) {
 
 // lookupChain resolves chain via the cached chain-registry index,
 // auto-syncing the cache if it's missing or older than
-// registry.DefaultIndexMaxAge. Errors are returned formatted for
-// direct stderr output by the caller.
-func lookupChain(cacheDir, chain string) (*registry.ChainInfo, error) {
+// registry.DefaultIndexMaxAge.
+func lookupChain(cacheDir, chain string, log *slog.Logger) (*registry.ChainInfo, error) {
 	age, err := registry.IndexAge(cacheDir)
 	switch {
 	case errors.Is(err, registry.ErrIndexMissing):
-		fmt.Printf("[add] no chain-registry cache yet — syncing\n")
-		if err := syncRegistry(cacheDir); err != nil {
+		log.Info("no chain-registry cache yet — syncing")
+		if err := syncRegistry(cacheDir, log); err != nil {
 			return nil, fmt.Errorf("sync chain-registry: %w", err)
 		}
 	case err != nil:
 		return nil, fmt.Errorf("read chain-registry index: %w", err)
 	case age > registry.DefaultIndexMaxAge:
-		fmt.Printf("[add] chain-registry cache is %s old — refreshing (override with `malcom registry refresh`)\n",
-			age.Truncate(time.Minute))
-		if err := syncRegistry(cacheDir); err != nil {
+		log.Info("chain-registry cache stale — refreshing",
+			"age", age.Truncate(time.Minute),
+			"hint", "override with `malcom registry refresh`")
+		if err := syncRegistry(cacheDir, log); err != nil {
 			return nil, fmt.Errorf("sync chain-registry: %w", err)
 		}
 	}
@@ -211,10 +221,10 @@ func lookupChain(cacheDir, chain string) (*registry.ChainInfo, error) {
 }
 
 // syncRegistry runs registry.Sync against cacheDir, surfacing collisions
-// to stderr. Cancellable via SIGINT/SIGTERM and bounded by
+// through log. Cancellable via SIGINT/SIGTERM and bounded by
 // registry.DefaultSyncTimeout so a hung TCP connection can't wedge
 // `malcom add`.
-func syncRegistry(cacheDir string) error {
+func syncRegistry(cacheDir string, log *slog.Logger) error {
 	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer cancel()
 	ctx, cancelTimeout := context.WithTimeout(ctx, registry.DefaultSyncTimeout)
@@ -223,13 +233,14 @@ func syncRegistry(cacheDir string) error {
 	if err != nil {
 		return err
 	}
-	fmt.Printf("[add] chain-registry synced: indexed=%d killed=%d filtered=%d\n",
-		res.IndexedChains, res.DroppedKilled, res.DroppedFiltered)
+	log.Info("chain-registry synced",
+		"indexed", res.IndexedChains,
+		"killed", res.DroppedKilled,
+		"filtered", res.DroppedFiltered)
 	if len(res.Collisions) > 0 {
-		fmt.Fprintf(os.Stderr, "[add] note: %d chain_id(s) advertised by multiple live registry entries — excluded:\n",
-			len(res.Collisions))
+		log.Warn("chain_id collisions excluded from index", "count", len(res.Collisions))
 		for _, c := range res.Collisions {
-			fmt.Fprintf(os.Stderr, "  %s: %v\n", c.ChainID, c.Paths)
+			log.Warn("collision", "chain_id", c.ChainID, "paths", c.Paths)
 		}
 	}
 	return nil

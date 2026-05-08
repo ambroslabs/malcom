@@ -15,12 +15,14 @@ import (
 	"context"
 	"flag"
 	"fmt"
+	"log/slog"
 	"os"
 	"os/signal"
 	"syscall"
 	"time"
 
 	"github.com/zrbecker/cosmos-p2p/internal/config"
+	malcomlog "github.com/zrbecker/cosmos-p2p/internal/log"
 	"github.com/zrbecker/cosmos-p2p/internal/registry"
 )
 
@@ -47,13 +49,23 @@ func Run(args []string) int {
 
 func runRefresh(args []string) int {
 	fs := flag.NewFlagSet("malcom registry refresh", flag.ContinueOnError)
+	logMode := fs.String("log", "", "log output: auto (default), pretty, text, json")
 	if err := fs.Parse(args); err != nil {
 		return 2
 	}
 
+	mode, ok := malcomlog.ParseMode(*logMode)
+	if !ok {
+		fmt.Fprintf(os.Stderr, "invalid -log %q (want auto/pretty/text/json)\n", *logMode)
+		return 2
+	}
+	log := malcomlog.New(malcomlog.Options{
+		Writer: os.Stderr, Mode: mode, Level: slog.LevelInfo,
+	}).With("module", "registry")
+
 	cacheDir, err := config.RegistryCacheDir()
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "resolve registry cache: %v\n", err)
+		log.Error("resolve registry cache", "err", err)
 		return 1
 	}
 
@@ -62,23 +74,24 @@ func runRefresh(args []string) int {
 	ctx, cancelTimeout := context.WithTimeout(ctx, registry.DefaultSyncTimeout)
 	defer cancelTimeout()
 
-	fmt.Printf("[registry] syncing chain-registry → %s\n", cacheDir)
+	log.Info("syncing chain-registry", "cache", cacheDir)
 	t0 := time.Now()
 	res, err := registry.Sync(ctx, cacheDir)
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "registry sync: %v\n", err)
+		log.Error("registry sync failed", "err", err)
 		return 1
 	}
-	fmt.Printf("[registry] done in %s: indexed=%d killed=%d filtered=%d\n",
-		time.Since(t0).Truncate(10*time.Millisecond),
-		res.IndexedChains, res.DroppedKilled, res.DroppedFiltered)
+	log.Info("done",
+		"elapsed", time.Since(t0).Truncate(10*time.Millisecond),
+		"indexed", res.IndexedChains,
+		"killed", res.DroppedKilled,
+		"filtered", res.DroppedFiltered)
 	if len(res.Collisions) > 0 {
-		fmt.Fprintf(os.Stderr, "\n[registry] %d chain_id(s) advertised by multiple live registry entries — excluded from the index:\n",
-			len(res.Collisions))
+		log.Warn("chain_id collisions excluded from index — `malcom add` will refuse these until upstream disambiguates",
+			"count", len(res.Collisions))
 		for _, c := range res.Collisions {
-			fmt.Fprintf(os.Stderr, "  %s: %v\n", c.ChainID, c.Paths)
+			log.Warn("collision", "chain_id", c.ChainID, "paths", c.Paths)
 		}
-		fmt.Fprintln(os.Stderr, "  (`malcom add <chain-id>` will refuse these until upstream disambiguates.)")
 	}
 	return 0
 }

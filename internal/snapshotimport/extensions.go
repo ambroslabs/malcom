@@ -17,7 +17,7 @@ package snapshotimport
 
 import (
 	"fmt"
-	"io"
+	"log/slog"
 	"os"
 	"path/filepath"
 )
@@ -39,12 +39,12 @@ func newExtensionWriter(extDir string) *extensionWriter {
 
 // openMeta starts a new extension. Resets the per-extension payload
 // counter and ensures the destination directory exists.
-func (e *extensionWriter) openMeta(name string, format uint32, stats *Stats, log io.Writer) error {
+func (e *extensionWriter) openMeta(name string, format uint32, stats *Stats, log *slog.Logger) error {
 	stats.Extensions++
 	e.curName = name
 	e.curFormat = format
 	e.curIndex = 0
-	fmt.Fprintf(log, "[import] open extension=%q format=%d\n", name, format)
+	log.Info("open extension", "extension", name, "format", format)
 	if e.extDir == "" {
 		return nil
 	}

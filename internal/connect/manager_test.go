@@ -1,6 +1,7 @@
 package connect
 
 import (
+	"log/slog"
 	"net"
 	"sync"
 	"testing"
@@ -242,7 +243,7 @@ func newManagerForTest(t *testing.T, sw managerSwitch, c Config) *Manager {
 	c.defaults()
 	m := &Manager{
 		cfg:        c,
-		log:        cmtlog.NewNopLogger(),
+		log:        slog.New(slog.DiscardHandler),
 		pinned:     map[p2p.ID]string{},
 		backoffs:   map[p2p.ID]*peerBackoff{},
 		banned:     map[p2p.ID]bool{},

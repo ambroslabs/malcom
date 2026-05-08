@@ -13,6 +13,7 @@ import (
 	"encoding/binary"
 	"fmt"
 	"io"
+	"log/slog"
 	"time"
 
 	"github.com/cockroachdb/pebble"
@@ -274,7 +275,7 @@ func (s *storeImporter) finalize(set func(key, value []byte) error) ([32]byte, e
 //
 // Returns the per-store root hashes in stream order (typically
 // alphabetical, by cosmos-sdk's exporter convention).
-func runImport(r io.Reader, db *pebble.DB, height int64, extDir string, stats *Stats, log io.Writer) ([]StoreInfo, error) {
+func runImport(r io.Reader, db *pebble.DB, height int64, extDir string, stats *Stats, log *slog.Logger) ([]StoreInfo, error) {
 	sr := newSnapReader(r)
 
 	const flushBytes = 64 << 20 // 64 MiB per batch
@@ -320,9 +321,12 @@ func runImport(r io.Reader, db *pebble.DB, height int64, extDir string, stats *S
 		}
 		stores = append(stores, StoreInfo{Name: curName, Hash: hash})
 		stats.Items += current.itemCount
-		fmt.Fprintf(log, "[import] store=%q items=%d (leaves=%d inner=%d) elapsed=%s\n",
-			curName, current.itemCount, current.leafCount, current.innerCount,
-			time.Since(storeAt).Truncate(time.Millisecond))
+		log.Info("store complete",
+			"store", curName,
+			"items", current.itemCount,
+			"leaves", current.leafCount,
+			"inner", current.innerCount,
+			"elapsed", time.Since(storeAt).Truncate(time.Millisecond))
 		current = nil
 		return nil
 	}
@@ -343,7 +347,7 @@ func runImport(r io.Reader, db *pebble.DB, height int64, extDir string, stats *S
 			current = newStoreImporter(item.StoreName, height)
 			curName = item.StoreName
 			storeAt = time.Now()
-			fmt.Fprintf(log, "[import] open store=%q\n", curName)
+			log.Info("open store", "store", curName)
 		case itemTypeIAVL:
 			if current == nil {
 				return nil, fmt.Errorf("IAVL item before any StoreItem")
@@ -388,8 +392,9 @@ func runImport(r io.Reader, db *pebble.DB, height int64, extDir string, stats *S
 		return nil, fmt.Errorf("flush final batch: %w", err)
 	}
 
-	fmt.Fprintf(log, "[import] complete elapsed=%s stores=%d\n",
-		time.Since(startedAt).Truncate(time.Millisecond), len(stores))
+	log.Info("stream complete",
+		"elapsed", time.Since(startedAt).Truncate(time.Millisecond),
+		"stores", len(stores))
 
 	return stores, nil
 }

@@ -37,7 +37,8 @@ import (
 	"sync"
 	"time"
 
-	cmtlog "github.com/cometbft/cometbft/libs/log"
+	"log/slog"
+
 	"github.com/cometbft/cometbft/p2p"
 	pexcb "github.com/cometbft/cometbft/p2p/pex"
 
@@ -143,7 +144,7 @@ func (c *Config) defaults() {
 
 type Manager struct {
 	cfg Config
-	log cmtlog.Logger
+	log *slog.Logger
 
 	mu          sync.Mutex
 	pinned      map[p2p.ID]string       // pid → addr (id@host:port)
