@@ -68,11 +68,13 @@ require_state_sync_channel = true
 
 # Permit multiple peers behind one IP. Default false (cometbft
 # default) rejects the eclipse vector where one attacker IP fills
-# many of our outbound slots — combined with the lack of
-# Hash/Metadata cross-validation on the wire, that's a forged-
-# snapshot path. Set true only when the peer set is dominated by
-# shared egress (NAT/CGN, cloud regions) and 'malcom verify'
-# against a trusted RPC is part of the operator's pipeline.
+# many of our outbound slots. p2p delivery is internally consistent
+# (offer.Hash is checked against the downloaded chunks) but not
+# anchored to a trusted root, so a peer set controlled by one
+# attacker can still serve a forged-but-consistent snapshot. Set
+# true only when the peer set is dominated by shared egress
+# (NAT/CGN, cloud regions) and 'malcom verify' against a trusted
+# RPC is part of the operator's pipeline.
 # allow_duplicate_ip = false
 
 # How long misbehaving peers are barred from PEX rotation via
