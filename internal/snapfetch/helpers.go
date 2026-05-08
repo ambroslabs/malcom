@@ -3,6 +3,7 @@ package snapfetch
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
 	"encoding/binary"
 	"encoding/json"
 	"fmt"
@@ -40,6 +41,31 @@ func parseChunkHashes(metadata []byte) ([][]byte, error) {
 		i += int(length)
 	}
 	return out, nil
+}
+
+// verifyChunkZero checks that data matches the offer's
+// metadata.chunk_hashes[0]. Used during the walk to reject garbage
+// chunk-0 responses before they cause an offer to be accepted.
+//
+// Returns an error describing the mismatch reason on failure. The
+// caller is expected to ban the responder on any error.
+func verifyChunkZero(offer *snapshotOffer, data []byte) error {
+	chunkHashes, err := parseChunkHashes(offer.Metadata)
+	if err != nil {
+		return fmt.Errorf("parse chunk_hashes: %w", err)
+	}
+	if uint32(len(chunkHashes)) != offer.Chunks {
+		return fmt.Errorf("chunk_hashes count %d, offer.Chunks %d",
+			len(chunkHashes), offer.Chunks)
+	}
+	if len(chunkHashes) == 0 {
+		return fmt.Errorf("offer has zero chunks")
+	}
+	h := sha256.Sum256(data)
+	if !bytes.Equal(h[:], chunkHashes[0]) {
+		return fmt.Errorf("chunk-0 hash mismatch")
+	}
+	return nil
 }
 
 func loadAddrbookPeers(ctx context.Context, addrBookPath string) []addrbook.PeerAddr {

@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/hex"
 	"fmt"
+	"path/filepath"
 	"time"
 
 	cfg "github.com/cometbft/cometbft/config"
@@ -29,7 +30,7 @@ func RunFetch(ctx context.Context, c Config, outRoot string) error {
 	}
 	defer cleanup()
 
-	offer, good, err := s.walk(ctx)
+	offer, good, chunk0, err := s.walk(ctx)
 	if err != nil {
 		return err
 	}
@@ -37,6 +38,17 @@ func RunFetch(ctx context.Context, c Config, outRoot string) error {
 	snapDir, chunkHashes, err := s.prepareSnapshotDir(outRoot, offer)
 	if err != nil {
 		return err
+	}
+
+	// Walk verified chunk-0 against metadata.chunk_hashes[0] before
+	// accepting the offer. Seed it on disk so download.resumeFromDisk
+	// picks it up and skips refetching. Best-effort: a write error
+	// just means download will fetch chunk-0 again.
+	if len(chunk0) > 0 {
+		path := filepath.Join(snapDir, "chunk_00000.bin")
+		if err := writeFileAtomic(path, chunk0, 0o644); err != nil {
+			s.log.Error("seed verified chunk-0 failed; download will refetch", "err", err)
+		}
 	}
 
 	fetchCtx, fetchCancel := context.WithTimeout(ctx, c.MaxFetchTime)
