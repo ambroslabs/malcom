@@ -74,12 +74,13 @@ func hintNoPeerAddrs(chainID string) string {
 // hintAllPeersBanned fires mid-download when every tracked peer has
 // hit its strike budget or been dropped by peerWatch. Usually means
 // the peer set is dominated by misbehaving deployments OR the strike
-// budgets are too tight for a flaky network.
+// budgets are too tight for a flaky network. Widening the outbound
+// ceiling doesn't help here — the existing peers already misbehaved;
+// the cure is fresh peers or more lenient strike budgets.
 func hintAllPeersBanned(chainID string) string {
-	return fmt.Sprintf("every peer hit its strike budget. Try: raise %s, add fresh bootstrap_peers under %s, or raise %s",
+	return fmt.Sprintf("every peer hit its strike budget. Try: raise %s, or add fresh bootstrap_peers under %s",
 		chainCfgRef(chainID, "peer_fails", "provisional_probe_strikes"),
 		chainCfgRef(chainID, "bootstrap_peers"),
-		chainCfgRef(chainID, "max_outbound_peers"),
 	)
 }
 
