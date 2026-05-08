@@ -19,10 +19,14 @@ func newOfferSet() *offerSet {
 
 // add records peerID as an offerer of s. Creates the offer record on
 // first observation; subsequent calls just record additional peers.
-func (o *offerSet) add(s *statesync.Snapshot, peerID string) {
+// Returns true on first observation of (height, format, hash) — callers
+// can use this to fire one-shot logs without having to track the tuple
+// themselves.
+func (o *offerSet) add(s *statesync.Snapshot, peerID string) bool {
 	k := snapKey(s)
 	rec, ok := o.byKey[k]
-	if !ok {
+	first := !ok
+	if first {
 		rec = &snapshotOffer{
 			Height:   s.Height,
 			Format:   s.Format,
@@ -35,6 +39,7 @@ func (o *offerSet) add(s *statesync.Snapshot, peerID string) {
 		o.byHeight[s.Height] = append(o.byHeight[s.Height], k)
 	}
 	rec.Peers[peerID] = true
+	return first
 }
 
 // offerEntry pairs a content key with its offer, so callers that need

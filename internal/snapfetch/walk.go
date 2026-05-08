@@ -90,6 +90,28 @@ func walkBackward(
 	// offers here; peerWatch sees them via its own subscription.
 	offers := newOfferSet()
 
+	// recordOffer adds an offer to the set and, on first observation
+	// of (height, format, hash), surfaces a one-shot Info log so
+	// operators can see what's out there in the wild — including
+	// candidates that are too old (in_window=false) and would normally
+	// be invisible. age is the distance below MaxHeight (the chain
+	// head as known to this run); negative when an offer claims a
+	// height above what we believed the head to be.
+	recordOffer := func(s *statesync.Snapshot, peerID string) {
+		if !offers.add(s, peerID) {
+			return
+		}
+		var age int64
+		if cfg.MaxHeight > 0 {
+			age = int64(cfg.MaxHeight) - int64(s.Height)
+		}
+		log.Info("snapshot offer",
+			"height", s.Height,
+			"peer", peerID,
+			"in_window", offerInWindow(s.Height, cfg),
+			"age", age)
+	}
+
 	// Drain any events that arrived during the seed-dial wave into
 	// the offerSet BEFORE we start the 3s warmup. Otherwise the
 	// warmup `time.After` blocks the receive loop and offers
@@ -99,7 +121,7 @@ func walkBackward(
 			select {
 			case ev := <-sub.Ctrl:
 				if ev.Snapshot != nil {
-					offers.add(ev.Snapshot, ev.PeerID)
+					recordOffer(ev.Snapshot, ev.PeerID)
 				}
 			case <-sub.Chunk:
 				// Discard pre-walk chunks; we only request chunk-0
@@ -113,7 +135,7 @@ func walkBackward(
 
 	// 3s warmup so PEX-harvested peers can connect and send their
 	// SnapshotsResponse. Drain again afterward.
-	if err := warmup(ctx, sub, offers, drainEvents, 3*time.Second); err != nil {
+	if err := warmup(ctx, sub, recordOffer, drainEvents, 3*time.Second); err != nil {
 		return nil, nil, nil, err
 	}
 
@@ -202,7 +224,7 @@ func walkBackward(
 					"offer_height", ev.Snapshot.Height,
 					"peer", ev.PeerID,
 					"failed_target", failed[ev.Snapshot.Height])
-				offers.add(ev.Snapshot, ev.PeerID)
+				recordOffer(ev.Snapshot, ev.PeerID)
 				// Jump-up: a fresher offer arrived for a height
 				// above the current target. Abort this iteration
 				// and prepend the fresher height to the queue (the
@@ -358,9 +380,9 @@ func isJumpCandidate(newHeight, current, minHeight uint64, failed map[uint64]boo
 }
 
 // warmup waits up to d for the warmup window to elapse, draining any
-// SnapshotsResponse events into offers as they arrive. Returns ctx.Err()
-// if the parent context is cancelled mid-warmup.
-func warmup(ctx context.Context, sub *subscription, offers *offerSet, drain func(), d time.Duration) error {
+// SnapshotsResponse events through record as they arrive. Returns
+// ctx.Err() if the parent context is cancelled mid-warmup.
+func warmup(ctx context.Context, sub *subscription, record func(*statesync.Snapshot, string), drain func(), d time.Duration) error {
 	deadline := time.NewTimer(d)
 	defer deadline.Stop()
 	for {
@@ -373,11 +395,28 @@ func warmup(ctx context.Context, sub *subscription, offers *offerSet, drain func
 			return nil
 		case ev := <-sub.Ctrl:
 			if ev.Snapshot != nil {
-				offers.add(ev.Snapshot, ev.PeerID)
+				record(ev.Snapshot, ev.PeerID)
 			}
 		case <-sub.Chunk:
 		}
 	}
+}
+
+// offerInWindow reports whether height falls in the heights this
+// fetch is willing to download. With TargetHeight set, only that exact
+// height qualifies; otherwise [MinHeight, MaxHeight] (each side
+// disabled when zero).
+func offerInWindow(height uint64, cfg Config) bool {
+	if cfg.TargetHeight != 0 {
+		return height == cfg.TargetHeight
+	}
+	if cfg.MinHeight != 0 && height < cfg.MinHeight {
+		return false
+	}
+	if cfg.MaxHeight != 0 && height > cfg.MaxHeight {
+		return false
+	}
+	return true
 }
 
 // walkTargets returns a descending list of heights from
