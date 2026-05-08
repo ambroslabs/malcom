@@ -64,12 +64,12 @@ func walkBackward(
 	case cfg.TargetHeight != 0:
 		targets = []uint64{cfg.TargetHeight}
 	case cfg.MaxHeight == 0:
-		return nil, nil, fmt.Errorf("walk has no upper bound — %s", hintMissingHeightInputs)
+		return nil, nil, fmt.Errorf("%w: walk has no upper bound — %s", ErrWalkFailed, hintMissingHeightInputs)
 	default:
 		targets = walkTargets(cfg.MaxHeight, cfg.MinHeight, cfg.SnapshotInterval)
 		if len(targets) == 0 {
-			return nil, nil, fmt.Errorf("no target heights in [%d, %d] with stride %d — %s",
-				cfg.MinHeight, cfg.MaxHeight, cfg.SnapshotInterval,
+			return nil, nil, fmt.Errorf("%w: no target heights in [%d, %d] with stride %d — %s",
+				ErrWalkFailed, cfg.MinHeight, cfg.MaxHeight, cfg.SnapshotInterval,
 				hintEmptyTargetWindow(cfg.ChainID))
 		}
 	}
@@ -281,8 +281,8 @@ walkLoop:
 		}
 
 		if cfg.TargetHeight != 0 {
-			return nil, nil, fmt.Errorf("target height %d: no peer served chunk-0 within %s — %s",
-				cfg.TargetHeight, cfg.PerHeightTimeout,
+			return nil, nil, fmt.Errorf("%w: target height %d: no peer served chunk-0 within %s — %s",
+				ErrWalkFailed, cfg.TargetHeight, cfg.PerHeightTimeout,
 				hintTargetHeightUnserved(cfg.ChainID))
 		}
 		failed[target] = true
@@ -294,8 +294,8 @@ walkLoop:
 			"height", target, "next", next)
 	}
 
-	return nil, nil, fmt.Errorf("no servable snapshot found in window [%d, %d] — %s",
-		cfg.MinHeight, cfg.MaxHeight, hintNoServable(cfg.ChainID))
+	return nil, nil, fmt.Errorf("%w: window [%d, %d] — %s",
+		ErrWalkFailed, cfg.MinHeight, cfg.MaxHeight, hintNoServable(cfg.ChainID))
 }
 
 // walkTargets returns a descending list of heights from
