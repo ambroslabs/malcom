@@ -373,6 +373,68 @@ func TestChunkSchedulerDispatchAssignsChunks(t *testing.T) {
 	}
 }
 
+// When RequestChunk returns false for a peer (cometbft send queue
+// full), dispatch must not keep reselecting that peer for every
+// remaining pending chunk in the same call. Regression test for
+// issue #23: with one peer and N pending chunks, a jammed send queue
+// should produce exactly one RequestChunk attempt, not N.
+func TestChunkSchedulerDispatchSkipsPeerOnSendFail(t *testing.T) {
+	b := newScenario(t)
+	b.target.Chunks = 100
+	b.reactor.requestChunkOK = false
+	s := b.build()
+	s.chunkHashes = make([][]byte, b.target.Chunks)
+	s.pending = make([]bool, b.target.Chunks)
+	for i := range s.pending {
+		s.pending[i] = true
+	}
+
+	peer := newFakePeer("peer-A", "1.1.1.1", 26656)
+	b.sw.peerSet.Add(peer)
+	s.stats[peer.ID()] = &peerStat{} // proven, perPeer=4 slots
+
+	if d := s.dispatch(); d != 0 {
+		t.Fatalf("dispatched=%d, want 0 (send queue jammed)", d)
+	}
+	if got := b.reactor.numRequests(); got != 1 {
+		t.Fatalf("RequestChunk called %d times, want 1 (peer should be skipped after first false)", got)
+	}
+	if s.stats[peer.ID()].inflight != 0 {
+		t.Fatalf("inflight=%d, want 0 (failed RequestChunk must not bump inflight)", s.stats[peer.ID()].inflight)
+	}
+}
+
+// With multiple peers and a jammed send queue across all of them,
+// dispatch should try each peer at most once (skip set), then return.
+func TestChunkSchedulerDispatchSkipsAllPeersOnSendFail(t *testing.T) {
+	b := newScenario(t)
+	b.target.Chunks = 100
+	b.reactor.requestChunkOK = false
+	s := b.build()
+	s.chunkHashes = make([][]byte, b.target.Chunks)
+	s.pending = make([]bool, b.target.Chunks)
+	for i := range s.pending {
+		s.pending[i] = true
+	}
+
+	a := newFakePeer("peer-A", "1.1.1.1", 26656)
+	bp := newFakePeer("peer-B", "2.2.2.2", 26656)
+	c := newFakePeer("peer-C", "3.3.3.3", 26656)
+	b.sw.peerSet.Add(a)
+	b.sw.peerSet.Add(bp)
+	b.sw.peerSet.Add(c)
+	s.stats[a.ID()] = &peerStat{}
+	s.stats[bp.ID()] = &peerStat{}
+	s.stats[c.ID()] = &peerStat{}
+
+	if d := s.dispatch(); d != 0 {
+		t.Fatalf("dispatched=%d, want 0", d)
+	}
+	if got := b.reactor.numRequests(); got != 3 {
+		t.Fatalf("RequestChunk called %d times, want 3 (one per peer)", got)
+	}
+}
+
 func TestChunkSchedulerPickPeerSkipsBanned(t *testing.T) {
 	b := newScenario(t)
 	s := b.build()
@@ -386,7 +448,7 @@ func TestChunkSchedulerPickPeerSkipsBanned(t *testing.T) {
 	s.stats[bad.ID()] = &peerStat{banned: true}
 
 	for i := 0; i < 5; i++ {
-		if pid := s.pickPeer(); pid != good.ID() {
+		if pid := s.pickPeer(nil); pid != good.ID() {
 			t.Fatalf("pickPeer=%q, want %q (banned should never be picked)", pid, good.ID())
 		}
 	}
@@ -577,12 +639,12 @@ func TestChunkSchedulerPickPeerProvenSlotsLimited(t *testing.T) {
 	// peer must not be picked again, so dispatch can't bump it past
 	// PerPeerLimit.
 	for i := 0; i < 4; i++ {
-		if pid := s.pickPeer(); pid != proven.ID() {
+		if pid := s.pickPeer(nil); pid != proven.ID() {
 			t.Fatalf("pick #%d=%q, want %q", i+1, pid, proven.ID())
 		}
 		s.stats[proven.ID()].addInflight()
 	}
-	if pid := s.pickPeer(); pid != "" {
+	if pid := s.pickPeer(nil); pid != "" {
 		t.Fatalf("pick with proven inflight=perPeer should return empty, got %q", pid)
 	}
 }
@@ -603,7 +665,7 @@ func TestChunkSchedulerPickPeerProvisionalSlotsLimited(t *testing.T) {
 	// is the actual "no more slots" state.
 	s.stats[prov.ID()].addInflight()
 	s.stats[prov.ID()].addInflight()
-	if pid := s.pickPeer(); pid != "" {
+	if pid := s.pickPeer(nil); pid != "" {
 		t.Fatalf("pick with provisional inflight=2 should return empty, got %q", pid)
 	}
 }

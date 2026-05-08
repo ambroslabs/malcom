@@ -556,12 +556,15 @@ func (s *chunkScheduler) addProvisional(peer p2p.Peer) {
 // (inflight <= provisionalInflight) so dispatch's post-pick addInflight
 // gives the probe one slot of headroom — enough to surface a hash or
 // timeout strike before the peer either gets proven or banned.
-func (s *chunkScheduler) pickPeer() p2p.ID {
+func (s *chunkScheduler) pickPeer(skip map[p2p.ID]bool) p2p.ID {
 	var bestProven, bestProvis p2p.ID
 	bestProvenInflight := s.perPeer + 1
 	bestProvisInflight := s.provisionalInflight + 1
 	for pid, st := range s.stats {
 		if st.banned {
+			continue
+		}
+		if skip[pid] {
 			continue
 		}
 		if s.sw.Peers().Get(pid) == nil {
@@ -591,13 +594,18 @@ func (s *chunkScheduler) pickPeer() p2p.ID {
 // dispatch pairs pending chunks with available peers via pickPeer
 // and fires ChunkRequests until either pending is exhausted or no
 // peer has an open slot.
+//
+// A peer whose RequestChunk returns false (cometbft send queue full)
+// is added to a per-dispatch skip set so pickPeer doesn't keep
+// reselecting it for every remaining pending chunk in the same call.
 func (s *chunkScheduler) dispatch() int {
 	dispatched := 0
+	var skip map[p2p.ID]bool
 	for i := uint32(0); i < s.target.Chunks; i++ {
 		if !s.pending[i] {
 			continue
 		}
-		pid := s.pickPeer()
+		pid := s.pickPeer(skip)
 		if pid == "" {
 			return dispatched
 		}
@@ -607,6 +615,10 @@ func (s *chunkScheduler) dispatch() int {
 			continue
 		}
 		if !s.ssR.RequestChunk(peer, s.target.Height, s.target.Format, i) {
+			if skip == nil {
+				skip = map[p2p.ID]bool{}
+			}
+			skip[pid] = true
 			continue
 		}
 		s.pending[i] = false
