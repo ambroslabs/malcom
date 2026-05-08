@@ -32,6 +32,7 @@ package connect
 
 import (
 	"context"
+	"errors"
 	"math/rand"
 	"sync"
 	"time"
@@ -426,12 +427,22 @@ func (m *Manager) fireDial(addr string) {
 // failures per addr. After MaxDialFailures, the entry is RemoveAddress'd
 // from the cometbft addrbook and (if Banlist is configured) recorded
 // for cross-run filtering.
+//
+// ErrCurrentlyDialingOrExistingAddress is treated as a no-op: it means
+// another goroutine has the dial in flight (TOCTOU between the
+// IsDialingOrExistingAddress gate and this call, or the pinned-redial
+// path racing warm-fill). Counting it as a failure can evict a healthy
+// peer purely on internal racing.
 func (m *Manager) dial(na *p2p.NetAddress) {
 	err := m.cfg.Switch.DialPeerWithAddress(na)
 	if err == nil {
 		m.mu.Lock()
 		delete(m.dialFail, na.String())
 		m.mu.Unlock()
+		return
+	}
+	var dialing p2p.ErrCurrentlyDialingOrExistingAddress
+	if errors.As(err, &dialing) {
 		return
 	}
 	m.recordDialFail(na, err)
