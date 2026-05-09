@@ -55,9 +55,18 @@ type SnapshotIndex struct {
 type StoreEntry struct {
 	Name              string
 	DecompressedStart int64  // offset of the StoreItem envelope's leading varint
-	DecompressedEnd   int64  // offset where the next store starts (or stream end)
+	DecompressedEnd   int64  // offset where the next store starts (or stream end); 0 if not yet known
 	ItemCount         uint64 // total items in this store (StoreItem + IAVL items)
 	IAVLBytes         int64  // sum of IAVL item-envelope bytes (size proxy)
+
+	// EndCh, when non-nil, is a single-shot channel that the
+	// streaming-pipeline producer (parallel.go's stage 1) sends the
+	// store's end offset on as soon as it's known (= the next
+	// StoreItem or the extension tail is parsed). Workers using the
+	// chunkRing-based reader block on this to set their reader's
+	// end. BuildIndex returns entries with EndCh == nil and the
+	// final DecompressedEnd populated normally.
+	EndCh chan int64
 }
 
 // BuildIndex decompresses the snapshot once and emits a per-store
