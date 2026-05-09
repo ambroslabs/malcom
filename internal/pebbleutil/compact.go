@@ -21,6 +21,8 @@ import (
 	"time"
 
 	"github.com/cockroachdb/pebble"
+
+	malcomlog "github.com/zrbecker/cosmos-p2p/internal/log"
 )
 
 // CleanupCompact opens a pebble DB at dir with default options,
@@ -32,6 +34,7 @@ func CleanupCompact(dir string, log *slog.Logger) error {
 	}
 	db, err := pebble.Open(dir, &pebble.Options{
 		MaxConcurrentCompactions: func() int { return 8 },
+		Logger:                   malcomlog.PebbleShim(log.With("module", "pebble")),
 	})
 	if err != nil {
 		return fmt.Errorf("open: %w", err)
