@@ -5,7 +5,10 @@
 
 package config
 
-import "time"
+import (
+	"runtime"
+	"time"
+)
 
 // Built-in default constants. Exposed so cli help text can reference
 // the same values applyFetchDefaults uses, keeping description
@@ -114,11 +117,33 @@ func applyImportDefaults(t *ImportTuning) {
 	if t.CacheMB == 0 {
 		t.CacheMB = 64
 	}
-	if t.MaxConcurrentCompactions == 0 {
-		t.MaxConcurrentCompactions = 2
-	}
 	if t.MinFreeGB == 0 {
 		t.MinFreeGB = 20
+	}
+	// FlushSplitMB defaults to memtable_mb. With CompactDuringImport
+	// off (the default), this means each memtable flush produces ~1
+	// L0 SSTable instead of memtable_mb / 4 = ~64 small ones — gaiad
+	// or the standalone compact then sees a manageable file count.
+	if t.FlushSplitMB == 0 {
+		t.FlushSplitMB = t.MemtableMB
+	}
+	// CompactDuringImport zero value (false) is the default — a bool
+	// can't distinguish "unset" from "set to false", so we don't
+	// override here. Templates document the default.
+}
+
+// ApplyCompactDefaults is the package-internal applyCompactDefaults
+// exposed for callers that work directly off the global Config (e.g.
+// `malcom compact`, which doesn't go through Resolve because it takes
+// no -chain argument).
+func ApplyCompactDefaults(t *CompactTuning) { applyCompactDefaults(t) }
+
+func applyCompactDefaults(t *CompactTuning) {
+	if t.MaxConcurrentCompactions == 0 {
+		t.MaxConcurrentCompactions = runtime.NumCPU()
+		if t.MaxConcurrentCompactions < 1 {
+			t.MaxConcurrentCompactions = 1
+		}
 	}
 }
 

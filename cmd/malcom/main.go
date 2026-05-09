@@ -26,6 +26,7 @@ import (
 	"github.com/zrbecker/cosmos-p2p/internal/cli/registrycmd"
 	"github.com/zrbecker/cosmos-p2p/internal/cli/snapshotfetch"
 	"github.com/zrbecker/cosmos-p2p/internal/cli/snapshotimport"
+	"github.com/zrbecker/cosmos-p2p/internal/cli/snapshotindex"
 	"github.com/zrbecker/cosmos-p2p/internal/cli/verify"
 )
 
@@ -72,6 +73,8 @@ func snapshotDispatch(args []string) int {
 		return snapshotfetch.Run(rest)
 	case "import":
 		return snapshotimport.Run(rest)
+	case "index":
+		return snapshotindex.Run(rest)
 	case "-h", "--help", "help":
 		snapshotUsage()
 		return 0

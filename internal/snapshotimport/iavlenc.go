@@ -37,6 +37,17 @@ func storePrefix(name string) []byte {
 	return out
 }
 
+// ─── append-into variants of the key + value encoders ────────────────────
+//
+// Each encoder takes the destination slice as a parameter and returns
+// the appended-to slice, in the canonical Go append idiom. Lets callers
+// supply a per-storeImporter scratch buffer that's reused across the
+// ~28M addNode calls for a big store like bank, eliminating the
+// per-call mallocgc + memmove cost the encode bucket was paying.
+//
+// The "Into" suffix mirrors stdlib (e.g. *big.Int.FillBytes /
+// hash.Hash.Sum); callers pass `buf[:0]` to write from the start.
+
 // nodeKeyBytes returns the 12-byte (version, nonce) tuple in the order
 // IAVL stores it (big-endian for both, version first). This is the
 // "nodeKey" used as the storage key suffix and as the value of the
@@ -51,34 +62,43 @@ func nodeKeyBytes(version int64, nonce uint32) []byte {
 // nodeDBKey assembles the full pebble key for a node entry under the
 // given store: storePrefix || 's' || version || nonce.
 func nodeDBKey(storePrefix []byte, version int64, nonce uint32) []byte {
-	out := make([]byte, 0, len(storePrefix)+1+12)
-	out = append(out, storePrefix...)
-	out = append(out, 's')
+	return nodeDBKeyInto(make([]byte, 0, len(storePrefix)+1+12), storePrefix, version, nonce)
+}
+
+func nodeDBKeyInto(buf, storePrefix []byte, version int64, nonce uint32) []byte {
+	buf = append(buf, storePrefix...)
+	buf = append(buf, 's')
 	var nk [12]byte
 	binary.BigEndian.PutUint64(nk[:], uint64(version))
 	binary.BigEndian.PutUint32(nk[8:], nonce)
-	out = append(out, nk[:]...)
-	return out
+	buf = append(buf, nk[:]...)
+	return buf
 }
 
 // fastDBKey returns the pebble key for a fast-storage entry:
 // storePrefix || 'f' || userKey.
 func fastDBKey(storePrefix, userKey []byte) []byte {
-	out := make([]byte, 0, len(storePrefix)+1+len(userKey))
-	out = append(out, storePrefix...)
-	out = append(out, 'f')
-	out = append(out, userKey...)
-	return out
+	return fastDBKeyInto(make([]byte, 0, len(storePrefix)+1+len(userKey)), storePrefix, userKey)
+}
+
+func fastDBKeyInto(buf, storePrefix, userKey []byte) []byte {
+	buf = append(buf, storePrefix...)
+	buf = append(buf, 'f')
+	buf = append(buf, userKey...)
+	return buf
 }
 
 // metadataDBKey returns the pebble key for a per-store metadata entry:
 // storePrefix || 'm' || metaKey.
 func metadataDBKey(storePrefix []byte, metaKey string) []byte {
-	out := make([]byte, 0, len(storePrefix)+1+len(metaKey))
-	out = append(out, storePrefix...)
-	out = append(out, 'm')
-	out = append(out, metaKey...)
-	return out
+	return metadataDBKeyInto(make([]byte, 0, len(storePrefix)+1+len(metaKey)), storePrefix, metaKey)
+}
+
+func metadataDBKeyInto(buf, storePrefix []byte, metaKey string) []byte {
+	buf = append(buf, storePrefix...)
+	buf = append(buf, 'm')
+	buf = append(buf, metaKey...)
+	return buf
 }
 
 // ─── varint primitives ───────────────────────────────────────────────────
@@ -177,12 +197,15 @@ func hashInner(version int64, height int8, size int64, left, right [32]byte) [32
 //
 //	varint(0) || varint(1) || EncodeBytes(key) || EncodeBytes(value)
 func encodeLeafNode(key, value []byte) []byte {
-	out := make([]byte, 0, 8+len(key)+len(value))
-	out = putVarint(out, 0) // height
-	out = putVarint(out, 1) // size
-	out = putBytes(out, key)
-	out = putBytes(out, value)
-	return out
+	return encodeLeafNodeInto(make([]byte, 0, 8+len(key)+len(value)), key, value)
+}
+
+func encodeLeafNodeInto(buf, key, value []byte) []byte {
+	buf = putVarint(buf, 0) // height
+	buf = putVarint(buf, 1) // size
+	buf = putBytes(buf, key)
+	buf = putBytes(buf, value)
+	return buf
 }
 
 // encodeInnerNode produces the bytes IAVL writes to pebble for a v1
@@ -199,18 +222,24 @@ func encodeLeafNode(key, value []byte) []byte {
 func encodeInnerNode(height int8, size int64, key []byte, hash [32]byte,
 	leftVersion int64, leftNonce uint32,
 	rightVersion int64, rightNonce uint32) []byte {
+	return encodeInnerNodeInto(make([]byte, 0, 96+len(key)),
+		height, size, key, hash, leftVersion, leftNonce, rightVersion, rightNonce)
+}
 
-	out := make([]byte, 0, 96+len(key))
-	out = putVarint(out, int64(height))
-	out = putVarint(out, size)
-	out = putBytes(out, key)
-	out = putHash32(out, hash[:])
-	out = putVarint(out, 0) // mode=0 (no legacy children)
-	out = putVarint(out, leftVersion)
-	out = putVarint(out, int64(leftNonce))
-	out = putVarint(out, rightVersion)
-	out = putVarint(out, int64(rightNonce))
-	return out
+func encodeInnerNodeInto(buf []byte,
+	height int8, size int64, key []byte, hash [32]byte,
+	leftVersion int64, leftNonce uint32,
+	rightVersion int64, rightNonce uint32) []byte {
+	buf = putVarint(buf, int64(height))
+	buf = putVarint(buf, size)
+	buf = putBytes(buf, key)
+	buf = putHash32(buf, hash[:])
+	buf = putVarint(buf, 0) // mode=0 (no legacy children)
+	buf = putVarint(buf, leftVersion)
+	buf = putVarint(buf, int64(leftNonce))
+	buf = putVarint(buf, rightVersion)
+	buf = putVarint(buf, int64(rightNonce))
+	return buf
 }
 
 // ─── fast-node encoding ──────────────────────────────────────────────────
@@ -224,10 +253,13 @@ func encodeInnerNode(height int8, size int64, key []byte, hash [32]byte,
 // these entries during import skips the expensive post-load fast-storage
 // upgrade pass.
 func encodeFastNode(version int64, value []byte) []byte {
-	out := make([]byte, 0, 16+len(value))
-	out = putVarint(out, version)
-	out = putBytes(out, value)
-	return out
+	return encodeFastNodeInto(make([]byte, 0, 16+len(value)), version, value)
+}
+
+func encodeFastNodeInto(buf []byte, version int64, value []byte) []byte {
+	buf = putVarint(buf, version)
+	buf = putBytes(buf, value)
+	return buf
 }
 
 // ─── per-store metadata ──────────────────────────────────────────────────

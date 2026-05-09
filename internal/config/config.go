@@ -30,6 +30,7 @@ type Config struct {
 	// [log] blocks.
 	Fetch     FetchTuning     `toml:"fetch"`
 	Import    ImportTuning    `toml:"import"`
+	Compact   CompactTuning   `toml:"compact"`
 	Bootstrap BootstrapTuning `toml:"bootstrap"`
 	Log       LogTuning       `toml:"log"`
 
@@ -52,8 +53,28 @@ type Chain struct {
 
 	Fetch     FetchTuning     `toml:"fetch"`
 	Import    ImportTuning    `toml:"import"`
+	Compact   CompactTuning   `toml:"compact"`
 	Bootstrap BootstrapTuning `toml:"bootstrap"`
 	Log       LogTuning       `toml:"log"`
+}
+
+// CompactTuning are pebble compaction knobs. They apply to:
+//
+//   - the standalone `malcom compact -dir <appdb>` command, and
+//   - `malcom snapshot import` when CompactDuringImport is enabled
+//     (off by default — see ImportTuning.CompactDuringImport).
+//
+// Default import behaviour is to write the snapshot in bulk-load mode
+// with auto-compactions disabled, then close the DB. The user runs
+// `malcom compact` separately, or lets gaiad's pebble auto-compact
+// at runtime. So these knobs typically only matter for the standalone
+// compact job.
+type CompactTuning struct {
+	// MaxConcurrentCompactions caps the number of pebble compaction
+	// goroutines. Default = runtime.NumCPU(). Compaction is largely
+	// I/O-bound on cosmos-scale chains; bumping past NumCPU rarely
+	// helps.
+	MaxConcurrentCompactions int `toml:"max_concurrent_compactions"`
 }
 
 // LogTuning maps onto internal/log.Tuning. Edit config.toml to surface
@@ -192,10 +213,28 @@ type FetchTuning struct {
 
 // ImportTuning maps onto snapshotimport.Options' tuning fields.
 type ImportTuning struct {
-	MemtableMB               int `toml:"memtable_mb"`
-	CacheMB                  int `toml:"cache_mb"`
+	MemtableMB int `toml:"memtable_mb"`
+	CacheMB    int `toml:"cache_mb"`
+	MinFreeGB  int `toml:"min_free_gb"`
+
+	// FlushSplitMB caps L0 SSTable size produced by memtable flushes.
+	// 0 = pebble default (4 MiB). Setting equal to memtable_mb yields
+	// ~1 SSTable per flush, which dramatically reduces L0 file count
+	// when CompactDuringImport is false (gaiad sees ~50 L0 files
+	// instead of thousands and auto-compacts more efficiently).
+	FlushSplitMB int `toml:"flush_split_mb"`
+
+	// CompactDuringImport enables pebble's auto-compactions while
+	// the import streams. Default false (bulk-load mode): compactions
+	// are deferred to a manual `malcom compact` pass or to gaiad's
+	// runtime auto-compactions. Setting true trades import wall time
+	// for less peak disk usage and a tighter LSM at end of import.
+	CompactDuringImport bool `toml:"compact_during_import"`
+
+	// MaxConcurrentCompactions is retained so old configs that set
+	// [import].max_concurrent_compactions still parse; the field is
+	// no longer consulted. Prefer [compact].max_concurrent_compactions.
 	MaxConcurrentCompactions int `toml:"max_concurrent_compactions"`
-	MinFreeGB                int `toml:"min_free_gb"`
 }
 
 // BootstrapTuning collects bootstrap's tuning knobs.
@@ -274,6 +313,7 @@ func (c *Config) Resolve(name string) (Chain, error) {
 	ch := Chain{
 		Fetch:     c.Fetch,
 		Import:    c.Import,
+		Compact:   c.Compact,
 		Bootstrap: c.Bootstrap,
 		Log:       c.Log,
 	}
@@ -300,6 +340,7 @@ func (c *Config) Resolve(name string) (Chain, error) {
 
 	applyFetchDefaults(&ch.Fetch)
 	applyImportDefaults(&ch.Import)
+	applyCompactDefaults(&ch.Compact)
 	applyBootstrapDefaults(&ch.Bootstrap)
 	applyLogDefaults(&ch.Log)
 

@@ -61,11 +61,19 @@ type Options struct {
 	// final compact + cleanup pass. Default 4.
 	MaxConcurrentCompactions int
 
-	// BulkLoad disables automatic L0→L1 compactions during the import
-	// stream and runs a single full-keyspace compact at the end.
-	// Default true. Disable on memory-constrained hosts that benefit
-	// from incremental compaction.
-	BulkLoad bool
+	// CompactDuringImport enables pebble's auto-compactions while the
+	// import streams. Default false (bulk-load mode): compactions are
+	// deferred to a manual `malcom compact` pass or to gaiad's
+	// runtime auto-compactions. Setting true trades import wall time
+	// for less peak disk usage and a tighter LSM at end of import.
+	CompactDuringImport bool
+
+	// FlushSplitMB caps L0 SSTable size from memtable flushes. 0 =
+	// pebble default (4 MiB). Setting equal to MemtableMB produces
+	// ~1 SSTable per memtable flush; with CompactDuringImport off
+	// this dramatically reduces the L0 file count gaiad sees on
+	// first open.
+	FlushSplitMB int
 
 	// Log receives structured progress events. nil → discard.
 	Log *slog.Logger
@@ -73,14 +81,20 @@ type Options struct {
 
 // Stats summarises a completed import. Returned by Import.
 type Stats struct {
-	Stores              []StoreInfo
-	Items               uint64
-	Extensions          int
-	ExtensionPayloads   int
-	Elapsed             time.Duration
-	StreamElapsed       time.Duration
-	FinalCompactElapsed time.Duration
-	CleanupElapsed      time.Duration
+	Stores            []StoreInfo
+	Items             uint64
+	Extensions        int
+	ExtensionPayloads int
+	Elapsed           time.Duration
+	StreamElapsed     time.Duration
+
+	// Sub-timing inside the stream phase. Time is sampled at chunk
+	// boundaries — each loop iteration accumulates one of three
+	// buckets, so the three sum to roughly StreamElapsed (small slack
+	// for the bookkeeping itself).
+	StreamDecodeElapsed time.Duration // proto decode of SnapshotItems off the wire
+	StreamIAVLElapsed   time.Duration // IAVL stack ops (addNode / finalize / hash)
+	StreamPebbleElapsed time.Duration // batch.Set + batch.Commit
 }
 
 // StoreInfo is declared in commitinfo.go (Name, Hash[32]byte).
@@ -126,15 +140,6 @@ func Import(opts Options) (*Stats, error) {
 	if maxCompact <= 0 {
 		maxCompact = 4
 	}
-	bulkLoad := opts.BulkLoad
-	if !opts.BulkLoad {
-		// Zero-value default differs from struct default — caller has
-		// to opt out explicitly via a sentinel field. Today we just
-		// always default to true; a "disable bulk-load" toggle can be
-		// added later if needed.
-		bulkLoad = true
-	}
-
 	t0 := time.Now()
 
 	// ─── output layout ───────────────────────────────────────────────
@@ -163,11 +168,20 @@ func Import(opts Options) (*Stats, error) {
 		MaxOpenFiles:                4096,
 		MaxConcurrentCompactions:    func() int { return maxCompact },
 		Logger:                      pebbleLog,
+		// L0 SSTables produced during bulk-load are throwaway — the
+		// post-import compact (`malcom compact`) or gaiad's runtime
+		// auto-compactions rewrite them into a snappy-compressed L6
+		// set. Skipping L0 compression saves ~10% of the stream's
+		// CPU budget. Deeper levels keep their default Snappy.
+		Levels: []pebble.LevelOptions{{Compression: pebble.NoCompression}},
 	}
-	if bulkLoad {
+	if !opts.CompactDuringImport {
 		popts.DisableAutomaticCompactions = true
 		popts.L0CompactionThreshold = 1024
 		popts.L0StopWritesThreshold = 4096
+	}
+	if opts.FlushSplitMB > 0 {
+		popts.FlushSplitBytes = int64(opts.FlushSplitMB) << 20
 	}
 	db, err := pebble.Open(appdbDir, popts)
 	if err != nil {
@@ -175,10 +189,21 @@ func Import(opts Options) (*Stats, error) {
 	}
 	// No defer Close — we explicitly Close before the cleanup reopen.
 
+	// Tmp dir for per-store fast-path SSTable Writers. The bulk-ingest
+	// path writes f/ entries to one SSTable per store, then atomically
+	// links them into the LSM via db.Ingest at end-of-store. Removed
+	// after Import returns.
+	ingestTmpDir := filepath.Join(opts.OutDir, "ingest-tmp")
+	if err := os.MkdirAll(ingestTmpDir, 0o755); err != nil {
+		_ = db.Close()
+		return nil, fmt.Errorf("mkdir ingest tmp: %w", err)
+	}
+	defer os.RemoveAll(ingestTmpDir)
+
 	// ─── run the streaming import ────────────────────────────────────
 	streamStart := time.Now()
 	stats := &Stats{}
-	stores, err := runImport(cr, db, opts.Height, extDir, stats, log)
+	stores, err := runImport(cr, db, opts.Height, extDir, ingestTmpDir, stats, log)
 	if err != nil {
 		_ = db.Close()
 		return nil, err
@@ -186,47 +211,18 @@ func Import(opts Options) (*Stats, error) {
 	stats.Stores = stores
 	stats.StreamElapsed = time.Since(streamStart).Truncate(time.Millisecond)
 
-	// ─── final compaction ────────────────────────────────────────────
-	t1 := time.Now()
-	log.Info("starting final compaction")
+	// Flush any remaining memtable data so the closed DB is durable
+	// without us running an explicit compact. The user runs `malcom
+	// compact -dir <appdb>` afterward (or lets gaiad's pebble
+	// auto-compact at runtime) to consolidate the LSM. Skipping the
+	// upfront compact saves ~2m wall on cosmoshub-4 — that work
+	// isn't gone, just deferred.
 	if err := db.Flush(); err != nil {
-		log.Warn("pre-compact flush failed", "err", err)
+		log.Warn("pre-close flush failed", "err", err)
 	}
-	if err := db.Compact([]byte{0x00}, []byte{0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff}, true); err != nil {
-		log.Warn("final compact failed", "err", err)
-	}
-	stats.FinalCompactElapsed = time.Since(t1).Truncate(time.Millisecond)
-	log.Info("final compaction complete", "elapsed", stats.FinalCompactElapsed)
-
 	if err := db.Close(); err != nil {
-		log.Warn("close after compact failed", "err", err)
+		log.Warn("close db failed", "err", err)
 	}
-
-	// ─── cleanup pass: reopen + Compact to reclaim orphan SSTs ───────
-	// On a fresh cosmoshub-4 import the in-process Compact above queues
-	// obsolete L0 files for deletion via pebble's cleanup manager, but
-	// those deletions don't always drain before Close. The next Open
-	// reclaims them via manifest replay — typically saves ~10 GiB.
-	t2 := time.Now()
-	log.Info("starting cleanup pass")
-	cleanup, err := pebble.Open(appdbDir, &pebble.Options{
-		MaxConcurrentCompactions: func() int { return maxCompact },
-		Logger:                   pebbleLog,
-	})
-	if err != nil {
-		return nil, fmt.Errorf("cleanup reopen: %w", err)
-	}
-	if err := cleanup.Flush(); err != nil {
-		log.Warn("cleanup flush failed", "err", err)
-	}
-	if err := cleanup.Compact([]byte{0x00}, []byte{0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff}, true); err != nil {
-		log.Warn("cleanup compact failed", "err", err)
-	}
-	if err := cleanup.Close(); err != nil {
-		log.Warn("cleanup close failed", "err", err)
-	}
-	stats.CleanupElapsed = time.Since(t2).Truncate(time.Millisecond)
-	log.Info("cleanup pass complete", "elapsed", stats.CleanupElapsed)
 
 	stats.Elapsed = time.Since(t0).Truncate(time.Millisecond)
 	log.Info("import complete",
