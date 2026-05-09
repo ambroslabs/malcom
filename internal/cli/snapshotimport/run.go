@@ -49,6 +49,7 @@ func Run(args []string) int {
 	parallel := fs.Bool("parallel", false, "use the parallel pipeline: decompress to temp file once, then process stores concurrently across workers")
 	parallelWorkers := fs.Int("workers", 0, "max concurrent store workers in -parallel mode (default = NumCPU)")
 	tempDir := fs.String("tmp-dir", "", "where to put the decompressed temp file in -parallel mode (default = -out dir; needs ~snapshot-decompressed-size of free space)")
+	waveParallel := fs.Bool("wave-parallel", false, "within-store wave-parallel hashing: each per-store worker spawns a hash worker pool to overlap iavl hash + encode work across cores. Helps single-store-dominated chains (bbn finality: ~-2 min vs async-only). Slightly regresses chains where multiple polestar stores run concurrent (osmosis cl/ibc/wasm). Default off.")
 	flushSplitMB := fs.Int("flush-split-mb", -1, "cap on L0 SSTable size from memtable flushes; -1 = use [import].flush_split_mb (defaults to memtable_mb)")
 	compactDuringImport := fs.Bool("compact-during-import", false, "enable pebble auto-compactions during import (default off; trades wall time for tighter end-of-import LSM)")
 	compactWorkers := fs.Int("compact-workers", 0, "override [compact].max_concurrent_compactions for this run (only meaningful when -compact-during-import is set)")
@@ -208,11 +209,15 @@ func Run(args []string) int {
 	var stats *snapshotimport.Stats
 	if *parallel {
 		stats, err = snapshotimport.ImportParallel(snapshotimport.ParallelOptions{
-			Options: importOpts,
-			Workers: *parallelWorkers,
-			TempDir: *tempDir,
+			Options:      importOpts,
+			Workers:      *parallelWorkers,
+			TempDir:      *tempDir,
+			WaveParallel: *waveParallel,
 		})
 	} else {
+		if *waveParallel {
+			log.Warn("-wave-parallel ignored without -parallel (wave-parallel only applies to per-store workers in the parallel pipeline)")
+		}
 		stats, err = snapshotimport.Import(importOpts)
 	}
 	if err != nil {

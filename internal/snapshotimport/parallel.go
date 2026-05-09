@@ -63,6 +63,17 @@ type ParallelOptions struct {
 	// TempDir holds the decompressed-stream temp file. Default =
 	// OutDir; the temp file is removed when ImportParallel returns.
 	TempDir string
+
+	// WaveParallel turns on within-store wave-parallel hashing per
+	// store: each per-store worker spawns a hash worker pool and
+	// dispatcher (see importer_par.go) so the IAVL hash + encode
+	// work overlaps across cores. Helps single-store-dominated
+	// chains (bbn finality: -2 min vs the async-only baseline);
+	// neutral on cosmoshub and slightly regresses osmosis (3 polestar
+	// stores running concurrent oversubscribe the inner-worker pool).
+	// Off by default; enable per chain via the `-wave-parallel` CLI
+	// flag when the polestar runs solo.
+	WaveParallel bool
 }
 
 // ImportParallel is the parallel sibling of Import. Same output, same
@@ -202,7 +213,7 @@ func ImportParallel(opts ParallelOptions) (*Stats, error) {
 	// all in-flight workers drain.
 	stage2Start := time.Now()
 	stores, parStats, err := stage2RunWorkersFromChan(
-		storeCh, tempPath, db, opts.Height, ingestTmpDir, log, workers)
+		storeCh, tempPath, db, opts.Height, ingestTmpDir, log, workers, opts.WaveParallel)
 	if err != nil {
 		_ = db.Close()
 		// Drain stage 1 to surface its error too if it had one.
@@ -472,7 +483,7 @@ func buildIndexFromReader(
 // store starts processing well before stage 1 finishes.
 func stage2RunWorkersFromChan(
 	storeCh <-chan StoreEntry, tempPath string, db *pebble.DB, height int64,
-	ingestTmpDir string, log *slog.Logger, numWorkers int,
+	ingestTmpDir string, log *slog.Logger, numWorkers int, waveParallel bool,
 ) ([]StoreInfo, *Stats, error) {
 
 	type workerOut struct {
@@ -509,7 +520,7 @@ func stage2RunWorkersFromChan(
 
 			for store := range storeCh {
 				info, items, ivl, pbl, err := processStoreSegment(
-					file, store, db, height, ing, log)
+					file, store, db, height, ing, log, waveParallel)
 				if err != nil {
 					resultsCh <- workerOut{err: fmt.Errorf("store %q: %w", store.Name, err)}
 					continue
@@ -541,12 +552,92 @@ func stage2RunWorkersFromChan(
 	return stores, stats, nil
 }
 
+// defaultParWorkers returns the per-store wave-parallel hash worker
+// count. NumCPU is reasonable: when other stores in the outer pool
+// are still running, the OS scheduler shares; when only one store
+// remains (= the polestar at the tail of the run, e.g. babylon's
+// finality), it can absorb the spare cores.
+func defaultParWorkers() int {
+	n := runtime.NumCPU()
+	if n < 1 {
+		return 1
+	}
+	return n
+}
+
+// asyncBatchWriter owns the pebble Commit work for one store. The
+// main loop submits filled batches; this goroutine drains them and
+// calls Commit + Close, freeing the main loop to keep building the
+// next batch (and its iavl hash work) while the previous one is
+// flushing. Buffered channel of 2 caps in-flight batches at 3
+// (building + queued + committing) ≈ 192 MiB peak per store at the
+// 64 MiB flush threshold.
+//
+// pebble.DB.Apply (called by Commit) serializes internally on a
+// single mutex, so multiple goroutines calling Commit don't increase
+// write throughput — the win is the overlap with the main loop's
+// iavl/parse work, not concurrent writes.
+type asyncBatchWriter struct {
+	db          *pebble.DB
+	ch          chan *pebble.Batch
+	wg          sync.WaitGroup
+	closeOnce   sync.Once
+	err         atomic.Pointer[error]
+	commitNanos atomic.Int64 // measured inside the writer goroutine
+}
+
+func newAsyncBatchWriter(db *pebble.DB) *asyncBatchWriter {
+	w := &asyncBatchWriter{
+		db: db,
+		ch: make(chan *pebble.Batch, 2),
+	}
+	w.wg.Add(1)
+	go w.run()
+	return w
+}
+
+func (w *asyncBatchWriter) run() {
+	defer w.wg.Done()
+	for batch := range w.ch {
+		t0 := time.Now()
+		if err := batch.Commit(pebble.NoSync); err != nil {
+			err = fmt.Errorf("async batch commit: %w", err)
+			w.err.CompareAndSwap(nil, &err)
+		}
+		batch.Close()
+		w.commitNanos.Add(time.Since(t0).Nanoseconds())
+	}
+}
+
+// submit hands ownership of a filled batch to the writer goroutine.
+// Returns the first earlier error if any; the batch is still queued
+// (Close is the writer's responsibility).
+func (w *asyncBatchWriter) submit(batch *pebble.Batch) error {
+	w.ch <- batch
+	if e := w.err.Load(); e != nil {
+		return *e
+	}
+	return nil
+}
+
+// drain closes the channel and blocks until all queued batches commit.
+// Idempotent — safe to call on error paths and again at end of normal
+// flow.
+func (w *asyncBatchWriter) drain() error {
+	w.closeOnce.Do(func() { close(w.ch) })
+	w.wg.Wait()
+	if e := w.err.Load(); e != nil {
+		return *e
+	}
+	return nil
+}
+
 // processStoreSegment runs the IAVL + ingest pipeline for one store
 // segment of the temp file. Returns the store's root hash + per-bucket
 // timings (for stats aggregation across workers).
 func processStoreSegment(
 	file *os.File, store StoreEntry, db *pebble.DB, height int64,
-	ing *fastIngester, log *slog.Logger,
+	ing *fastIngester, log *slog.Logger, waveParallel bool,
 ) (StoreInfo, uint64, int64, int64, error) {
 
 	var iavlNanos, pebbleNanos int64
@@ -559,22 +650,27 @@ func processStoreSegment(
 	br := bufio.NewReaderSize(r, 1<<20)
 	sr := newSnapReader(br)
 
+	// Async batch commit pipeline: the main thread keeps building the
+	// next batch while a writer goroutine commits the previous one.
+	// Buffer of 2 caps in-flight batches at 3 (current + queued +
+	// committing) ≈ 192 MiB peak per store. Pebble's DB.Apply
+	// serializes internally, so multiple Commits don't race; the win is
+	// overlap with iavl/parse work, not write parallelism.
 	const flushBytes = 64 << 20
+	bw := newAsyncBatchWriter(db)
+	defer bw.drain() // idempotent; ensures the writer goroutine is reaped on error returns
 	batch := db.NewBatch()
 	batchBytes := 0
 	flush := func() error {
 		if batchBytes == 0 {
 			return nil
 		}
-		err := batch.Commit(pebble.NoSync)
-		batch.Close()
+		err := bw.submit(batch)
 		batch = db.NewBatch()
 		batchBytes = 0
 		return err
 	}
 	set := func(key, value []byte) error {
-		t0 := time.Now()
-		defer func() { pebbleNanos += time.Since(t0).Nanoseconds() }()
 		if err := batch.Set(key, value, nil); err != nil {
 			return err
 		}
@@ -596,40 +692,128 @@ func processStoreSegment(
 	si := newStoreImporter(store.Name, height)
 	storeStart := time.Now()
 	var items uint64
-	for {
-		item, err := sr.Next()
-		if err == io.EOF {
-			break
+
+	if waveParallel {
+		// Wave-parallel mode: spawn a writer goroutine that drains the
+		// per-store writeQ into the batch, plus the storeImporter's hash
+		// worker pool. The writer goroutine is the SOLE caller of `set`
+		// during the streaming phase, so pebble.Batch's single-writer
+		// requirement is satisfied even with N concurrent hash workers
+		// pushing to writeQ.
+		//
+		// Decoder pipeline: a separate goroutine reads sr.Next() and
+		// pushes decoded items to itemQ. The main loop reads from itemQ
+		// instead of calling sr.Next() inline. Profiling showed sr.Next
+		// at ~33% of the per-store main-goroutine CPU on bbn finality;
+		// pulling that off the main goroutine lets the hash-worker pool
+		// run closer to its throughput ceiling on a single-store-dominated
+		// chain.
+		parWorkers := defaultParWorkers()
+		writeQ := make(chan writeEnt, 4096)
+		writerDone := make(chan error, 1)
+		go func() {
+			var werr error
+			for ent := range writeQ {
+				if werr != nil {
+					continue
+				}
+				if err := set(ent.key, ent.encoded); err != nil {
+					werr = err
+				}
+			}
+			writerDone <- werr
+		}()
+		si.enableWaveParallel(parWorkers, writeQ)
+
+		const itemQBuf = 4096
+		itemQ := make(chan *snapItem, itemQBuf)
+		decErr := make(chan error, 1)
+		go func() {
+			defer close(itemQ)
+			for {
+				item, err := sr.Next()
+				if err != nil {
+					decErr <- err
+					return
+				}
+				itemQ <- item
+			}
+		}()
+
+		for item := range itemQ {
+			switch item.Type {
+			case itemTypeStore:
+				if item.StoreName != store.Name {
+					_ = batch.Close()
+					return StoreInfo{}, 0, 0, 0, fmt.Errorf(
+						"expected StoreItem %q, got %q at offset %d",
+						store.Name, item.StoreName, store.DecompressedStart)
+				}
+			case itemTypeIAVL:
+				if err := si.addNode(set, setFast,
+					item.IAVLHeight, item.IAVLVersion,
+					item.IAVLKey, item.IAVLValue); err != nil {
+					_ = batch.Close()
+					return StoreInfo{}, 0, 0, 0, fmt.Errorf("add node: %w", err)
+				}
+			default:
+				_ = batch.Close()
+				return StoreInfo{}, 0, 0, 0, fmt.Errorf(
+					"unexpected item type %d in store segment", item.Type)
+			}
+			items++
 		}
-		if err != nil {
+		if err := <-decErr; err != io.EOF {
 			_ = batch.Close()
 			return StoreInfo{}, 0, 0, 0, fmt.Errorf("read item: %w", err)
 		}
-		switch item.Type {
-		case itemTypeStore:
-			// First item must be the StoreItem marking this segment.
-			if item.StoreName != store.Name {
+
+		if err := si.finishStreaming(); err != nil {
+			_ = batch.Close()
+			return StoreInfo{}, 0, 0, 0, fmt.Errorf("finish streaming: %w", err)
+		}
+		close(writeQ)
+		if werr := <-writerDone; werr != nil {
+			_ = batch.Close()
+			return StoreInfo{}, 0, 0, 0, fmt.Errorf("writer goroutine: %w", werr)
+		}
+	} else {
+		// Synchronous path: main thread does decode + addNode inline.
+		// No hash worker pool, no writer goroutine — just async batch
+		// commits via the existing asyncBatchWriter from PR #71.
+		for {
+			item, err := sr.Next()
+			if err == io.EOF {
+				break
+			}
+			if err != nil {
+				_ = batch.Close()
+				return StoreInfo{}, 0, 0, 0, fmt.Errorf("read item: %w", err)
+			}
+			switch item.Type {
+			case itemTypeStore:
+				if item.StoreName != store.Name {
+					_ = batch.Close()
+					return StoreInfo{}, 0, 0, 0, fmt.Errorf(
+						"expected StoreItem %q, got %q at offset %d",
+						store.Name, item.StoreName, store.DecompressedStart)
+				}
+			case itemTypeIAVL:
+				if err := si.addNode(set, setFast,
+					item.IAVLHeight, item.IAVLVersion,
+					item.IAVLKey, item.IAVLValue); err != nil {
+					_ = batch.Close()
+					return StoreInfo{}, 0, 0, 0, fmt.Errorf("add node: %w", err)
+				}
+			default:
 				_ = batch.Close()
 				return StoreInfo{}, 0, 0, 0, fmt.Errorf(
-					"expected StoreItem %q, got %q at offset %d",
-					store.Name, item.StoreName, store.DecompressedStart)
+					"unexpected item type %d in store segment", item.Type)
 			}
-		case itemTypeIAVL:
-			ivStart := time.Now()
-			if err := si.addNode(set, setFast,
-				item.IAVLHeight, item.IAVLVersion,
-				item.IAVLKey, item.IAVLValue); err != nil {
-				_ = batch.Close()
-				return StoreInfo{}, 0, 0, 0, fmt.Errorf("add node: %w", err)
-			}
-			iavlNanos += time.Since(ivStart).Nanoseconds()
-		default:
-			_ = batch.Close()
-			return StoreInfo{}, 0, 0, 0, fmt.Errorf(
-				"unexpected item type %d in store segment", item.Type)
+			items++
 		}
-		items++
 	}
+
 	hash, err := si.finalize(set)
 	if err != nil {
 		_ = batch.Close()
@@ -639,8 +823,18 @@ func processStoreSegment(
 		return StoreInfo{}, 0, 0, 0, fmt.Errorf("flush final: %w", err)
 	}
 	batch.Close()
+	if err := bw.drain(); err != nil {
+		return StoreInfo{}, 0, 0, 0, fmt.Errorf("drain async writer: %w", err)
+	}
 	if err := ing.ingestStore(store.Name); err != nil {
 		return StoreInfo{}, 0, 0, 0, fmt.Errorf("ingest fast: %w", err)
+	}
+
+	storeWall := time.Since(storeStart).Nanoseconds()
+	pebbleNanos = bw.commitNanos.Load()
+	iavlNanos = storeWall - pebbleNanos
+	if iavlNanos < 0 {
+		iavlNanos = 0
 	}
 
 	log.Info("store complete",
@@ -648,7 +842,7 @@ func processStoreSegment(
 		"items", si.itemCount,
 		"leaves", si.leafCount,
 		"inner", si.innerCount,
-		"elapsed", time.Since(storeStart).Truncate(time.Millisecond))
+		"elapsed", time.Duration(storeWall).Truncate(time.Millisecond))
 
 	return StoreInfo{Name: store.Name, Hash: hash}, items, iavlNanos, pebbleNanos, nil
 }

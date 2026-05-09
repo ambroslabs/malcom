@@ -51,7 +51,17 @@ type storeImporter struct {
 	// nonces[v] = next nonce to assign for a node at version v. The
 	// IAVL convention reserves nonce=1 for the root, so for non-root
 	// nodes we start counting at 2.
-	nonces map[int64]uint32
+	//
+	// nonceCacheVersion + nonceCacheCounter keep the most-recent
+	// (version, counter) pair out of the map so that consecutive
+	// nodes at the same version (the common case — bursts of leaves
+	// at the snapshot height) skip both the map lookup and the map
+	// write. Profile on bbn finality showed nextNonce at ~15% of the
+	// main-goroutine CPU before this; the cache cuts it to a single
+	// uint32 increment for ~99% of calls.
+	nonces            map[int64]uint32
+	nonceCacheVersion int64  // 0 = empty cache
+	nonceCacheCounter uint32
 
 	// stack of completed-but-not-yet-consumed subtrees. Inner nodes
 	// pop the top two; leaves push themselves.
@@ -84,6 +94,13 @@ type storeImporter struct {
 	itemCount  uint64
 	leafCount  uint64
 	innerCount uint64
+
+	// Wave-parallel state, set by enableWaveParallel. When non-nil,
+	// addNode dispatches to the wave-parallel path (deferred hashing
+	// across a worker pool) and the parStack is used in place of stack.
+	// See importer_par.go.
+	par      *parState
+	parStack []*parFrame
 }
 
 func newStoreImporter(storeName string, height int64) *storeImporter {
@@ -109,6 +126,15 @@ func (s *storeImporter) addNode(set, setFast func(key, value []byte) error,
 	height int8, version int64, key, value []byte) error {
 
 	s.itemCount++
+
+	// Wave-parallel path: defer hashing to the worker pool.
+	if s.parallelEnabled() {
+		if height == 0 {
+			return s.addLeafPar(setFast, version, key, value)
+		}
+		return s.addInnerPar(version, height, key)
+	}
+
 	if height == 0 {
 		// ─── leaf ────────────────────────────────────────────────
 		nonce := s.nextNonce(version)
@@ -196,14 +222,29 @@ func (s *storeImporter) closesPair(height int8) bool {
 // nextNonce reserves the next nonce for a node at `version`. The first
 // allocated nonce for any version is 2 — nonce=1 is reserved for the
 // root node, which is re-stamped at finalize time.
+//
+// Single-version cache: most consecutive calls share the same version
+// (a leaf burst within one snapshot height), so we keep the active
+// counter in nonceCacheCounter and only round-trip through the map on
+// version transitions. Profiling showed this path at ~15% of main-
+// goroutine CPU on bbn finality; cached path is a single increment.
 func (s *storeImporter) nextNonce(version int64) uint32 {
-	cur := s.nonces[version]
-	if cur == 0 {
-		cur = 1 // start at 1 so the first allocated nonce is 2
+	if version != s.nonceCacheVersion {
+		// Flush the prior cache back to the map so a subsequent
+		// transition (or a re-visit of an older version) reads the
+		// up-to-date counter.
+		if s.nonceCacheVersion != 0 {
+			s.nonces[s.nonceCacheVersion] = s.nonceCacheCounter
+		}
+		s.nonceCacheVersion = version
+		cur := s.nonces[version]
+		if cur == 0 {
+			cur = 1 // start at 1 so the first allocated nonce is 2
+		}
+		s.nonceCacheCounter = cur
 	}
-	cur++
-	s.nonces[version] = cur
-	return cur
+	s.nonceCacheCounter++
+	return s.nonceCacheCounter
 }
 
 func (s *storeImporter) topHeights() []int8 {
@@ -228,6 +269,12 @@ func (s *storeImporter) topHeights() []int8 {
 // (hashWithCount returns sha256.New().Sum(nil) when node == nil), and
 // what the network's AppHash assumes. See emptyIAVLTreeHash.
 func (s *storeImporter) finalize(set func(key, value []byte) error) ([]byte, error) {
+	// Wave-parallel path: callers must have called finishStreaming +
+	// drained writeQ before reaching here. finalizePar lives in
+	// importer_par.go.
+	if s.parallelEnabled() {
+		return s.finalizePar(set)
+	}
 	if len(s.stack) == 0 {
 		// Empty store — write an empty root marker (gaiad reads this
 		// via nodeDBKey(snapshotHeight, 1) and tolerates an empty value).
