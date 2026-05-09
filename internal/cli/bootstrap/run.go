@@ -355,7 +355,7 @@ func Run(args []string) int {
 	// 8. Place wasm extension payloads (if any).
 	srcExt := filepath.Join(*appdb, "extensions")
 	if _, err := os.Stat(srcExt); err == nil {
-		if err := placeWasmPayloads(srcExt, outRoot, log); err != nil {
+		if err := placeWasmPayloads(srcExt, outRoot, ch.ChainID, log); err != nil {
 			log.Error("place wasm payloads", "err", err)
 			return 1
 		}

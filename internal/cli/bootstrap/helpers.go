@@ -76,11 +76,17 @@ func cloneTree(srcDir, dstDir string) error {
 // chain-registry's codebase.cosmwasm.version. Today every supported
 // chain uses the modern layout, so we keep it simple.
 //
+// Per-chain wasm dir overrides live in wasmDirByChainID — chains whose
+// daemon configures wasmd's BaseDir off the default (osmosis-1's
+// `<home>/wasm/wasm`) need their bytecode placed accordingly, otherwise
+// startup panics with "pinning contract failed". Default of empty
+// string falls through to the modern wasmd layout.
+//
 // Unrecognized extension dirs (anything other than `wasm` /
 // `08-wasm`) cause a hard error rather than a silent skip — silently
 // skipping produces a daemon that boots with missing state and
 // panics later.
-func placeWasmPayloads(extDir, gaiaRoot string, log *slog.Logger) error {
+func placeWasmPayloads(extDir, gaiaRoot, chainID string, log *slog.Logger) error {
 	entries, err := os.ReadDir(extDir)
 	if err != nil {
 		return fmt.Errorf("read extensions dir: %w", err)
@@ -91,7 +97,11 @@ func placeWasmPayloads(extDir, gaiaRoot string, log *slog.Logger) error {
 		}
 		switch e.Name() {
 		case "wasm":
-			dst := filepath.Join(gaiaRoot, "wasm", "state", "wasm")
+			sub := wasmDirByChainID[chainID]
+			if sub == "" {
+				sub = "wasm/state/wasm"
+			}
+			dst := filepath.Join(gaiaRoot, sub)
 			if err := placeOneExt(filepath.Join(extDir, e.Name()), dst, log); err != nil {
 				return fmt.Errorf("wasm extension: %w", err)
 			}
@@ -105,6 +115,18 @@ func placeWasmPayloads(extDir, gaiaRoot string, log *slog.Logger) error {
 		}
 	}
 	return nil
+}
+
+// wasmDirByChainID overrides the default `wasm/state/wasm` BaseDir for
+// chains that point wasmd elsewhere. The values are paths relative to
+// the chain home; the bytecode goes at `<gaiaRoot>/<value>/<sha256>`.
+//
+// osmosis-1 sets wasmd's BaseDir to `<home>/wasm/wasm` (so the actual
+// bytecode subdir is `<home>/wasm/wasm/state/wasm`), confirmed
+// empirically by watching osmosisd auto-create `<home>/wasm/wasm/cache/`
+// at first start. Other chains' overrides land here as we hit them.
+var wasmDirByChainID = map[string]string{
+	"osmosis-1": "wasm/wasm/state/wasm",
 }
 
 // placeOneExt iterates payload files in srcDir, gunzips each, hashes
