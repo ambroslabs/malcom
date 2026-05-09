@@ -7,10 +7,13 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"log/slog"
 	"os"
 	"path/filepath"
 
 	"github.com/cockroachdb/pebble"
+
+	malcomlog "github.com/zrbecker/cosmos-p2p/internal/log"
 )
 
 // StateSyncApplyStats summarises the result of an ApplyStateSync run.
@@ -36,8 +39,11 @@ type StateSyncApplyStats struct {
 //
 // Disk requirements (under tmpDir): ~25 GB for the Pebble base index
 // (each base item stored under its uint64 index for random lookup).
-func ApplyStateSync(baseDir, diffPath, outDir, tmpDir string) (StateSyncApplyStats, error) {
+func ApplyStateSync(baseDir, diffPath, outDir, tmpDir string, log *slog.Logger) (StateSyncApplyStats, error) {
 	var stats StateSyncApplyStats
+	if log == nil {
+		log = slog.New(slog.DiscardHandler)
+	}
 
 	df, err := os.Open(diffPath)
 	if err != nil {
@@ -64,6 +70,7 @@ func ApplyStateSync(baseDir, diffPath, outDir, tmpDir string) (StateSyncApplySta
 		DisableWAL:   true,
 		MemTableSize: 64 << 20,
 		Cache:        pebble.NewCache(256 << 20),
+		Logger:       malcomlog.PebbleShim(log.With("module", "pebble")),
 	})
 	if err != nil {
 		return stats, fmt.Errorf("open pebble: %w", err)

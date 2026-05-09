@@ -220,6 +220,18 @@ func Run(args []string) int {
 		return 1
 	}
 
+	appdbMeta := snapshotimport.AppDBMeta{
+		ChainID:               ch.ChainID,
+		Height:                *height,
+		ImportedAt:            time.Now().UTC(),
+		SourceSnapshotHashHex: meta.HashHex,
+		DBBackend:             snapshotimport.DBBackendPebble,
+	}
+	if err := snapshotimport.WriteAppDBMeta(outDir, appdbMeta); err != nil {
+		log.Error("write appdb meta", "err", err)
+		return 1
+	}
+
 	finalDB := filepath.Join(outDir, "application.db")
 	dbBytes := uint64(0)
 	if size, err := dirSize(finalDB); err == nil {
