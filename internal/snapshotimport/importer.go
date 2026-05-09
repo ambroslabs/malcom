@@ -11,6 +11,7 @@ package snapshotimport
 
 import (
 	"context"
+	"crypto/sha256"
 	"encoding/binary"
 	"fmt"
 	"io"
@@ -19,6 +20,18 @@ import (
 
 	"github.com/cockroachdb/pebble"
 )
+
+// emptyIAVLTreeHash is the cosmos-sdk iavl convention for the hash of
+// a tree with no nodes: sha256(""). The CommitInfo.Hash() multistore
+// merkle then double-hashes this in simpleMap.Set, so emitting nil or
+// 32 zeros for an empty store would land on a different AppHash than
+// the chain expects. This constant lets the importer keep its hash
+// shape uniformly 32 bytes while staying consensus-correct for stores
+// whose IAVL tree happens to be empty at snapshot time.
+//
+// Reference: github.com/cosmos/iavl@v1.2.2/node.go hashWithCount —
+// "if node == nil { return sha256.New().Sum(nil) }".
+var emptyIAVLTreeHash = sha256.Sum256(nil)
 
 // frame is one stack entry. Fixed 53 bytes, packed.
 type frame struct {
@@ -208,20 +221,24 @@ func (s *storeImporter) topHeights() []int8 {
 // (snapshotHeight, 1) → (rootVersion, 1) so gaiad's LoadVersion(height)
 // can find the root.
 //
-// Returns the merkle root hash of the store, suitable for inclusion in
-// the global commit-info.
-func (s *storeImporter) finalize(set func(key, value []byte) error) ([32]byte, error) {
+// Returns the merkle root hash of the store, suitable for inclusion
+// in the global commit-info. For a store whose IAVL tree had zero
+// nodes in the snapshot, the returned hash is sha256("") rather than
+// nil — that's the value cosmos-sdk's iavl produces for an empty tree
+// (hashWithCount returns sha256.New().Sum(nil) when node == nil), and
+// what the network's AppHash assumes. See emptyIAVLTreeHash.
+func (s *storeImporter) finalize(set func(key, value []byte) error) ([]byte, error) {
 	if len(s.stack) == 0 {
 		// Empty store — write an empty root marker (gaiad reads this
 		// via nodeDBKey(snapshotHeight, 1) and tolerates an empty value).
 		s.keyScratch = nodeDBKeyInto(s.keyScratch[:0], s.storePrefix, s.height, 1)
 		if err := set(s.keyScratch, nil); err != nil {
-			return [32]byte{}, fmt.Errorf("set empty root marker: %w", err)
+			return nil, fmt.Errorf("set empty root marker: %w", err)
 		}
-		return [32]byte{}, nil
+		return emptyIAVLTreeHash[:], nil
 	}
 	if len(s.stack) != 1 {
-		return [32]byte{}, fmt.Errorf("invalid stream: stack has %d roots, expected 1",
+		return nil, fmt.Errorf("invalid stream: stack has %d roots, expected 1",
 			len(s.stack))
 	}
 
@@ -246,7 +263,7 @@ func (s *storeImporter) finalize(set func(key, value []byte) error) ([32]byte, e
 	// the same byte sequence is valid at any storage location.
 	s.keyScratch = nodeDBKeyInto(s.keyScratch[:0], s.storePrefix, root.version, 1)
 	if err := set(s.keyScratch, s.lastIavlBytes); err != nil {
-		return [32]byte{}, fmt.Errorf("set canonical root at (rootVersion, 1): %w", err)
+		return nil, fmt.Errorf("set canonical root at (rootVersion, 1): %w", err)
 	}
 
 	// If the snapshot's "current version" (s.height) differs from the
@@ -268,7 +285,7 @@ func (s *storeImporter) finalize(set func(key, value []byte) error) ([32]byte, e
 		binary.BigEndian.PutUint32(redirectVal[9:], 1)
 		s.keyScratch = nodeDBKeyInto(s.keyScratch[:0], s.storePrefix, s.height, 1)
 		if err := set(s.keyScratch, redirectVal[:]); err != nil {
-			return [32]byte{}, fmt.Errorf("set root redirect at (snapshotHeight, 1): %w", err)
+			return nil, fmt.Errorf("set root redirect at (snapshotHeight, 1): %w", err)
 		}
 	}
 
@@ -278,10 +295,10 @@ func (s *storeImporter) finalize(set func(key, value []byte) error) ([32]byte, e
 		fastStorageVersionValue, fastStorageVersionDelimiter, s.height))
 	s.keyScratch = metadataDBKeyInto(s.keyScratch[:0], s.storePrefix, "storage_version")
 	if err := set(s.keyScratch, metaVal); err != nil {
-		return [32]byte{}, fmt.Errorf("set storage_version marker: %w", err)
+		return nil, fmt.Errorf("set storage_version marker: %w", err)
 	}
 
-	return root.hash, nil
+	return root.hash[:], nil
 }
 
 // ─── driver ──────────────────────────────────────────────────────────────
