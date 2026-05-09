@@ -158,9 +158,17 @@ func walkBackward(
 	jumps := 0
 	jumpCapLogged := false
 
+	// dispatch asks every peer that's offered a snapshot at height ≥
+	// target (capped at MaxHeight) to send chunk-0. Range-matching —
+	// rather than insisting on exact-height matches — lets chains
+	// whose snapshot heights aren't multiples of SnapshotInterval
+	// (osmosis publishes mid-interval) match at the natural walk
+	// step. atOrAbove sorts descending, so the freshest in-range
+	// offer's peers are asked first; whichever chunk-0 verifies
+	// first wins.
 	dispatch := func(target uint64) int {
 		n := 0
-		for _, e := range offers.at(target) {
+		for _, e := range offers.atOrAbove(target, cfg.MaxHeight) {
 			for pid := range e.Offer.Peers {
 				ak := askKey(pid, e.Key)
 				if asked[ak] {
@@ -253,10 +261,17 @@ func walkBackward(
 						jumpCapLogged = true
 					}
 				}
-				if ev.Snapshot.Height == target {
+				// Range-match: any offer at height >= target (and within
+				// the upper window) is dispatchable. dispatch's `asked`
+				// map dedupes against earlier asks to the same peer.
+				if ev.Snapshot.Height >= target &&
+					(cfg.MaxHeight == 0 || ev.Snapshot.Height <= cfg.MaxHeight) {
 					n := dispatch(target)
 					log.Debug("walk dispatch on offer match",
-						"target", target, "asked", n, "peer", ev.PeerID)
+						"target", target,
+						"offer_height", ev.Snapshot.Height,
+						"asked", n,
+						"peer", ev.PeerID)
 				}
 			case ev, ok := <-sub.Chunk:
 				if !ok {
@@ -274,7 +289,16 @@ func walkBackward(
 					"missing", ev.Chunk.Missing,
 					"bytes", len(ev.Chunk.Bytes),
 					"peer", ev.PeerID)
-				if ev.Chunk.Index != 0 || ev.Chunk.Height != target {
+				// Accept chunk-0 from any height in [target, MaxHeight] —
+				// the dispatch fan-out asked peers about offers in the
+				// same range, so this is the symmetric receive path.
+				// Chunks below target or above the window are leftovers
+				// from prior walk iterations / out-of-window peers and
+				// get dropped.
+				if ev.Chunk.Index != 0 || ev.Chunk.Height < target {
+					continue
+				}
+				if cfg.MaxHeight != 0 && ev.Chunk.Height > cfg.MaxHeight {
 					continue
 				}
 				if ev.Chunk.Missing || len(ev.Chunk.Bytes) == 0 {
@@ -284,10 +308,13 @@ func walkBackward(
 				// metadata.chunk_hashes[0]. ChunkRequest carries no hash,
 				// so the responder might be serving any of several offers
 				// with the same (height, format). The first whose hash[0]
-				// matches is the offer we accept.
+				// matches is the offer we accept. We look up offers at
+				// the chunk's reported height (not target), since with
+				// range dispatch the chunk's actual height may be
+				// strictly above target.
 				var matched *snapshotOffer
 				var lastErr error
-				for _, e := range offers.at(target) {
+				for _, e := range offers.at(ev.Chunk.Height) {
 					if e.Offer.Format != ev.Chunk.Format {
 						continue
 					}
@@ -305,7 +332,7 @@ func walkBackward(
 					// advertised metadata. Ban and keep waiting on
 					// this height for another peer's response.
 					log.Error("chunk-0 verify failed; banning peer",
-						"peer", ev.PeerID, "height", target, "err", lastErr)
+						"peer", ev.PeerID, "height", ev.Chunk.Height, "err", lastErr)
 					if watch != nil {
 						if peer := sw.Peers().Get(p2p.ID(ev.PeerID)); peer != nil {
 							watch.banPeer(peer, "chunk-0 hash mismatch")
@@ -316,7 +343,11 @@ func walkBackward(
 				accepted = matched
 				acceptedChunk0 = ev.Chunk.Bytes
 				responder = p2p.ID(ev.PeerID)
-				log.Debug("walk accepting", "height", target, "format", matched.Format, "peer", ev.PeerID)
+				log.Debug("walk accepting",
+					"target", target,
+					"chunk_height", ev.Chunk.Height,
+					"format", matched.Format,
+					"peer", ev.PeerID)
 				deadline.Stop()
 				break heightLoop
 			}
