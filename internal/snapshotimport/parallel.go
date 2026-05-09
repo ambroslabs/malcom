@@ -541,6 +541,73 @@ func stage2RunWorkersFromChan(
 	return stores, stats, nil
 }
 
+// asyncBatchWriter owns the pebble Commit work for one store. The
+// main loop submits filled batches; this goroutine drains them and
+// calls Commit + Close, freeing the main loop to keep building the
+// next batch (and its iavl hash work) while the previous one is
+// flushing. Buffered channel of 2 caps in-flight batches at 3
+// (building + queued + committing) ≈ 192 MiB peak per store at the
+// 64 MiB flush threshold.
+//
+// pebble.DB.Apply (called by Commit) serializes internally on a
+// single mutex, so multiple goroutines calling Commit don't increase
+// write throughput — the win is the overlap with the main loop's
+// iavl/parse work, not concurrent writes.
+type asyncBatchWriter struct {
+	db          *pebble.DB
+	ch          chan *pebble.Batch
+	wg          sync.WaitGroup
+	closeOnce   sync.Once
+	err         atomic.Pointer[error]
+	commitNanos atomic.Int64 // measured inside the writer goroutine
+}
+
+func newAsyncBatchWriter(db *pebble.DB) *asyncBatchWriter {
+	w := &asyncBatchWriter{
+		db: db,
+		ch: make(chan *pebble.Batch, 2),
+	}
+	w.wg.Add(1)
+	go w.run()
+	return w
+}
+
+func (w *asyncBatchWriter) run() {
+	defer w.wg.Done()
+	for batch := range w.ch {
+		t0 := time.Now()
+		if err := batch.Commit(pebble.NoSync); err != nil {
+			err = fmt.Errorf("async batch commit: %w", err)
+			w.err.CompareAndSwap(nil, &err)
+		}
+		batch.Close()
+		w.commitNanos.Add(time.Since(t0).Nanoseconds())
+	}
+}
+
+// submit hands ownership of a filled batch to the writer goroutine.
+// Returns the first earlier error if any; the batch is still queued
+// (Close is the writer's responsibility).
+func (w *asyncBatchWriter) submit(batch *pebble.Batch) error {
+	w.ch <- batch
+	if e := w.err.Load(); e != nil {
+		return *e
+	}
+	return nil
+}
+
+// drain closes the channel and blocks until all queued batches commit.
+// Idempotent — safe to call on error paths and again at end of normal
+// flow.
+func (w *asyncBatchWriter) drain() error {
+	w.closeOnce.Do(func() { close(w.ch) })
+	w.wg.Wait()
+	if e := w.err.Load(); e != nil {
+		return *e
+	}
+	return nil
+}
+
 // processStoreSegment runs the IAVL + ingest pipeline for one store
 // segment of the temp file. Returns the store's root hash + per-bucket
 // timings (for stats aggregation across workers).
@@ -559,22 +626,27 @@ func processStoreSegment(
 	br := bufio.NewReaderSize(r, 1<<20)
 	sr := newSnapReader(br)
 
+	// Async batch commit pipeline: the main thread keeps building the
+	// next batch while a writer goroutine commits the previous one.
+	// Buffer of 2 caps in-flight batches at 3 (current + queued +
+	// committing) ≈ 192 MiB peak per store. Pebble's DB.Apply
+	// serializes internally, so multiple Commits don't race; the win is
+	// overlap with iavl/parse work, not write parallelism.
 	const flushBytes = 64 << 20
+	bw := newAsyncBatchWriter(db)
+	defer bw.drain() // idempotent; ensures the writer goroutine is reaped on error returns
 	batch := db.NewBatch()
 	batchBytes := 0
 	flush := func() error {
 		if batchBytes == 0 {
 			return nil
 		}
-		err := batch.Commit(pebble.NoSync)
-		batch.Close()
+		err := bw.submit(batch)
 		batch = db.NewBatch()
 		batchBytes = 0
 		return err
 	}
 	set := func(key, value []byte) error {
-		t0 := time.Now()
-		defer func() { pebbleNanos += time.Since(t0).Nanoseconds() }()
 		if err := batch.Set(key, value, nil); err != nil {
 			return err
 		}
@@ -615,14 +687,12 @@ func processStoreSegment(
 					store.Name, item.StoreName, store.DecompressedStart)
 			}
 		case itemTypeIAVL:
-			ivStart := time.Now()
 			if err := si.addNode(set, setFast,
 				item.IAVLHeight, item.IAVLVersion,
 				item.IAVLKey, item.IAVLValue); err != nil {
 				_ = batch.Close()
 				return StoreInfo{}, 0, 0, 0, fmt.Errorf("add node: %w", err)
 			}
-			iavlNanos += time.Since(ivStart).Nanoseconds()
 		default:
 			_ = batch.Close()
 			return StoreInfo{}, 0, 0, 0, fmt.Errorf(
@@ -639,8 +709,18 @@ func processStoreSegment(
 		return StoreInfo{}, 0, 0, 0, fmt.Errorf("flush final: %w", err)
 	}
 	batch.Close()
+	if err := bw.drain(); err != nil {
+		return StoreInfo{}, 0, 0, 0, fmt.Errorf("drain async writer: %w", err)
+	}
 	if err := ing.ingestStore(store.Name); err != nil {
 		return StoreInfo{}, 0, 0, 0, fmt.Errorf("ingest fast: %w", err)
+	}
+
+	storeWall := time.Since(storeStart).Nanoseconds()
+	pebbleNanos = bw.commitNanos.Load()
+	iavlNanos = storeWall - pebbleNanos
+	if iavlNanos < 0 {
+		iavlNanos = 0
 	}
 
 	log.Info("store complete",
@@ -648,7 +728,7 @@ func processStoreSegment(
 		"items", si.itemCount,
 		"leaves", si.leafCount,
 		"inner", si.innerCount,
-		"elapsed", time.Since(storeStart).Truncate(time.Millisecond))
+		"elapsed", time.Duration(storeWall).Truncate(time.Millisecond))
 
 	return StoreInfo{Name: store.Name, Hash: hash}, items, iavlNanos, pebbleNanos, nil
 }
