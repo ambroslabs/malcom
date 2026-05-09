@@ -146,6 +146,7 @@ addrbook    = "error"   # cometbft addrbook — real errors, suppress info chatt
 p2p         = "silent"  # cometbft switch — peer EOFs / disconnects are expected, not actionable
 mconnection = "silent"  # cometbft mconn — packet byte-count dumps
 pex         = "silent"  # PEX gossip (covers our internal/pex and cometbft's)
+statesync   = "silent"  # BaseService start/stop + "send queue full" on slow peers, not actionable
 `
 }
 

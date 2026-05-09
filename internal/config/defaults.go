@@ -139,6 +139,7 @@ func applyLogDefaults(t *LogTuning) {
 			"p2p":         "silent", // cometbft switch — peer EOFs aren't actionable
 			"mconnection": "silent", // packet byte counts at Debug
 			"pex":         "silent", // PEX gossip noise (covers our pex and cometbft's)
+			"statesync":   "silent", // BaseService start/stop + "send queue full" at Error on slow peers — neither actionable
 		}
 	}
 }
