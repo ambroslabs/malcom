@@ -35,9 +35,17 @@ import (
 )
 
 // StoreInfo is one entry in the commit-info store_infos repeated field.
+//
+// Hash is variable-length intentionally: cosmos-sdk represents an
+// untouched store (an IAVL tree with no nodes) as an empty hash, not
+// a 32-byte string of zeros. Conflating the two breaks consensus —
+// `simpleMap.Set` hashes the value, and `sha256("")` ≠ `sha256(0×32)`,
+// which propagates into a divergent AppHash. Use `nil` (or the empty
+// slice) for empty stores; the encoder writes a length-0 field, which
+// chain runtimes parse identically to an absent field per proto3.
 type StoreInfo struct {
 	Name string
-	Hash [32]byte
+	Hash []byte
 }
 
 // commitInfoBytes returns the protobuf-encoded CommitInfo for the given
@@ -74,10 +82,10 @@ func encodeStoreInfo(si StoreInfo, ver int64) []byte {
 	return out
 }
 
-func encodeCommitID(version int64, hash [32]byte) []byte {
+func encodeCommitID(version int64, hash []byte) []byte {
 	var out []byte
 	out = appendUvarintField(out, 1, uint64(version))
-	out = appendBytesField(out, 2, hash[:])
+	out = appendBytesField(out, 2, hash)
 	return out
 }
 
