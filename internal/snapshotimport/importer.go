@@ -235,6 +235,14 @@ func (s *storeImporter) finalize(set func(key, value []byte) error) ([]byte, err
 		if err := set(s.keyScratch, nil); err != nil {
 			return nil, fmt.Errorf("set empty root marker: %w", err)
 		}
+		// Write the fast-storage marker even for empty stores so the
+		// runtime daemon doesn't fall into the "Upgrading IAVL storage"
+		// pass on first load. Without this, every chain with at least
+		// one empty store at snapshot time pays a multi-minute startup
+		// hit on first boot.
+		if err := s.writeStorageVersionMarker(set); err != nil {
+			return nil, err
+		}
 		return emptyIAVLTreeHash[:], nil
 	}
 	if len(s.stack) != 1 {
@@ -289,16 +297,31 @@ func (s *storeImporter) finalize(set func(key, value []byte) error) ([]byte, err
 		}
 	}
 
-	// Per-store fast-storage marker: gaiad checks this on load and
-	// skips the (multi-minute) "Upgrading IAVL storage" pass.
+	if err := s.writeStorageVersionMarker(set); err != nil {
+		return nil, err
+	}
+
+	return root.hash[:], nil
+}
+
+// writeStorageVersionMarker writes the per-store metadataDB
+// `storage_version` key that signals to the chain runtime that this
+// store's IAVL is already on the fast-storage layout. Without it,
+// gaiad-style daemons fall into the "Upgrading IAVL storage for
+// faster queries + execution on live state" startup pass — fast for
+// empty stores but still adds latency, and on populated stores can
+// take many minutes.
+//
+// Same value (`<fastStorageVersionValue>-<height>`) on both the
+// empty-store and populated paths; factored out so they stay in sync.
+func (s *storeImporter) writeStorageVersionMarker(set func(key, value []byte) error) error {
 	metaVal := []byte(fmt.Sprintf("%s%s%d",
 		fastStorageVersionValue, fastStorageVersionDelimiter, s.height))
 	s.keyScratch = metadataDBKeyInto(s.keyScratch[:0], s.storePrefix, "storage_version")
 	if err := set(s.keyScratch, metaVal); err != nil {
-		return nil, fmt.Errorf("set storage_version marker: %w", err)
+		return fmt.Errorf("set storage_version marker: %w", err)
 	}
-
-	return root.hash[:], nil
+	return nil
 }
 
 // ─── driver ──────────────────────────────────────────────────────────────
