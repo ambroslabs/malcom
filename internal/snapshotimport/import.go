@@ -23,6 +23,8 @@ import (
 	"time"
 
 	"github.com/cockroachdb/pebble"
+
+	malcomlog "github.com/zrbecker/cosmos-p2p/internal/log"
 )
 
 // Options controls Import. Zero-value defaults are tuned for a 64 GiB
@@ -153,12 +155,14 @@ func Import(opts Options) (*Stats, error) {
 	defer cr.Close()
 
 	// ─── pebble open ─────────────────────────────────────────────────
+	pebbleLog := malcomlog.PebbleShim(log.With("module", "pebble"))
 	popts := &pebble.Options{
 		MemTableSize:                uint64(memMB) << 20,
 		MemTableStopWritesThreshold: 4,
 		Cache:                       pebble.NewCache(int64(cacheMB) << 20),
 		MaxOpenFiles:                4096,
 		MaxConcurrentCompactions:    func() int { return maxCompact },
+		Logger:                      pebbleLog,
 	}
 	if bulkLoad {
 		popts.DisableAutomaticCompactions = true
@@ -207,6 +211,7 @@ func Import(opts Options) (*Stats, error) {
 	log.Info("starting cleanup pass")
 	cleanup, err := pebble.Open(appdbDir, &pebble.Options{
 		MaxConcurrentCompactions: func() int { return maxCompact },
+		Logger:                   pebbleLog,
 	})
 	if err != nil {
 		return nil, fmt.Errorf("cleanup reopen: %w", err)
