@@ -156,3 +156,74 @@ func TestOfferSetCountDistinctAcrossHeights(t *testing.T) {
 		t.Fatalf("count=%d, want 2 (distinct offers, not events)", got)
 	}
 }
+
+func TestOfferSetAtOrAboveDescending(t *testing.T) {
+	o := newOfferSet()
+	o.add(mkSnap(100, 1, "a"), "p1")
+	o.add(mkSnap(250, 1, "b"), "p2")
+	o.add(mkSnap(175, 1, "c"), "p3")
+	o.add(mkSnap(300, 1, "d"), "p4")
+
+	// Range [150, 300]: drops 100, keeps 175/250/300, descending.
+	got := o.atOrAbove(150, 300)
+	if len(got) != 3 {
+		t.Fatalf("len=%d, want 3", len(got))
+	}
+	wantHeights := []uint64{300, 250, 175}
+	for i, h := range wantHeights {
+		if got[i].Offer.Height != h {
+			t.Fatalf("got[%d].Height=%d, want %d (must be descending)", i, got[i].Offer.Height, h)
+		}
+	}
+}
+
+func TestOfferSetAtOrAboveExcludesAboveMax(t *testing.T) {
+	o := newOfferSet()
+	o.add(mkSnap(100, 1, "a"), "p1")
+	o.add(mkSnap(500, 1, "b"), "p2") // above max
+	got := o.atOrAbove(50, 200)
+	if len(got) != 1 {
+		t.Fatalf("len=%d, want 1 (500 must be excluded)", len(got))
+	}
+	if got[0].Offer.Height != 100 {
+		t.Fatalf("got[0].Height=%d, want 100", got[0].Offer.Height)
+	}
+}
+
+func TestOfferSetAtOrAboveMaxZeroIgnoresUpperBound(t *testing.T) {
+	o := newOfferSet()
+	o.add(mkSnap(100, 1, "a"), "p1")
+	o.add(mkSnap(50, 1, "b"), "p2")  // below min, dropped
+	o.add(mkSnap(999, 1, "c"), "p3") // far above any plausible window
+	got := o.atOrAbove(80, 0)
+	if len(got) != 2 {
+		t.Fatalf("len=%d, want 2 (max=0 means no upper bound)", len(got))
+	}
+	if got[0].Offer.Height != 999 || got[1].Offer.Height != 100 {
+		t.Fatalf("descending order broken: %d, %d", got[0].Offer.Height, got[1].Offer.Height)
+	}
+}
+
+func TestOfferSetAtOrAboveSameHeightMultipleOffers(t *testing.T) {
+	o := newOfferSet()
+	o.add(mkSnap(100, 1, "a"), "p1")
+	o.add(mkSnap(100, 2, "b"), "p2") // same height, different format
+	o.add(mkSnap(200, 1, "c"), "p3")
+	got := o.atOrAbove(100, 200)
+	if len(got) != 3 {
+		t.Fatalf("len=%d, want 3 (both 100 entries plus 200)", len(got))
+	}
+	if got[0].Offer.Height != 200 {
+		t.Fatalf("got[0].Height=%d, want 200 (descending)", got[0].Offer.Height)
+	}
+	if got[1].Offer.Height != 100 || got[2].Offer.Height != 100 {
+		t.Fatalf("got[1,2] heights = %d, %d, want both 100", got[1].Offer.Height, got[2].Offer.Height)
+	}
+}
+
+func TestOfferSetAtOrAboveEmpty(t *testing.T) {
+	o := newOfferSet()
+	if got := o.atOrAbove(100, 200); len(got) != 0 {
+		t.Fatalf("empty set should return no entries, got %d", len(got))
+	}
+}

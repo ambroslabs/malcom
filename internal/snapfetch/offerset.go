@@ -1,6 +1,10 @@
 package snapfetch
 
-import "github.com/zrbecker/cosmos-p2p/internal/statesync"
+import (
+	"sort"
+
+	"github.com/zrbecker/cosmos-p2p/internal/statesync"
+)
 
 // offerSet indexes snapshot offers by content key and by height
 // during walkBackward. Replaces the inline `offers` + `offerByHeight`
@@ -63,3 +67,33 @@ func (o *offerSet) at(height uint64) []offerEntry {
 
 // count returns the total distinct offers across all heights.
 func (o *offerSet) count() int { return len(o.byKey) }
+
+// atOrAbove returns offers whose height falls in [min, max], sorted
+// descending by height. Used by walkBackward so chains that take
+// snapshots at non-multiple heights (osmosis publishes mid-interval)
+// still match: at walk target H, we ask peers about every offer at
+// H or above (capped at MaxHeight), not just exact-height matches.
+//
+// max == 0 disables the upper bound — caller-side check; we accept
+// any height ≥ min in that case so callers without a known chain
+// head can still use this method.
+func (o *offerSet) atOrAbove(min, max uint64) []offerEntry {
+	heights := make([]uint64, 0, len(o.byHeight))
+	for h := range o.byHeight {
+		if h < min {
+			continue
+		}
+		if max != 0 && h > max {
+			continue
+		}
+		heights = append(heights, h)
+	}
+	sort.Slice(heights, func(i, j int) bool { return heights[i] > heights[j] })
+	out := make([]offerEntry, 0)
+	for _, h := range heights {
+		for _, k := range o.byHeight[h] {
+			out = append(out, offerEntry{Key: k, Offer: o.byKey[k]})
+		}
+	}
+	return out
+}
