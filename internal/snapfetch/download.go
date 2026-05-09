@@ -13,7 +13,8 @@ import (
 	"strings"
 	"time"
 
-	cmtlog "github.com/cometbft/cometbft/libs/log"
+	"log/slog"
+
 	"github.com/cometbft/cometbft/p2p"
 
 	"github.com/zrbecker/cosmos-p2p/internal/connect"
@@ -135,7 +136,7 @@ type chunkScheduler struct {
 	mgr   schedulerManager
 	watch *peerWatch
 	srv   *served.Set
-	log   cmtlog.Logger
+	log   *slog.Logger
 
 	// writeFile is the chunk-write hook. Production wires writeFileAtomic;
 	// tests inject a failing stub to drive the disk-failure path without

@@ -6,6 +6,7 @@ package bootstrap
 
 import (
 	"fmt"
+	"log/slog"
 	"os"
 	"path/filepath"
 
@@ -17,7 +18,7 @@ import (
 // downloading from a URL into $XDG_DATA_HOME/malcom/<chain>/genesis.json
 // if the chain.toml value is an http(s) URL. Idempotent: a previous
 // download is reused.
-func resolveGenesis(ch config.Chain) (string, error) {
+func resolveGenesis(ch config.Chain, log *slog.Logger) (string, error) {
 	g := ch.Genesis
 	if g == "" {
 		return "", fmt.Errorf("genesis is empty")
@@ -29,12 +30,12 @@ func resolveGenesis(ch config.Chain) (string, error) {
 			return "", fmt.Errorf("resolve data dir: %w", err)
 		}
 		dest := filepath.Join(dataDir, ch.ChainID, "genesis.json")
-		fmt.Printf("[bootstrap] genesis  source=%s\n", g)
+		log.Info("genesis source", "url", g)
 		if err := registry.DownloadGenesis(g, dest); err != nil {
 			return "", fmt.Errorf("download genesis: %w", err)
 		}
 		if info, err := os.Stat(dest); err == nil {
-			fmt.Printf("[bootstrap] genesis  cached at %s (%d bytes)\n", dest, info.Size())
+			log.Info("genesis cached", "path", dest, "bytes", uint64(info.Size()))
 		}
 		return dest, nil
 	}

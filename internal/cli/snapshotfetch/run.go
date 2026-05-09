@@ -21,6 +21,7 @@ import (
 	"flag"
 	"fmt"
 	"io"
+	"log/slog"
 	"net/http"
 	"os"
 	"os/signal"
@@ -30,8 +31,6 @@ import (
 	"sync/atomic"
 	"syscall"
 	"time"
-
-	cmtlog "github.com/cometbft/cometbft/libs/log"
 
 	"github.com/zrbecker/cosmos-p2p/internal/config"
 	malcomlog "github.com/zrbecker/cosmos-p2p/internal/log"
@@ -49,7 +48,14 @@ func Run(args []string) int {
 	maxAge := fs.Uint64("max-age", 0, fmt.Sprintf("freshness floor in blocks (default %d; override in config.fetch.max_age_blocks)", config.DefaultMaxAgeBlocks))
 	noVerifyHash := fs.Bool("no-verify-hash", false, "skip the post-download SHA256(chunks) == offer.Hash check; per-chunk hashes are still verified against metadata. Run `malcom verify` afterwards if you skip.")
 	debug := fs.Bool("debug", false, "verbose snapfetch logging")
+	logMode := fs.String("log", "", "log output: auto (default), pretty, text, json")
 	if err := fs.Parse(args); err != nil {
+		return ExitConfig
+	}
+
+	mode, ok := malcomlog.ParseMode(*logMode)
+	if !ok {
+		fmt.Fprintf(os.Stderr, "invalid -log %q (want auto/pretty/text/json)\n", *logMode)
 		return ExitConfig
 	}
 
@@ -68,48 +74,30 @@ func Run(args []string) int {
 		return ExitConfig
 	}
 
+	// Build the logger from the resolved [log] / [log.modules] config.
+	// -debug lowers the global threshold to debug AND bumps every
+	// non-"silent" entry in [log.modules] to debug.
+	logOpts, err := malcomlog.BuildOptions(malcomlog.Tuning{
+		Level:   ch.Log.Level,
+		Modules: ch.Log.Modules,
+	}, mode, *debug, os.Stderr)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "log config: %v\n", err)
+		return ExitConfig
+	}
+	logger := malcomlog.New(logOpts)
+	fetchLog := logger.With("module", "fetch-cli")
+
 	if err := os.MkdirAll(*out, 0o755); err != nil {
-		fmt.Fprintf(os.Stderr, "mkdir out: %v\n", err)
+		fetchLog.Error("mkdir out failed", "err", err, "dir", *out)
 		return ExitDiskFailed
 	}
 	// Ensure node key + cache dirs exist (config.Resolve gave us paths
 	// but didn't create them).
 	if err := os.MkdirAll(filepath.Dir(ch.NodeKey), 0o755); err != nil {
-		fmt.Fprintf(os.Stderr, "mkdir node-key dir: %v\n", err)
+		fetchLog.Error("mkdir node-key dir failed", "err", err, "dir", filepath.Dir(ch.NodeKey))
 		return ExitDiskFailed
 	}
-
-	// Default mode silences cometbft's per-peer EOF spam — the p2p
-	// module logs every disconnect at Error level even when it's a
-	// normal seed-mode close. -debug flips to AllowDebug (everything).
-	// Pass os.Stderr directly — malcomlog handles its own
-	// serialization, and we need the *os.File for TTY detection.
-	logger := malcomlog.New(os.Stderr)
-	if *debug {
-		// -debug on cmtlog.AllowDebug() lets through cometbft's
-		// mconnection packet-byte dumps (gigabytes per minute) and
-		// drowns the malcom-relevant lines. Keep cometbft modules at
-		// error+ and bump only our own modules to debug.
-		logger = cmtlog.NewFilter(logger, cmtlog.AllowError(),
-			cmtlog.AllowDebugWith("module", "fetch-cli"),
-			cmtlog.AllowDebugWith("module", "fetch"),
-			cmtlog.AllowDebugWith("module", "connect"),
-			cmtlog.AllowDebugWith("module", "pex"),
-			cmtlog.AllowDebugWith("module", "peerwatch"),
-			cmtlog.AllowDebugWith("module", "addrbook"),
-			cmtlog.AllowDebugWith("module", "statesync"),
-		)
-	} else {
-		logger = cmtlog.NewFilter(logger,
-			cmtlog.AllowInfoWith("module", "fetch-cli"),
-			cmtlog.AllowInfoWith("module", "fetch"),
-			cmtlog.AllowInfoWith("module", "peerwatch"),
-			cmtlog.AllowErrorWith("module", "addrbook"),
-			// pex / p2p / mconnection silenced by default
-		)
-	}
-
-	fetchLog := logger.With("module", "fetch-cli")
 
 	// Resolve maxHeight. Three paths:
 	//   - -target-height set: skip lookup entirely (we lock to that one height).
@@ -237,7 +225,7 @@ func Run(args []string) int {
 	}()
 
 	if err := snapfetch.RunFetch(rootCtx, scfg, *out); err != nil {
-		fmt.Fprintf(os.Stderr, "snapfetch: %v\n", err)
+		fetchLog.Error("snapfetch failed", "err", err)
 		return mapExitCode(err, interrupted.Load())
 	}
 	fetchLog.Info("WARNING: snapshot contents are not authenticated by p2p — run `malcom verify` against a trusted RPC before using this snapshot in production")
@@ -249,7 +237,7 @@ func Run(args []string) int {
 // user can see which to prune from chains/<id>.toml. Returns the
 // successful URL alongside the height so the caller can surface
 // where the value came from (some RPCs cache and are minutes stale).
-func fetchCurrentHeightVerbose(rpcs []string, logger cmtlog.Logger) (uint64, string, error) {
+func fetchCurrentHeightVerbose(rpcs []string, logger *slog.Logger) (uint64, string, error) {
 	if len(rpcs) == 0 {
 		return 0, "", errors.New("no RPC URLs configured")
 	}

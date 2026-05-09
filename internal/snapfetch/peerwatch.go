@@ -5,7 +5,8 @@ import (
 	"sync"
 	"time"
 
-	cmtlog "github.com/cometbft/cometbft/libs/log"
+	"log/slog"
+
 	"github.com/cometbft/cometbft/p2p"
 	pexcb "github.com/cometbft/cometbft/p2p/pex"
 
@@ -43,7 +44,7 @@ type peerWatch struct {
 	grace                   time.Duration
 	banDuration             time.Duration
 	requireStateSyncChannel bool
-	log                     cmtlog.Logger // snapshot of logctx.From(ctx) at construction
+	log                     *slog.Logger // snapshot of logctx.From(ctx) at construction
 
 	mu        sync.Mutex
 	firstSeen map[p2p.ID]time.Time

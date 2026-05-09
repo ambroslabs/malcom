@@ -6,9 +6,11 @@ package compact
 import (
 	"flag"
 	"fmt"
+	"log/slog"
 	"os"
 	"time"
 
+	malcomlog "github.com/zrbecker/cosmos-p2p/internal/log"
 	"github.com/zrbecker/cosmos-p2p/internal/pebbleutil"
 )
 
@@ -16,6 +18,8 @@ import (
 func Run(args []string) int {
 	fs := flag.NewFlagSet("malcom compact", flag.ContinueOnError)
 	dir := fs.String("dir", "", "path to pebble DB directory (required)")
+	logMode := fs.String("log", "", "log output: auto (default), pretty, text, json")
+	debug := fs.Bool("debug", false, "verbose logging")
 	if err := fs.Parse(args); err != nil {
 		return 2
 	}
@@ -24,11 +28,27 @@ func Run(args []string) int {
 		return 2
 	}
 
+	mode, ok := malcomlog.ParseMode(*logMode)
+	if !ok {
+		fmt.Fprintf(os.Stderr, "invalid -log %q (want auto/pretty/text/json)\n", *logMode)
+		return 2
+	}
+	level := slog.LevelInfo
+	if *debug {
+		level = slog.LevelDebug
+	}
+	log := malcomlog.New(malcomlog.Options{
+		Writer: os.Stderr,
+		Mode:   mode,
+		Level:  level,
+	}).With("module", "compact")
+
 	t0 := time.Now()
-	if err := pebbleutil.CleanupCompact(*dir); err != nil {
-		fmt.Fprintf(os.Stderr, "compact: %v\n", err)
+	log.Info("starting", "dir", *dir)
+	if err := pebbleutil.CleanupCompact(*dir, log); err != nil {
+		log.Error("compact failed", "err", err)
 		return 1
 	}
-	fmt.Printf("[compact] total time %s\n", time.Since(t0).Truncate(time.Millisecond))
+	log.Info("complete", "elapsed", time.Since(t0).Truncate(time.Millisecond))
 	return 0
 }

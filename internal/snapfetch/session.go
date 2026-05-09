@@ -13,7 +13,8 @@ import (
 	"strings"
 	"time"
 
-	cmtlog "github.com/cometbft/cometbft/libs/log"
+	"log/slog"
+
 	"github.com/cometbft/cometbft/p2p"
 	pexcb "github.com/cometbft/cometbft/p2p/pex"
 	"github.com/cometbft/cometbft/version"
@@ -24,6 +25,7 @@ import (
 	"github.com/zrbecker/cosmos-p2p/internal/helpers/nodekey"
 	"github.com/zrbecker/cosmos-p2p/internal/helpers/served"
 	"github.com/zrbecker/cosmos-p2p/internal/humanbytes"
+	malcomlog "github.com/zrbecker/cosmos-p2p/internal/log"
 	"github.com/zrbecker/cosmos-p2p/internal/logctx"
 	localpex "github.com/zrbecker/cosmos-p2p/internal/pex"
 	"github.com/zrbecker/cosmos-p2p/internal/statesync"
@@ -35,7 +37,7 @@ import (
 // operate on this state.
 type fetchSession struct {
 	cfg       Config
-	log       cmtlog.Logger
+	log       *slog.Logger
 	sw        *p2p.Switch
 	ssR       *statesync.Reactor
 	book      pexcb.AddrBook
@@ -104,12 +106,12 @@ func newFetchSession(ctx context.Context, c Config) (*fetchSession, func(), erro
 	if err := transport.Listen(*listenAddr); err != nil {
 		return nil, nil, fmt.Errorf("transport.Listen: %w", err)
 	}
-	ssR := statesync.NewReactor(log.With("module", "statesync"))
+	ssR := statesync.NewReactor(malcomlog.CmtShim(log.With("module", "statesync")))
 
 	// AddrBook holds peer addresses learned via PEX (and seeded with
 	// our bootstrap_peers list at startup). cometbft's implementation —
 	// JSON-persistent, bucket-balanced, freshness-tracked.
-	book, err := addrbook.NewAddrBook(c.AddrBook, log.With("module", "addrbook"))
+	book, err := addrbook.NewAddrBook(c.AddrBook, malcomlog.CmtShim(log.With("module", "addrbook")))
 	if err != nil {
 		return nil, nil, fmt.Errorf("addrbook: %w", err)
 	}
@@ -153,7 +155,7 @@ func newFetchSession(ctx context.Context, c Config) (*fetchSession, func(), erro
 		"added", res.Added, "skipped_banned", res.SkippedBanned)
 
 	sw := p2p.NewSwitch(buildP2PConfig(c.MaxOutboundPeers, c.AllowDuplicateIP), transport)
-	sw.SetLogger(log.With("module", "p2p"))
+	sw.SetLogger(malcomlog.CmtShim(log.With("module", "p2p")))
 	sw.SetNodeKey(nodeKey)
 	sw.SetNodeInfo(nodeInfo)
 	sw.SetAddrBook(book)
@@ -224,7 +226,7 @@ func newFetchSession(ctx context.Context, c Config) (*fetchSession, func(), erro
 		pexR := localpex.NewAutoReactor(book, localpex.AutoConfig{
 			Banlist: bans,
 			Kicker:  mgr,
-		}, log.With("module", "pex"))
+		}, malcomlog.CmtShim(log.With("module", "pex")))
 		sw.AddReactor("PEX", pexR)
 	} else {
 		log.Info("pex disabled (curated-peers mode): warm-fill draws only from bootstrap_peers")

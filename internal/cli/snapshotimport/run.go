@@ -17,7 +17,7 @@ import (
 	"path/filepath"
 
 	"github.com/zrbecker/cosmos-p2p/internal/config"
-	"github.com/zrbecker/cosmos-p2p/internal/humanbytes"
+	malcomlog "github.com/zrbecker/cosmos-p2p/internal/log"
 	"github.com/zrbecker/cosmos-p2p/internal/snapshotdiff"
 	"github.com/zrbecker/cosmos-p2p/internal/snapshotimport"
 )
@@ -36,6 +36,8 @@ func Run(args []string) int {
 	out := fs.String("out", ".", "parent dir for the output (subdir appdb_<chain>_<height>/ created inside)")
 	height := fs.Int64("height", 0, "height override (required if snapshot meta.json is missing or omits height)")
 	noExt := fs.Bool("no-extensions", false, "skip writing extension payloads")
+	logMode := fs.String("log", "", "log output: auto (default), pretty, text, json")
+	debug := fs.Bool("debug", false, "verbose logging")
 	if err := fs.Parse(args); err != nil {
 		return 2
 	}
@@ -43,6 +45,26 @@ func Run(args []string) int {
 		fs.Usage()
 		return 2
 	}
+
+	mode, ok := malcomlog.ParseMode(*logMode)
+	if !ok {
+		fmt.Fprintf(os.Stderr, "invalid -log %q (want auto/pretty/text/json)\n", *logMode)
+		return 2
+	}
+	// Load config so the logger picks up [log] / [log.modules]. Fall
+	// back to defaults if config is missing (the import path doesn't
+	// strictly require a config — chain id can come from meta.json).
+	var logTuning malcomlog.Tuning
+	if cfg, err := config.Load(); err == nil {
+		logTuning = malcomlog.Tuning{Level: cfg.Log.Level, Modules: cfg.Log.Modules}
+	}
+	logOpts, err := malcomlog.BuildOptions(logTuning, mode, *debug, os.Stderr)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "log config: %v\n", err)
+		return 2
+	}
+	logger := malcomlog.New(logOpts)
+	log := logger.With("module", "import-cli")
 
 	// Read meta.json if present. The chain id and height are normally
 	// drawn from here so the user doesn't have to repeat themselves;
@@ -53,33 +75,33 @@ func Run(args []string) int {
 	meta, metaErr := readMeta(metaPath)
 	switch {
 	case metaErr != nil && !os.IsNotExist(metaErr):
-		fmt.Fprintf(os.Stderr, "read %s: %v\n", metaPath, metaErr)
+		log.Error("read meta.json", "path", metaPath, "err", metaErr)
 		return 1
 	case metaErr != nil:
 		// missing meta.json — flags must fully specify chain + height.
 		if *chain == "" || *height == 0 {
-			fmt.Fprintf(os.Stderr, "snapshot %s has no meta.json; pass -chain and -height to override\n", *snapshotDir)
+			log.Error("no meta.json; pass -chain and -height to override", "path", *snapshotDir)
 			return 1
 		}
 	default:
 		if meta.ChainID != "" && *chain != "" && meta.ChainID != *chain {
-			fmt.Fprintf(os.Stderr, "meta.json chain_id %q does not match -chain %q\n", meta.ChainID, *chain)
+			log.Error("meta.json chain_id does not match -chain", "meta", meta.ChainID, "flag", *chain)
 			return 1
 		}
 		if meta.Height != 0 && *height != 0 && uint64(*height) != meta.Height {
-			fmt.Fprintf(os.Stderr, "meta.json height %d does not match -height %d\n", meta.Height, *height)
+			log.Error("meta.json height does not match -height", "meta", meta.Height, "flag", *height)
 			return 1
 		}
 		if *chain == "" {
 			if meta.ChainID == "" {
-				fmt.Fprintln(os.Stderr, "snapshot meta.json has no chain_id; pass -chain to override")
+				log.Error("meta.json has no chain_id; pass -chain to override")
 				return 1
 			}
 			*chain = meta.ChainID
 		}
 		if *height == 0 {
 			if meta.Height == 0 {
-				fmt.Fprintln(os.Stderr, "snapshot meta.json has no height; pass -height to override")
+				log.Error("meta.json has no height; pass -height to override")
 				return 1
 			}
 			*height = int64(meta.Height)
@@ -88,38 +110,38 @@ func Run(args []string) int {
 
 	cfg, err := config.Load()
 	if err != nil {
-		fmt.Fprintln(os.Stderr, err)
+		log.Error("config load", "err", err)
 		return 1
 	}
 	ch, err := cfg.Resolve(*chain)
 	if err != nil {
-		fmt.Fprintln(os.Stderr, err)
+		log.Error("resolve chain", "err", err, "chain", *chain)
 		return 1
 	}
 
 	outDir := filepath.Join(*out, fmt.Sprintf("appdb_%s_%d", ch.ChainID, *height))
 	if err := os.MkdirAll(outDir, 0o755); err != nil {
-		fmt.Fprintf(os.Stderr, "mkdir out: %v\n", err)
+		log.Error("mkdir out failed", "err", err, "dir", outDir)
 		return 1
 	}
 
 	if ch.Import.MinFreeGB > 0 {
 		if err := snapshotdiff.CheckFreeSpace(outDir, uint64(ch.Import.MinFreeGB)<<30); err != nil {
-			fmt.Fprintf(os.Stderr, "disk check: %v\n", err)
+			log.Error("disk check failed", "err", err)
 			return 1
 		}
 	}
 
-	fmt.Printf("[import] config:       %s\n", cfg.Path())
-	fmt.Printf("[import] chain:        %s\n", ch.ChainID)
-	fmt.Printf("[import] snapshot:     %s\n", *snapshotDir)
-	fmt.Printf("[import] out:          %s\n", outDir)
-	fmt.Printf("[import] height:       %d\n", *height)
-	fmt.Printf("[import] memtable:     %d MiB\n", ch.Import.MemtableMB)
-	fmt.Printf("[import] cache:        %d MiB\n", ch.Import.CacheMB)
-	fmt.Printf("[import] max-compact:  %d\n", ch.Import.MaxConcurrentCompactions)
-	fmt.Printf("[import] extensions:   %v\n", !*noExt)
-	fmt.Println()
+	log.Info("starting",
+		"config", cfg.Path(),
+		"chain", ch.ChainID,
+		"snapshot", *snapshotDir,
+		"out", outDir,
+		"height", *height,
+		"memtable_mb", ch.Import.MemtableMB,
+		"cache_mb", ch.Import.CacheMB,
+		"max_compact", ch.Import.MaxConcurrentCompactions,
+		"extensions", !*noExt)
 
 	stats, err := snapshotimport.Import(snapshotimport.Options{
 		SnapshotDir:              *snapshotDir,
@@ -129,26 +151,29 @@ func Run(args []string) int {
 		MemtableMB:               ch.Import.MemtableMB,
 		CacheMB:                  ch.Import.CacheMB,
 		MaxConcurrentCompactions: ch.Import.MaxConcurrentCompactions,
-		Log:                      os.Stdout,
+		Log:                      logger,
 	})
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "import: %v\n", err)
+		log.Error("import failed", "err", err)
 		return 1
 	}
 
 	finalDB := filepath.Join(outDir, "application.db")
-	fmt.Println()
-	fmt.Printf("[import] complete in %s\n", stats.Elapsed)
-	fmt.Printf("  stores written:     %d\n", len(stats.Stores))
-	fmt.Printf("  IAVL items:         %d\n", stats.Items)
-	fmt.Printf("  extensions:         %d\n", stats.Extensions)
-	fmt.Printf("  ext payloads:       %d\n", stats.ExtensionPayloads)
-	fmt.Printf("  stream elapsed:     %s\n", stats.StreamElapsed)
-	fmt.Printf("  final compact:      %s\n", stats.FinalCompactElapsed)
-	fmt.Printf("  cleanup pass:       %s\n", stats.CleanupElapsed)
+	dbBytes := uint64(0)
 	if size, err := dirSize(finalDB); err == nil {
-		fmt.Printf("  application.db:     %s  (%s)\n", finalDB, humanbytes.Format(uint64(size)))
+		dbBytes = uint64(size)
 	}
+	log.Info("complete",
+		"elapsed", stats.Elapsed,
+		"stores", len(stats.Stores),
+		"items", stats.Items,
+		"extensions", stats.Extensions,
+		"ext_payloads", stats.ExtensionPayloads,
+		"stream_elapsed", stats.StreamElapsed,
+		"final_compact_elapsed", stats.FinalCompactElapsed,
+		"cleanup_elapsed", stats.CleanupElapsed,
+		"appdb", finalDB,
+		"appdb_bytes", dbBytes)
 	return 0
 }
 

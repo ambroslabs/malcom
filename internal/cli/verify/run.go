@@ -26,6 +26,7 @@ import (
 	"github.com/cometbft/cometbft/crypto/merkle"
 
 	"github.com/zrbecker/cosmos-p2p/internal/config"
+	malcomlog "github.com/zrbecker/cosmos-p2p/internal/log"
 )
 
 // Run is the malcom subcommand entry point.
@@ -35,6 +36,8 @@ func Run(args []string) int {
 	appdb := fs.String("appdb", "", "path to the application.db parent dir (required)")
 	height := fs.Int64("height", 0, "snapshot height committed to application.db (required)")
 	rpcURL := fs.String("rpc", "", "cometbft RPC endpoint (defaults to first chains/<id>.toml rpcs entry)")
+	logMode := fs.String("log", "", "log output: auto (default), pretty, text, json")
+	debug := fs.Bool("debug", false, "verbose logging")
 	if err := fs.Parse(args); err != nil {
 		return 2
 	}
@@ -42,6 +45,28 @@ func Run(args []string) int {
 		fs.Usage()
 		return 2
 	}
+
+	mode, ok := malcomlog.ParseMode(*logMode)
+	if !ok {
+		fmt.Fprintf(os.Stderr, "invalid -log %q (want auto/pretty/text/json)\n", *logMode)
+		return 2
+	}
+	// Pull [log] from config when available; verify is also runnable
+	// with -rpc and no config, in which case fall back to defaults.
+	var logTuning malcomlog.Tuning
+	if cfg, err := config.Load(); err == nil {
+		if ch, err := cfg.Resolve(*chain); err == nil {
+			logTuning = malcomlog.Tuning{Level: ch.Log.Level, Modules: ch.Log.Modules}
+		} else {
+			logTuning = malcomlog.Tuning{Level: cfg.Log.Level, Modules: cfg.Log.Modules}
+		}
+	}
+	logOpts, err := malcomlog.BuildOptions(logTuning, mode, *debug, os.Stderr)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "log config: %v\n", err)
+		return 2
+	}
+	log := malcomlog.New(logOpts).With("module", "verify")
 
 	// -rpc lets verify run against a single RPC without needing a
 	// chains/<id>.toml — convenient for one-off checks. Only load
@@ -51,12 +76,12 @@ func Run(args []string) int {
 	if rpc == "" {
 		cfg, err := config.Load()
 		if err != nil {
-			fmt.Fprintln(os.Stderr, err)
+			log.Error("config load", "err", err)
 			return 1
 		}
 		ch, err = cfg.Resolve(*chain)
 		if err != nil {
-			fmt.Fprintln(os.Stderr, err)
+			log.Error("resolve chain", "err", err, "chain", *chain)
 			return 1
 		}
 	} else {
@@ -66,41 +91,41 @@ func Run(args []string) int {
 		rpc = ch.RPCs[0]
 	}
 	if rpc == "" {
-		fmt.Fprintf(os.Stderr, "no rpc; pass -rpc or set chains.%s.rpcs in config\n", ch.ChainID)
+		log.Error("no rpc; pass -rpc or set chains.<id>.rpcs in config", "chain", ch.ChainID)
 		return 1
 	}
 
-	fmt.Printf("[verify] appdb   %s\n", *appdb)
-	fmt.Printf("[verify] height  %d\n", *height)
-	fmt.Printf("[verify] rpc     %s\n", rpc)
+	log.Info("starting", "appdb", *appdb, "height", *height, "rpc", rpc)
 
 	infos, err := readCommitInfo(*appdb, *height)
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "read commit info: %v\n", err)
+		log.Error("read commit info failed", "err", err)
 		return 1
 	}
-	fmt.Printf("[verify] stores: %d\n", len(infos))
+	log.Info("commit info read", "stores", len(infos))
 	for _, si := range infos {
-		fmt.Printf("            %-22s %x\n", si.Name, si.Hash)
+		log.Debug("store", "name", si.Name, "hash", fmt.Sprintf("%x", si.Hash))
 	}
 
 	localHash := computeAppHash(infos)
-	fmt.Printf("[verify] local AppHash:     %X\n", localHash)
+	log.Info("local apphash", "apphash", fmt.Sprintf("%X", localHash))
 
 	consHeight := *height + 1
 	consHash, err := fetchAppHash(rpc, consHeight)
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "fetch consensus app hash: %v\n", err)
+		log.Error("fetch consensus apphash failed", "err", err, "rpc", rpc, "height", consHeight)
 		return 1
 	}
-	fmt.Printf("[verify] consensus AppHash @ block %d: %s\n", consHeight, consHash)
+	log.Info("consensus apphash", "height", consHeight, "apphash", consHash)
 
 	consBytes, _ := hex.DecodeString(consHash)
 	if bytes.Equal(localHash, consBytes) {
-		fmt.Printf("\n  ✓ MATCH — application.db is consensus-correct at height %d\n", *height)
+		log.Info("MATCH — application.db is consensus-correct", "height", *height)
 		return 0
 	}
-	fmt.Println("\n  ✗ MISMATCH")
+	log.Error("MISMATCH",
+		"local", fmt.Sprintf("%X", localHash),
+		"consensus", consHash)
 	return 1
 }
 

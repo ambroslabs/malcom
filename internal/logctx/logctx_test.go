@@ -2,24 +2,23 @@ package logctx
 
 import (
 	"context"
+	"log/slog"
 	"testing"
-
-	cmtlog "github.com/cometbft/cometbft/libs/log"
 )
 
-func TestFromReturnsNopWhenNotAttached(t *testing.T) {
+func TestFromReturnsDiscardWhenNotAttached(t *testing.T) {
 	log := From(context.Background())
 	if log == nil {
-		t.Fatalf("From(empty ctx) = nil, want no-op logger")
+		t.Fatalf("From(empty ctx) = nil, want discard logger")
 	}
-	// Calling on the no-op should not panic.
+	// Calling on the discard logger should not panic.
 	log.Info("hi")
 	log.Debug("hi")
 	log.Error("hi")
 }
 
 func TestWithAttachesLogger(t *testing.T) {
-	original := cmtlog.NewNopLogger()
+	original := slog.New(slog.DiscardHandler)
 	ctx := With(context.Background(), original)
 	got := From(ctx)
 	if got != original {
@@ -27,30 +26,28 @@ func TestWithAttachesLogger(t *testing.T) {
 	}
 }
 
-func TestWithNilLoggerYieldsNopLogger(t *testing.T) {
+func TestWithNilLoggerYieldsDiscardLogger(t *testing.T) {
 	ctx := With(context.Background(), nil)
 	got := From(ctx)
 	if got == nil {
-		t.Fatalf("With(nil) → From returned nil; want no-op logger")
+		t.Fatalf("With(nil) → From returned nil; want discard logger")
 	}
 	got.Info("safe to call")
 }
 
 func TestWithFieldsChains(t *testing.T) {
-	original := cmtlog.NewNopLogger()
+	original := slog.New(slog.DiscardHandler)
 	ctx := With(context.Background(), original)
 	ctx = WithFields(ctx, "module", "fetch", "phase", "walk")
 	got := From(ctx)
 	if got == nil {
 		t.Fatalf("From after WithFields returned nil")
 	}
-	// We can't introspect cometbft logger keyvals without reflection;
-	// at minimum confirm no panic and the type is preserved.
 	got.Info("hi")
 }
 
 func TestWrapAndContextValuesSurvive(t *testing.T) {
-	original := cmtlog.NewNopLogger()
+	original := slog.New(slog.DiscardHandler)
 	ctx := With(context.Background(), original)
 	wrapped := Wrap(ctx)
 	if wrapped.Logger() == nil {
@@ -61,18 +58,18 @@ func TestWrapAndContextValuesSurvive(t *testing.T) {
 	}
 }
 
-func TestContextWithTimeoutPreservesLogger(t *testing.T) {
-	original := cmtlog.NewNopLogger()
+func TestContextWithCancelPreservesLogger(t *testing.T) {
+	original := slog.New(slog.DiscardHandler)
 	ctx := With(context.Background(), original)
-	timeoutCtx, cancel := context.WithCancel(ctx)
+	derived, cancel := context.WithCancel(ctx)
 	defer cancel()
-	if From(timeoutCtx) != original {
+	if From(derived) != original {
 		t.Fatalf("derived ctx lost logger")
 	}
 }
 
 func TestWrapWithFieldsReturnsWrapper(t *testing.T) {
-	original := cmtlog.NewNopLogger()
+	original := slog.New(slog.DiscardHandler)
 	wrapped := Wrap(With(context.Background(), original))
 	scoped := wrapped.WithFields("k", "v")
 	if scoped.Logger() == nil {

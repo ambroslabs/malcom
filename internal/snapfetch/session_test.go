@@ -12,7 +12,7 @@ import (
 	"syscall"
 	"testing"
 
-	cmtlog "github.com/cometbft/cometbft/libs/log"
+	"log/slog"
 	"github.com/cometbft/cometbft/p2p"
 )
 
@@ -21,7 +21,7 @@ import (
 // no .tmp files are left behind.
 func TestWriteMetaWritesMetaAndCompleteAtomically(t *testing.T) {
 	dir := t.TempDir()
-	s := &fetchSession{log: cmtlog.NewNopLogger()}
+	s := &fetchSession{log: slog.New(slog.DiscardHandler)}
 
 	offer := &snapshotOffer{
 		Height:   123,
@@ -74,7 +74,7 @@ func TestWriteMetaWritesMetaAndCompleteAtomically(t *testing.T) {
 // .tmp is left behind.
 func TestPrepareSnapshotDirAtomicMetadata(t *testing.T) {
 	root := t.TempDir()
-	s := &fetchSession{log: cmtlog.NewNopLogger(), cfg: Config{ChainID: "testchain"}}
+	s := &fetchSession{log: slog.New(slog.DiscardHandler), cfg: Config{ChainID: "testchain"}}
 
 	// One chunk hash → one byte of metadata + tag/length framing.
 	// 0x0A = field-1 length-delimited, 0x04 = length 4, then 4 bytes hash.
@@ -113,7 +113,7 @@ func TestPrepareSnapshotDirAtomicMetadata(t *testing.T) {
 // inode equality, which writeFileAtomic's tmp+rename would change.
 func TestPrepareSnapshotDirReusesMatchingMetadata(t *testing.T) {
 	root := t.TempDir()
-	s := &fetchSession{log: cmtlog.NewNopLogger(), cfg: Config{ChainID: "testchain"}}
+	s := &fetchSession{log: slog.New(slog.DiscardHandler), cfg: Config{ChainID: "testchain"}}
 
 	metadata := []byte{0x0A, 0x04, 0x01, 0x02, 0x03, 0x04}
 	offer := &snapshotOffer{

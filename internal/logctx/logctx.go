@@ -1,6 +1,6 @@
-// Package logctx attaches a cometbft-style logger to a context.Context
-// so callees can pull it without threading a *logger parameter through
-// every signature.
+// Package logctx attaches a *slog.Logger to a context.Context so
+// callees can pull it without threading a *slog.Logger parameter
+// through every signature.
 //
 // The logger is stored via context.WithValue, so all standard context
 // derivations (context.WithTimeout, context.WithCancel, etc.) preserve
@@ -22,36 +22,35 @@
 // Scope by deriving a new context — never mutate:
 //
 //	ctx = logctx.WithFields(ctx, "module", "fetch")
-//	doStuff(ctx) // sees module=snapfetch
+//	doStuff(ctx) // sees module=fetch
 package logctx
 
 import (
 	"context"
-
-	cmtlog "github.com/cometbft/cometbft/libs/log"
+	"log/slog"
 )
 
 type ctxKey struct{}
 
-// With returns a context that carries log. nil log → no-op logger.
-func With(parent context.Context, log cmtlog.Logger) context.Context {
+// With returns a context that carries log. nil log → discard logger.
+func With(parent context.Context, log *slog.Logger) context.Context {
 	if log == nil {
-		log = cmtlog.NewNopLogger()
+		log = slog.New(slog.DiscardHandler)
 	}
 	return context.WithValue(parent, ctxKey{}, log)
 }
 
-// From returns the logger attached to ctx, or a no-op logger if none.
-// Always safe to call.
-func From(ctx context.Context) cmtlog.Logger {
-	if v, ok := ctx.Value(ctxKey{}).(cmtlog.Logger); ok {
+// From returns the logger attached to ctx, or a discard logger if
+// none. Always safe to call.
+func From(ctx context.Context) *slog.Logger {
+	if v, ok := ctx.Value(ctxKey{}).(*slog.Logger); ok {
 		return v
 	}
-	return cmtlog.NewNopLogger()
+	return slog.New(slog.DiscardHandler)
 }
 
 // WithFields returns a context whose logger has the given key/value
-// pairs appended (via cmtlog.Logger.With). Equivalent to
+// pairs appended (via slog.Logger.With). Equivalent to
 // With(parent, From(parent).With(kv...)).
 func WithFields(parent context.Context, kv ...any) context.Context {
 	return With(parent, From(parent).With(kv...))
@@ -69,9 +68,9 @@ type Context struct {
 // Context wrapper. The underlying ctx is unchanged.
 func Wrap(ctx context.Context) Context { return Context{ctx} }
 
-// Logger returns the logger attached to the wrapped ctx, or a no-op
-// logger if none.
-func (c Context) Logger() cmtlog.Logger { return From(c.Context) }
+// Logger returns the logger attached to the wrapped ctx, or a
+// discard logger if none.
+func (c Context) Logger() *slog.Logger { return From(c.Context) }
 
 // WithFields is the wrapper-flavored equivalent of the package-level
 // WithFields function.

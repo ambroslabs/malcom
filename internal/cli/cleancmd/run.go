@@ -13,36 +13,48 @@ import (
 	"flag"
 	"fmt"
 	iofs "io/fs"
+	"log/slog"
 	"os"
 	"path/filepath"
 	"time"
 
 	"github.com/zrbecker/cosmos-p2p/internal/config"
+	malcomlog "github.com/zrbecker/cosmos-p2p/internal/log"
 )
 
 // Run is the malcom subcommand entry point.
 func Run(args []string) int {
 	fs := flag.NewFlagSet("malcom clean", flag.ContinueOnError)
 	clobber := fs.Bool("clobber", false, "delete instead of backing up to <dir>.bak.<ts>")
+	logMode := fs.String("log", "", "log output: auto (default), pretty, text, json")
 	if err := fs.Parse(args); err != nil {
 		return 2
 	}
 
+	mode, ok := malcomlog.ParseMode(*logMode)
+	if !ok {
+		fmt.Fprintf(os.Stderr, "invalid -log %q (want auto/pretty/text/json)\n", *logMode)
+		return 2
+	}
+	log := malcomlog.New(malcomlog.Options{
+		Writer: os.Stderr, Mode: mode, Level: slog.LevelInfo,
+	}).With("module", "clean")
+
 	cfgPath, err := config.DefaultConfigPath()
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "resolve config path: %v\n", err)
+		log.Error("resolve config path", "err", err)
 		return 1
 	}
 	configRoot := filepath.Dir(cfgPath)
 
 	stateDir, err := config.StateDir()
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "resolve state dir: %v\n", err)
+		log.Error("resolve state dir", "err", err)
 		return 1
 	}
 	cacheDir, err := config.CacheDir()
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "resolve cache dir: %v\n", err)
+		log.Error("resolve cache dir", "err", err)
 		return 1
 	}
 
@@ -54,16 +66,16 @@ func Run(args []string) int {
 	for _, p := range targets {
 		info, err := os.Stat(p)
 		if errors.Is(err, iofs.ErrNotExist) {
-			fmt.Printf("[clean] %s: not present, skipping\n", p)
+			log.Info("not present, skipping", "path", p)
 			continue
 		}
 		if err != nil {
-			fmt.Fprintf(os.Stderr, "stat %s: %v\n", p, err)
+			log.Error("stat failed", "path", p, "err", err)
 			rc = 1
 			continue
 		}
 		if !info.IsDir() {
-			fmt.Fprintf(os.Stderr, "%s is not a directory; refusing to act\n", p)
+			log.Error("not a directory; refusing to act", "path", p)
 			rc = 1
 			continue
 		}
@@ -71,25 +83,25 @@ func Run(args []string) int {
 
 		if *clobber {
 			if err := os.RemoveAll(p); err != nil {
-				fmt.Fprintf(os.Stderr, "remove %s: %v\n", p, err)
+				log.Error("remove failed", "path", p, "err", err)
 				rc = 1
 				continue
 			}
-			fmt.Printf("[clean] %s -> deleted\n", p)
+			log.Info("deleted", "path", p)
 			continue
 		}
 
 		backup := uniqueBackupName(p, ts)
 		if err := os.Rename(p, backup); err != nil {
-			fmt.Fprintf(os.Stderr, "backup %s -> %s: %v\n", p, backup, err)
+			log.Error("backup failed", "path", p, "backup", backup, "err", err)
 			rc = 1
 			continue
 		}
-		fmt.Printf("[clean] %s -> %s\n", p, backup)
+		log.Info("backed up", "path", p, "backup", backup)
 	}
 
 	if nothing && rc == 0 {
-		fmt.Println("[clean] nothing to clean")
+		log.Info("nothing to clean")
 	}
 	return rc
 }

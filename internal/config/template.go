@@ -126,6 +126,27 @@ cmt_db_backend = "goleveldb"
 place_wasm     = true     # extract wasm payloads to the gaia home's expected paths
 write_configs  = true     # emit minimal app.toml/config.toml/client.toml
 moniker        = "bootstrap-node"
+
+[log]
+# Global threshold for modules NOT listed in [log.modules]. One of:
+# debug, info, warn, error. The -debug CLI flag overrides this to
+# debug for the run.
+level = "info"
+
+[log.modules]
+# Per-module thresholds. Same level names as [log].level, plus the
+# special value "silent" which suppresses the module entirely.
+#
+# -debug bumps modules listed here to "debug" — *except* entries
+# explicitly set to "silent", which stay silent so the noisiest
+# cometbft chatter doesn't drown an otherwise useful debug run.
+# Edit the entry to "debug" (or remove it) to surface a silenced
+# module.
+addrbook    = "error"   # cometbft addrbook — real errors, suppress info chatter
+p2p         = "silent"  # cometbft switch — peer EOFs / disconnects are expected, not actionable
+mconnection = "silent"  # cometbft mconn — packet byte-count dumps
+pex         = "silent"  # PEX gossip (covers our internal/pex and cometbft's)
+statesync   = "silent"  # BaseService start/stop + "send queue full" on slow peers, not actionable
 `
 }
 

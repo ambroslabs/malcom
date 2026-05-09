@@ -19,23 +19,35 @@ package initcmd
 import (
 	"flag"
 	"fmt"
+	"log/slog"
 	"os"
 	"path/filepath"
 
 	"github.com/zrbecker/cosmos-p2p/internal/config"
+	malcomlog "github.com/zrbecker/cosmos-p2p/internal/log"
 )
 
 // Run is the malcom subcommand entry point.
 func Run(args []string) int {
 	fs := flag.NewFlagSet("malcom init", flag.ContinueOnError)
 	force := fs.Bool("force", false, "overwrite existing config.toml")
+	logMode := fs.String("log", "", "log output: auto (default), pretty, text, json")
 	if err := fs.Parse(args); err != nil {
 		return 2
 	}
 
+	mode, ok := malcomlog.ParseMode(*logMode)
+	if !ok {
+		fmt.Fprintf(os.Stderr, "invalid -log %q (want auto/pretty/text/json)\n", *logMode)
+		return 2
+	}
+	log := malcomlog.New(malcomlog.Options{
+		Writer: os.Stderr, Mode: mode, Level: slog.LevelInfo,
+	}).With("module", "init")
+
 	cfgPath, err := config.DefaultConfigPath()
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "resolve config path: %v\n", err)
+		log.Error("resolve config path", "err", err)
 		return 1
 	}
 	configRoot := filepath.Dir(cfgPath)
@@ -43,50 +55,48 @@ func Run(args []string) int {
 
 	stateDir, err := config.StateDir()
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "resolve state dir: %v\n", err)
+		log.Error("resolve state dir", "err", err)
 		return 1
 	}
 	cacheDir, err := config.CacheDir()
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "resolve cache dir: %v\n", err)
+		log.Error("resolve cache dir", "err", err)
 		return 1
 	}
 	dataDir, err := config.DataDir()
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "resolve data dir: %v\n", err)
+		log.Error("resolve data dir", "err", err)
 		return 1
 	}
 
 	for _, d := range []string{configRoot, chainsDir, stateDir, cacheDir, dataDir} {
 		if err := os.MkdirAll(d, 0o755); err != nil {
-			fmt.Fprintf(os.Stderr, "mkdir %s: %v\n", d, err)
+			log.Error("mkdir failed", "dir", d, "err", err)
 			return 1
 		}
 	}
 
 	cfgWritten, err := writeIfMissing(cfgPath, config.GlobalTemplate(), *force)
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "write %s: %v\n", cfgPath, err)
+		log.Error("write config failed", "path", cfgPath, "err", err)
 		return 1
 	}
 	switch {
 	case !cfgWritten:
-		fmt.Printf("[init] config exists at %s — keeping (pass -force to overwrite)\n", cfgPath)
+		log.Info("config exists, keeping (pass -force to overwrite)", "path", cfgPath)
 	case *force:
-		fmt.Printf("[init] wrote config %s (forced)\n", cfgPath)
+		log.Info("config written (forced)", "path", cfgPath)
 	default:
-		fmt.Printf("[init] wrote config %s\n", cfgPath)
+		log.Info("config written", "path", cfgPath)
 	}
 
-	fmt.Println()
-	fmt.Println("[init] done. layout:")
-	fmt.Printf("  config:   %s\n", cfgPath)
-	fmt.Printf("  chains:   %s/\n", chainsDir)
-	fmt.Printf("  state:    %s/\n", stateDir)
-	fmt.Printf("  cache:    %s/\n", cacheDir)
-	fmt.Printf("  data:     %s/\n", dataDir)
-	fmt.Println()
-	fmt.Println("[init] add a chain with: malcom add <chain-id>  (e.g. malcom add cosmoshub-4)")
+	log.Info("layout",
+		"config", cfgPath,
+		"chains", chainsDir,
+		"state", stateDir,
+		"cache", cacheDir,
+		"data", dataDir)
+	log.Info("done — add a chain with `malcom add <chain-id>` (e.g. cosmoshub-4)")
 	return 0
 }
 

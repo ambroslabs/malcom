@@ -7,7 +7,7 @@ import (
 	"path/filepath"
 	"time"
 
-	cmtlog "github.com/cometbft/cometbft/libs/log"
+	"log/slog"
 
 	"github.com/zrbecker/cosmos-p2p/internal/humanbytes"
 	"github.com/zrbecker/cosmos-p2p/internal/snapshotinspect"
@@ -18,7 +18,7 @@ import (
 // Optional post-process — RunFetch doesn't call it (the next pipeline
 // step parses the snapshot anyway). logger may be nil for silent
 // operation.
-func InspectAndEnrich(dir string, logger cmtlog.Logger) error {
+func InspectAndEnrich(dir string, logger *slog.Logger) error {
 	if logger != nil {
 		logger.Info("inspecting", "dir", dir)
 	}

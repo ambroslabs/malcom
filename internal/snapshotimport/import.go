@@ -16,7 +16,7 @@ package snapshotimport
 
 import (
 	"fmt"
-	"io"
+	"log/slog"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -65,8 +65,8 @@ type Options struct {
 	// from incremental compaction.
 	BulkLoad bool
 
-	// Log receives progress messages. Defaults to os.Stdout.
-	Log io.Writer
+	// Log receives structured progress events. nil → discard.
+	Log *slog.Logger
 }
 
 // Stats summarises a completed import. Returned by Import.
@@ -107,10 +107,11 @@ func Import(opts Options) (*Stats, error) {
 		}
 		return nil, fmt.Errorf("stat .complete in %s: %w", opts.SnapshotDir, err)
 	}
-	logw := opts.Log
-	if logw == nil {
-		logw = os.Stdout
+	log := opts.Log
+	if log == nil {
+		log = slog.New(slog.DiscardHandler)
 	}
+	log = log.With("module", "import")
 	memMB := opts.MemtableMB
 	if memMB <= 0 {
 		memMB = 256
@@ -173,7 +174,7 @@ func Import(opts Options) (*Stats, error) {
 	// ─── run the streaming import ────────────────────────────────────
 	streamStart := time.Now()
 	stats := &Stats{}
-	stores, err := runImport(cr, db, opts.Height, extDir, stats, logw)
+	stores, err := runImport(cr, db, opts.Height, extDir, stats, log)
 	if err != nil {
 		_ = db.Close()
 		return nil, err
@@ -183,18 +184,18 @@ func Import(opts Options) (*Stats, error) {
 
 	// ─── final compaction ────────────────────────────────────────────
 	t1 := time.Now()
-	fmt.Fprintf(logw, "[import] starting final compaction (this can take a while on cosmoshub)...\n")
+	log.Info("starting final compaction")
 	if err := db.Flush(); err != nil {
-		fmt.Fprintf(logw, "warning: pre-compact flush failed: %v\n", err)
+		log.Warn("pre-compact flush failed", "err", err)
 	}
 	if err := db.Compact([]byte{0x00}, []byte{0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff}, true); err != nil {
-		fmt.Fprintf(logw, "warning: final compact failed: %v\n", err)
+		log.Warn("final compact failed", "err", err)
 	}
 	stats.FinalCompactElapsed = time.Since(t1).Truncate(time.Millisecond)
-	fmt.Fprintf(logw, "[import] final compaction elapsed=%s\n", stats.FinalCompactElapsed)
+	log.Info("final compaction complete", "elapsed", stats.FinalCompactElapsed)
 
 	if err := db.Close(); err != nil {
-		fmt.Fprintf(logw, "warning: close after compact failed: %v\n", err)
+		log.Warn("close after compact failed", "err", err)
 	}
 
 	// ─── cleanup pass: reopen + Compact to reclaim orphan SSTs ───────
@@ -203,7 +204,7 @@ func Import(opts Options) (*Stats, error) {
 	// those deletions don't always drain before Close. The next Open
 	// reclaims them via manifest replay — typically saves ~10 GiB.
 	t2 := time.Now()
-	fmt.Fprintf(logw, "[import] starting cleanup pass (reopen + reclaim orphan SSTs)...\n")
+	log.Info("starting cleanup pass")
 	cleanup, err := pebble.Open(appdbDir, &pebble.Options{
 		MaxConcurrentCompactions: func() int { return maxCompact },
 	})
@@ -211,21 +212,21 @@ func Import(opts Options) (*Stats, error) {
 		return nil, fmt.Errorf("cleanup reopen: %w", err)
 	}
 	if err := cleanup.Flush(); err != nil {
-		fmt.Fprintf(logw, "warning: cleanup flush failed: %v\n", err)
+		log.Warn("cleanup flush failed", "err", err)
 	}
 	if err := cleanup.Compact([]byte{0x00}, []byte{0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff}, true); err != nil {
-		fmt.Fprintf(logw, "warning: cleanup compact failed: %v\n", err)
+		log.Warn("cleanup compact failed", "err", err)
 	}
 	if err := cleanup.Close(); err != nil {
-		fmt.Fprintf(logw, "warning: cleanup close failed: %v\n", err)
+		log.Warn("cleanup close failed", "err", err)
 	}
 	stats.CleanupElapsed = time.Since(t2).Truncate(time.Millisecond)
-	fmt.Fprintf(logw, "[import] cleanup pass elapsed=%s\n", stats.CleanupElapsed)
+	log.Info("cleanup pass complete", "elapsed", stats.CleanupElapsed)
 
 	stats.Elapsed = time.Since(t0).Truncate(time.Millisecond)
-	fmt.Fprintf(logw, "[import] total elapsed=%s, stores=%d, output=%s\n",
-		stats.Elapsed, len(stores), appdbDir)
-	fmt.Fprintf(logw, "[import] runtime stats: NumGoroutine=%d\n", runtime.NumGoroutine())
+	log.Info("import complete",
+		"elapsed", stats.Elapsed, "stores", len(stores), "output", appdbDir,
+		"goroutines", runtime.NumGoroutine())
 
 	return stats, nil
 }
