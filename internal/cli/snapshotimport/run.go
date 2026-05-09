@@ -10,11 +10,16 @@
 package snapshotimport
 
 import (
+	"context"
 	"encoding/json"
 	"flag"
 	"fmt"
+	"log/slog"
 	"os"
 	"path/filepath"
+	"runtime"
+	"runtime/pprof"
+	"time"
 
 	"github.com/zrbecker/cosmos-p2p/internal/config"
 	malcomlog "github.com/zrbecker/cosmos-p2p/internal/log"
@@ -38,6 +43,12 @@ func Run(args []string) int {
 	noExt := fs.Bool("no-extensions", false, "skip writing extension payloads")
 	logMode := fs.String("log", "", "log output: auto (default), pretty, text, json")
 	debug := fs.Bool("debug", false, "verbose logging")
+	cpuProfile := fs.String("cpuprofile", "", "write a pprof CPU profile to this path; open with `go tool pprof -http=: <path>`")
+	memProfile := fs.String("memprofile", "", "write a pprof heap profile to this path at end of run")
+	memStats := fs.Bool("mem-stats", false, "log runtime.MemStats every 10s during the run (module=memstats)")
+	parallel := fs.Bool("parallel", false, "use the parallel pipeline: decompress to temp file once, then process stores concurrently across workers")
+	parallelWorkers := fs.Int("workers", 0, "max concurrent store workers in -parallel mode (default min(NumCPU, 4))")
+	tempDir := fs.String("tmp-dir", "", "where to put the decompressed temp file in -parallel mode (default = -out dir; needs ~snapshot-decompressed-size of free space)")
 	if err := fs.Parse(args); err != nil {
 		return 2
 	}
@@ -65,6 +76,33 @@ func Run(args []string) int {
 	}
 	logger := malcomlog.New(logOpts)
 	log := logger.With("module", "import-cli")
+
+	// CPU profile spans the whole Run including the final compact +
+	// cleanup pass — useful for profiling the entire pipeline, not
+	// just the stream phase.
+	if *cpuProfile != "" {
+		f, err := os.Create(*cpuProfile)
+		if err != nil {
+			log.Error("create cpu profile failed", "path", *cpuProfile, "err", err)
+			return 1
+		}
+		if err := pprof.StartCPUProfile(f); err != nil {
+			log.Error("start cpu profile failed", "err", err)
+			_ = f.Close()
+			return 1
+		}
+		defer func() {
+			pprof.StopCPUProfile()
+			_ = f.Close()
+			log.Info("cpu profile written", "path", *cpuProfile)
+		}()
+	}
+
+	if *memStats {
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+		go runMemStatsTicker(ctx, logger.With("module", "memstats"), 10*time.Second)
+	}
 
 	// Read meta.json if present. The chain id and height are normally
 	// drawn from here so the user doesn't have to repeat themselves;
@@ -143,7 +181,7 @@ func Run(args []string) int {
 		"max_compact", ch.Import.MaxConcurrentCompactions,
 		"extensions", !*noExt)
 
-	stats, err := snapshotimport.Import(snapshotimport.Options{
+	importOpts := snapshotimport.Options{
 		SnapshotDir:              *snapshotDir,
 		OutDir:                   outDir,
 		Height:                   *height,
@@ -152,7 +190,17 @@ func Run(args []string) int {
 		CacheMB:                  ch.Import.CacheMB,
 		MaxConcurrentCompactions: ch.Import.MaxConcurrentCompactions,
 		Log:                      logger,
-	})
+	}
+	var stats *snapshotimport.Stats
+	if *parallel {
+		stats, err = snapshotimport.ImportParallel(snapshotimport.ParallelOptions{
+			Options: importOpts,
+			Workers: *parallelWorkers,
+			TempDir: *tempDir,
+		})
+	} else {
+		stats, err = snapshotimport.Import(importOpts)
+	}
 	if err != nil {
 		log.Error("import failed", "err", err)
 		return 1
@@ -170,11 +218,69 @@ func Run(args []string) int {
 		"extensions", stats.Extensions,
 		"ext_payloads", stats.ExtensionPayloads,
 		"stream_elapsed", stats.StreamElapsed,
+		"stream_decode_elapsed", stats.StreamDecodeElapsed,
+		"stream_iavl_elapsed", stats.StreamIAVLElapsed,
+		"stream_pebble_elapsed", stats.StreamPebbleElapsed,
 		"final_compact_elapsed", stats.FinalCompactElapsed,
 		"cleanup_elapsed", stats.CleanupElapsed,
 		"appdb", finalDB,
 		"appdb_bytes", dbBytes)
+
+	if *memProfile != "" {
+		f, err := os.Create(*memProfile)
+		if err != nil {
+			log.Error("create mem profile failed", "path", *memProfile, "err", err)
+			return 1
+		}
+		runtime.GC() // GC once so the heap profile reflects steady-state, not leftover obsolete allocations
+		if err := pprof.Lookup("heap").WriteTo(f, 0); err != nil {
+			log.Error("write mem profile failed", "err", err)
+			_ = f.Close()
+			return 1
+		}
+		_ = f.Close()
+		log.Info("mem profile written", "path", *memProfile)
+	}
 	return 0
+}
+
+// runMemStatsTicker logs runtime.MemStats every interval. Deltas
+// (num_gc, gc_pause_ns) are reported since the previous tick so the
+// reader can spot bursts; absolute fields (heap_alloc, heap_sys,
+// next_gc) show steady-state.
+func runMemStatsTicker(ctx context.Context, log *slog.Logger, interval time.Duration) {
+	t := time.NewTicker(interval)
+	defer t.Stop()
+
+	var prev runtime.MemStats
+	runtime.ReadMemStats(&prev)
+	log.Info("baseline",
+		"heap_alloc_bytes", prev.HeapAlloc,
+		"heap_sys_bytes", prev.HeapSys,
+		"next_gc_bytes", prev.NextGC,
+		"num_gc", uint64(prev.NumGC),
+	)
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-t.C:
+			var m runtime.MemStats
+			runtime.ReadMemStats(&m)
+			log.Info("snapshot",
+				"heap_alloc_bytes", m.HeapAlloc,
+				"heap_sys_bytes", m.HeapSys,
+				"heap_inuse_bytes", m.HeapInuse,
+				"next_gc_bytes", m.NextGC,
+				"num_gc_delta", uint64(m.NumGC-prev.NumGC),
+				"gc_pause_ns_delta", m.PauseTotalNs-prev.PauseTotalNs,
+				"gc_cpu_fraction", m.GCCPUFraction,
+				"goroutines", runtime.NumGoroutine(),
+			)
+			prev = m
+		}
+	}
 }
 
 func readMeta(path string) (metaJSON, error) {

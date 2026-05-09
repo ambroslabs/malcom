@@ -81,6 +81,14 @@ type Stats struct {
 	StreamElapsed       time.Duration
 	FinalCompactElapsed time.Duration
 	CleanupElapsed      time.Duration
+
+	// Sub-timing inside the stream phase. Time is sampled at chunk
+	// boundaries — each loop iteration accumulates one of three
+	// buckets, so the three sum to roughly StreamElapsed (small slack
+	// for the bookkeeping itself).
+	StreamDecodeElapsed time.Duration // proto decode of SnapshotItems off the wire
+	StreamIAVLElapsed   time.Duration // IAVL stack ops (addNode / finalize / hash)
+	StreamPebbleElapsed time.Duration // batch.Set + batch.Commit
 }
 
 // StoreInfo is declared in commitinfo.go (Name, Hash[32]byte).
@@ -163,6 +171,12 @@ func Import(opts Options) (*Stats, error) {
 		MaxOpenFiles:                4096,
 		MaxConcurrentCompactions:    func() int { return maxCompact },
 		Logger:                      pebbleLog,
+		// L0 SSTables produced during bulk-load are throwaway — the
+		// final Compact below rewrites them into a single, snappy-
+		// compressed L6 set. Skipping L0 compression saves ~10% of
+		// the stream's CPU budget (snappy.encodeBlock dominated the
+		// flat profile). Deeper levels keep their default Snappy.
+		Levels: []pebble.LevelOptions{{Compression: pebble.NoCompression}},
 	}
 	if bulkLoad {
 		popts.DisableAutomaticCompactions = true
@@ -175,10 +189,21 @@ func Import(opts Options) (*Stats, error) {
 	}
 	// No defer Close — we explicitly Close before the cleanup reopen.
 
+	// Tmp dir for per-store fast-path SSTable Writers. The bulk-ingest
+	// path writes f/ entries to one SSTable per store, then atomically
+	// links them into the LSM via db.Ingest at end-of-store. Removed
+	// after Import returns.
+	ingestTmpDir := filepath.Join(opts.OutDir, "ingest-tmp")
+	if err := os.MkdirAll(ingestTmpDir, 0o755); err != nil {
+		_ = db.Close()
+		return nil, fmt.Errorf("mkdir ingest tmp: %w", err)
+	}
+	defer os.RemoveAll(ingestTmpDir)
+
 	// ─── run the streaming import ────────────────────────────────────
 	streamStart := time.Now()
 	stats := &Stats{}
-	stores, err := runImport(cr, db, opts.Height, extDir, stats, log)
+	stores, err := runImport(cr, db, opts.Height, extDir, ingestTmpDir, stats, log)
 	if err != nil {
 		_ = db.Close()
 		return nil, err

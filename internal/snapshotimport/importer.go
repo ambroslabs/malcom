@@ -10,6 +10,7 @@
 package snapshotimport
 
 import (
+	"context"
 	"encoding/binary"
 	"fmt"
 	"io"
@@ -31,6 +32,7 @@ type frame struct {
 // storeImporter rebuilds one IAVL store. Reset between stores via
 // resetForStore.
 type storeImporter struct {
+	storeName   string
 	storePrefix []byte // "s/k:<name>/"
 
 	// nonces[v] = next nonce to assign for a node at version v. The
@@ -54,7 +56,16 @@ type storeImporter struct {
 	// canonical key — bypassing the need for a redirect entry. (iavl's
 	// isReferenceRoot only follows redirects whose value starts with
 	// the 's' nodeKey prefix; raw nodeKey bytes are NOT recognised.)
+	//
+	// Owned storage (we copy into it) so it survives the scratch-buf
+	// reuse on the next addNode call.
 	lastIavlBytes []byte
+
+	// Scratch buffers reused across addNode calls. set/setFast both
+	// copy the bytes into pebble's internal buffers, so we can hand
+	// them slices into our scratch and reuse on the next call.
+	keyScratch   []byte
+	valueScratch []byte
 
 	// running totals for progress logs
 	itemCount  uint64
@@ -64,6 +75,7 @@ type storeImporter struct {
 
 func newStoreImporter(storeName string, height int64) *storeImporter {
 	return &storeImporter{
+		storeName:   storeName,
 		storePrefix: storePrefix(storeName),
 		nonces:      make(map[int64]uint32),
 		stack:       make([]frame, 0, 64),
@@ -72,11 +84,15 @@ func newStoreImporter(storeName string, height int64) *storeImporter {
 }
 
 // addNode processes one IAVL ExportNode (post-order LRN). It hashes,
-// encodes, writes to the batch, and pushes a frame onto the stack. The
-// caller writes batch entries via the `set` callback rather than us
-// owning the batch — keeps batch lifecycle (flush thresholds, async
-// commit, error handling) out of the importer's concerns.
-func (s *storeImporter) addNode(set func(key, value []byte) error,
+// encodes, writes to the batch, and pushes a frame onto the stack.
+//
+// Two callbacks: `set` is the batch path (used for s/ node entries
+// and m/ metadata, which arrive in non-byte-sorted order). `setFast`
+// receives f/ fast-storage entries, which arrive in byte-sorted
+// order (postorder leaves = sorted user-keys) and can be routed to
+// an SSTable Writer for bulk-ingest. Pass the same callback for
+// both to disable bulk-ingest.
+func (s *storeImporter) addNode(set, setFast func(key, value []byte) error,
 	height int8, version int64, key, value []byte) error {
 
 	s.itemCount++
@@ -85,15 +101,19 @@ func (s *storeImporter) addNode(set func(key, value []byte) error,
 		nonce := s.nextNonce(version)
 
 		h := hashLeaf(version, key, value)
-		nodeBytes := encodeLeafNode(key, value)
-		if err := set(nodeDBKey(s.storePrefix, version, nonce), nodeBytes); err != nil {
+		s.valueScratch = encodeLeafNodeInto(s.valueScratch[:0], key, value)
+		s.keyScratch = nodeDBKeyInto(s.keyScratch[:0], s.storePrefix, version, nonce)
+		if err := set(s.keyScratch, s.valueScratch); err != nil {
 			return fmt.Errorf("set leaf node: %w", err)
 		}
-		s.lastIavlBytes = nodeBytes
+		// Preserve a copy for finalize's canonical-root re-emit; the
+		// scratch buffer gets clobbered on the next addNode call.
+		s.lastIavlBytes = append(s.lastIavlBytes[:0], s.valueScratch...)
 
 		// fast-storage entry: 'f' || userKey → varint(version) || EncodeBytes(value)
-		if err := set(fastDBKey(s.storePrefix, key),
-			encodeFastNode(version, value)); err != nil {
+		s.valueScratch = encodeFastNodeInto(s.valueScratch[:0], version, value)
+		s.keyScratch = fastDBKeyInto(s.keyScratch[:0], s.storePrefix, key)
+		if err := setFast(s.keyScratch, s.valueScratch); err != nil {
 			return fmt.Errorf("set fast node: %w", err)
 		}
 
@@ -128,13 +148,15 @@ func (s *storeImporter) addNode(set func(key, value []byte) error,
 	nonce := s.nextNonce(version)
 	h := hashInner(version, height, size, left.hash, right.hash)
 
-	nodeBytes := encodeInnerNode(height, size, key, h,
+	s.valueScratch = encodeInnerNodeInto(s.valueScratch[:0],
+		height, size, key, h,
 		left.version, left.nonce,
 		right.version, right.nonce)
-	if err := set(nodeDBKey(s.storePrefix, version, nonce), nodeBytes); err != nil {
+	s.keyScratch = nodeDBKeyInto(s.keyScratch[:0], s.storePrefix, version, nonce)
+	if err := set(s.keyScratch, s.valueScratch); err != nil {
 		return fmt.Errorf("set inner node: %w", err)
 	}
-	s.lastIavlBytes = nodeBytes
+	s.lastIavlBytes = append(s.lastIavlBytes[:0], s.valueScratch...)
 
 	s.stack = append(s.stack, frame{
 		hash:    h,
@@ -192,7 +214,8 @@ func (s *storeImporter) finalize(set func(key, value []byte) error) ([32]byte, e
 	if len(s.stack) == 0 {
 		// Empty store — write an empty root marker (gaiad reads this
 		// via nodeDBKey(snapshotHeight, 1) and tolerates an empty value).
-		if err := set(nodeDBKey(s.storePrefix, s.height, 1), nil); err != nil {
+		s.keyScratch = nodeDBKeyInto(s.keyScratch[:0], s.storePrefix, s.height, 1)
+		if err := set(s.keyScratch, nil); err != nil {
 			return [32]byte{}, fmt.Errorf("set empty root marker: %w", err)
 		}
 		return [32]byte{}, nil
@@ -221,8 +244,8 @@ func (s *storeImporter) finalize(set func(key, value []byte) error) ([32]byte, e
 	// The encoded inner-node bytes don't embed the node's own nodeKey
 	// (only its children's leftNodeKey/rightNodeKey are encoded), so
 	// the same byte sequence is valid at any storage location.
-	rootCanonicalKey := nodeDBKey(s.storePrefix, root.version, 1)
-	if err := set(rootCanonicalKey, s.lastIavlBytes); err != nil {
+	s.keyScratch = nodeDBKeyInto(s.keyScratch[:0], s.storePrefix, root.version, 1)
+	if err := set(s.keyScratch, s.lastIavlBytes); err != nil {
 		return [32]byte{}, fmt.Errorf("set canonical root at (rootVersion, 1): %w", err)
 	}
 
@@ -243,7 +266,8 @@ func (s *storeImporter) finalize(set func(key, value []byte) error) ([32]byte, e
 		redirectVal[0] = 's'
 		binary.BigEndian.PutUint64(redirectVal[1:], uint64(root.version))
 		binary.BigEndian.PutUint32(redirectVal[9:], 1)
-		if err := set(nodeDBKey(s.storePrefix, s.height, 1), redirectVal[:]); err != nil {
+		s.keyScratch = nodeDBKeyInto(s.keyScratch[:0], s.storePrefix, s.height, 1)
+		if err := set(s.keyScratch, redirectVal[:]); err != nil {
 			return [32]byte{}, fmt.Errorf("set root redirect at (snapshotHeight, 1): %w", err)
 		}
 	}
@@ -252,7 +276,8 @@ func (s *storeImporter) finalize(set func(key, value []byte) error) ([32]byte, e
 	// skips the (multi-minute) "Upgrading IAVL storage" pass.
 	metaVal := []byte(fmt.Sprintf("%s%s%d",
 		fastStorageVersionValue, fastStorageVersionDelimiter, s.height))
-	if err := set(metadataDBKey(s.storePrefix, "storage_version"), metaVal); err != nil {
+	s.keyScratch = metadataDBKeyInto(s.keyScratch[:0], s.storePrefix, "storage_version")
+	if err := set(s.keyScratch, metaVal); err != nil {
 		return [32]byte{}, fmt.Errorf("set storage_version marker: %w", err)
 	}
 
@@ -275,8 +300,23 @@ func (s *storeImporter) finalize(set func(key, value []byte) error) ([32]byte, e
 //
 // Returns the per-store root hashes in stream order (typically
 // alphabetical, by cosmos-sdk's exporter convention).
-func runImport(r io.Reader, db *pebble.DB, height int64, extDir string, stats *Stats, log *slog.Logger) ([]StoreInfo, error) {
-	sr := newSnapReader(r)
+func runImport(r io.Reader, db *pebble.DB, height int64, extDir, ingestTmpDir string, stats *Stats, log *slog.Logger) ([]StoreInfo, error) {
+	// Decouple zlib decompression from the IAVL+pebble work via a
+	// prefetch goroutine. 8 × 1 MiB buffers ≈ 8 MiB of read-ahead;
+	// enough to absorb the variance in chunk read latency without
+	// touching the 256 MiB memtable budget. Per-buffer allocation
+	// adds ~36 MB/s of GC pressure (negligible — measured 0.2-0.5%
+	// GC CPU in baseline).
+	pf := newPrefetchReader(context.Background(), r, 8, 1<<20)
+	defer pf.Close()
+	sr := newSnapReader(pf)
+
+	// Sub-phase accumulators reported on Stats. Decode = sr.Next()
+	// (proto decode + chunk read + zlib decompress). Pebble = anything
+	// inside set / flush / batch.Commit. IAVL is computed as the
+	// residual: streamElapsed - decode - pebble (covers IAVL hashing,
+	// addNode, finalize, plus a sliver of bookkeeping).
+	var decodeNanos, pebbleNanos int64
 
 	const flushBytes = 64 << 20 // 64 MiB per batch
 	batch := db.NewBatch()
@@ -285,13 +325,19 @@ func runImport(r io.Reader, db *pebble.DB, height int64, extDir string, stats *S
 		if batchBytes == 0 {
 			return nil
 		}
-		err := batch.Commit(pebble.Sync)
+		// NoSync: skip per-batch fsync. The import is recoverable —
+		// a crash mid-stream means re-running snapshot import from a
+		// fresh DB, not preserving partial state. Final flush at end
+		// of stream uses Sync to make the completed import durable.
+		err := batch.Commit(pebble.NoSync)
 		batch.Close()
 		batch = db.NewBatch()
 		batchBytes = 0
 		return err
 	}
 	set := func(key, value []byte) error {
+		t0 := time.Now()
+		defer func() { pebbleNanos += time.Since(t0).Nanoseconds() }()
 		if err := batch.Set(key, value, nil); err != nil {
 			return err
 		}
@@ -301,6 +347,14 @@ func runImport(r io.Reader, db *pebble.DB, height int64, extDir string, stats *S
 		}
 		return nil
 	}
+
+	// Fast-path SSTable ingester. One *sstable.Writer per store
+	// accumulates byte-sorted f/ entries; on closeCurrent the file
+	// is closed and atomically linked into the LSM via db.Ingest.
+	// Bypasses memtable + WAL + batch sort + L0→L6 compaction for
+	// fast-storage data, which is ~half of the import volume.
+	ing := newFastIngester(db, ingestTmpDir, log)
+	defer ing.cleanup()
 
 	var (
 		current   *storeImporter
@@ -319,6 +373,13 @@ func runImport(r io.Reader, db *pebble.DB, height int64, extDir string, stats *S
 		if err != nil {
 			return fmt.Errorf("finalize store %q: %w", curName, err)
 		}
+		// Close + ingest the per-store fast-path SSTable. ingestStore
+		// is a no-op if no fast entries were emitted (empty stores).
+		// Done before flushing the batch so the f/ entries are visible
+		// to any subsequent reads, though no readers exist mid-import.
+		if err := ing.ingestStore(current.storeName); err != nil {
+			return fmt.Errorf("ingest fast SSTable for %q: %w", curName, err)
+		}
 		stores = append(stores, StoreInfo{Name: curName, Hash: hash})
 		stats.Items += current.itemCount
 		log.Info("store complete",
@@ -332,7 +393,9 @@ func runImport(r io.Reader, db *pebble.DB, height int64, extDir string, stats *S
 	}
 
 	for {
+		decT0 := time.Now()
 		item, err := sr.Next()
+		decodeNanos += time.Since(decT0).Nanoseconds()
 		if err == io.EOF {
 			break
 		}
@@ -347,12 +410,15 @@ func runImport(r io.Reader, db *pebble.DB, height int64, extDir string, stats *S
 			current = newStoreImporter(item.StoreName, height)
 			curName = item.StoreName
 			storeAt = time.Now()
+			if err := ing.openStore(item.StoreName); err != nil {
+				return nil, fmt.Errorf("open fast SSTable for %q: %w", curName, err)
+			}
 			log.Info("open store", "store", curName)
 		case itemTypeIAVL:
 			if current == nil {
 				return nil, fmt.Errorf("IAVL item before any StoreItem")
 			}
-			if err := current.addNode(set,
+			if err := current.addNode(set, ing.set,
 				item.IAVLHeight, item.IAVLVersion,
 				item.IAVLKey, item.IAVLValue); err != nil {
 				return nil, fmt.Errorf("add node into %q: %w", curName, err)
@@ -388,13 +454,34 @@ func runImport(r io.Reader, db *pebble.DB, height int64, extDir string, stats *S
 		return nil, fmt.Errorf("write latest-version: %w", err)
 	}
 
-	if err := flush(); err != nil {
-		return nil, fmt.Errorf("flush final batch: %w", err)
+	// Final flush uses Sync so the completed import survives a crash —
+	// per-batch fsyncs were skipped via NoSync above for throughput.
+	finalFlushStart := time.Now()
+	if batchBytes > 0 {
+		if err := batch.Commit(pebble.Sync); err != nil {
+			return nil, fmt.Errorf("flush final batch: %w", err)
+		}
+		batch.Close()
+		batch = db.NewBatch()
+		batchBytes = 0
 	}
+	pebbleNanos += time.Since(finalFlushStart).Nanoseconds()
+
+	streamDur := time.Since(startedAt)
+	stats.StreamDecodeElapsed = time.Duration(decodeNanos)
+	stats.StreamPebbleElapsed = time.Duration(pebbleNanos)
+	residual := streamDur - stats.StreamDecodeElapsed - stats.StreamPebbleElapsed
+	if residual < 0 {
+		residual = 0
+	}
+	stats.StreamIAVLElapsed = residual
 
 	log.Info("stream complete",
-		"elapsed", time.Since(startedAt).Truncate(time.Millisecond),
-		"stores", len(stores))
+		"elapsed", streamDur.Truncate(time.Millisecond),
+		"stores", len(stores),
+		"decode_elapsed", stats.StreamDecodeElapsed.Truncate(time.Millisecond),
+		"iavl_elapsed", stats.StreamIAVLElapsed.Truncate(time.Millisecond),
+		"pebble_elapsed", stats.StreamPebbleElapsed.Truncate(time.Millisecond))
 
 	return stores, nil
 }
