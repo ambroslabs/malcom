@@ -66,6 +66,14 @@ type ParallelOptions struct {
 	// has no effect.
 	TempDir string
 
+	// ChunkMB caps the in-memory chunk ring (the streaming buffer
+	// between stage 1 decompression and stage 2 per-store readers).
+	// 0 = auto: 15% of total RAM, capped at 8 GiB, floored at
+	// 256 MiB. Lower values reduce peak RSS at the cost of more
+	// stage-1 backpressure on multi-store-concurrent chains. On bbn
+	// finality (single polestar) any reasonable cap suffices.
+	ChunkMB int
+
 	// WaveParallel turns on within-store wave-parallel hashing per
 	// store: each per-store worker spawns a hash worker pool and
 	// dispatcher (see importer_par.go) so the IAVL hash + encode
@@ -114,16 +122,20 @@ func ImportParallel(opts ParallelOptions) (*Stats, error) {
 	// In-memory chunk ring replaces the on-disk decompressed.tmp.
 	// Stage 1 streams decompressed bytes into the ring; stage 2
 	// workers each create a reader at their store's start offset.
-	// 4 GiB cap is enough for typical multi-store interleave (cosmoshub
-	// bank+ibc, osmosis cl+ibc+wasm) without forcing stage 1 to back
-	// off; readers' min-cursor pins eviction so old chunks free as
-	// the slowest reader advances. opts.TempDir is preserved as a
-	// CLI knob but only honored when ringMaxBytes==0 (=opt-out path
-	// removed; the field is now unused).
-	const (
-		ringChunkSize = 4 << 20
-		ringMaxBytes  = 4 << 30
-	)
+	// Readers' min-cursor pins eviction so old chunks free as the
+	// slowest reader advances. The ring uses an internal free-list
+	// so its memory budget (active chunks + free slabs) is bounded
+	// at exactly chunkMB MiB regardless of allocation rate.
+	const ringChunkSize = 4 << 20
+	chunkMB := opts.ChunkMB
+	if chunkMB <= 0 {
+		chunkMB = defaultChunkMB()
+	}
+	ringMaxBytes := int64(chunkMB) << 20
+	if ringMaxBytes < int64(ringChunkSize) {
+		ringMaxBytes = int64(ringChunkSize)
+	}
+	log.Info("chunk ring sized", "chunk_mb", chunkMB, "auto", opts.ChunkMB <= 0)
 	ring := newChunkRing(ringChunkSize, ringMaxBytes)
 
 	memMB := opts.MemtableMB

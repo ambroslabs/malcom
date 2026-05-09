@@ -23,7 +23,33 @@ import (
 	"fmt"
 	"io"
 	"sync"
+	"syscall"
 )
+
+// defaultChunkMB returns the default chunk-ring memory budget (in
+// MiB) when the user passes 0 (auto). Heuristic: 15% of total RAM,
+// capped at 8 GiB, floored at 256 MiB. On systems where the
+// syscall fails, falls back to 1024 MiB.
+func defaultChunkMB() int {
+	const (
+		fallback = 1024
+		floor    = 256
+		ceiling  = 8 * 1024
+	)
+	var info syscall.Sysinfo_t
+	if err := syscall.Sysinfo(&info); err != nil {
+		return fallback
+	}
+	totalBytes := uint64(info.Totalram) * uint64(info.Unit)
+	target := totalBytes * 15 / 100 / (1 << 20)
+	if target > ceiling {
+		target = ceiling
+	}
+	if target < floor {
+		target = floor
+	}
+	return int(target)
+}
 
 // chunkEnt is one in-memory decompressed chunk, owned by the ring
 // until evicted. start is its offset in the decompressed stream;
@@ -48,6 +74,15 @@ type chunkRing struct {
 	closed bool        // producer signaled EOF
 	err    error       // producer error captured here so readers see it
 	readers []*chunkRingReader
+
+	// freeBufs is a fixed-cap pool of chunkSize-cap byte slices
+	// recycled across allocations. Cap is maxBytes/chunkSize so the
+	// ring's total memory (active chunks + free-list) never exceeds
+	// maxBytes by more than one chunkSize. Avoids GC churn on the
+	// 76 GB / run that flows through the ring on bbn finality —
+	// without a pool, every 4 MiB chunk is a fresh make() and an
+	// eventual GC reclamation.
+	freeBufs [][]byte
 }
 
 // newChunkRing returns a ring with the given chunk size and max-bytes
@@ -59,9 +94,40 @@ func newChunkRing(chunkSize int, maxBytes int64) *chunkRing {
 	if maxBytes < int64(chunkSize) {
 		panic("chunkRing: maxBytes must be >= chunkSize")
 	}
-	r := &chunkRing{chunkSize: chunkSize, maxBytes: maxBytes}
+	maxChunks := int(maxBytes / int64(chunkSize))
+	r := &chunkRing{
+		chunkSize: chunkSize,
+		maxBytes:  maxBytes,
+		freeBufs:  make([][]byte, 0, maxChunks),
+	}
 	r.cond = sync.NewCond(&r.mu)
 	return r
+}
+
+// allocBuf returns a chunkSize-cap, zero-length byte slice. Pulls
+// from the free list when possible; otherwise allocates fresh.
+// Caller holds r.mu.
+func (r *chunkRing) allocBufLocked() []byte {
+	if n := len(r.freeBufs); n > 0 {
+		buf := r.freeBufs[n-1]
+		r.freeBufs[n-1] = nil
+		r.freeBufs = r.freeBufs[:n-1]
+		return buf[:0]
+	}
+	return make([]byte, 0, r.chunkSize)
+}
+
+// freeBufLocked returns a buffer to the free list. Drops on the
+// floor if the list is at cap (= ring.maxBytes worth of free
+// slabs already pooled). Caller holds r.mu.
+func (r *chunkRing) freeBufLocked(b []byte) {
+	if cap(b) != r.chunkSize {
+		return
+	}
+	if len(r.freeBufs) >= cap(r.freeBufs) {
+		return
+	}
+	r.freeBufs = append(r.freeBufs, b[:0])
 }
 
 // Write appends bytes to the ring, splitting into chunks of
@@ -117,10 +183,10 @@ func (r *chunkRing) Write(p []byte) (int, error) {
 		if take == 0 {
 			continue
 		}
-		// Allocate a fresh-capped buffer so future appends to this
-		// chunk land in its own backing array.
-		buf := make([]byte, take, r.chunkSize)
-		copy(buf, p[written:written+take])
+		// Pull a chunkSize-cap buffer from the free list (or alloc
+		// fresh) and seed it with the new bytes.
+		buf := r.allocBufLocked()
+		buf = append(buf, p[written:written+take]...)
 		r.chunks = append(r.chunks, chunkEnt{start: r.tail, data: buf})
 		r.tail += int64(take)
 		written += take
@@ -276,5 +342,6 @@ func (r *chunkRing) evictLocked() {
 		}
 		r.head = c.start + int64(len(c.data))
 		r.chunks = r.chunks[1:]
+		r.freeBufLocked(c.data)
 	}
 }
