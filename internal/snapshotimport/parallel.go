@@ -541,6 +541,19 @@ func stage2RunWorkersFromChan(
 	return stores, stats, nil
 }
 
+// defaultParWorkers returns the per-store wave-parallel hash worker
+// count. NumCPU is reasonable: when other stores in the outer pool
+// are still running, the OS scheduler shares; when only one store
+// remains (= the polestar at the tail of the run, e.g. babylon's
+// finality), it can absorb the spare cores.
+func defaultParWorkers() int {
+	n := runtime.NumCPU()
+	if n < 1 {
+		return 1
+	}
+	return n
+}
+
 // asyncBatchWriter owns the pebble Commit work for one store. The
 // main loop submits filled batches; this goroutine drains them and
 // calls Commit + Close, freeing the main loop to keep building the
@@ -666,17 +679,58 @@ func processStoreSegment(
 	}
 
 	si := newStoreImporter(store.Name, height)
+
+	// Wave-parallel mode: spawn a writer goroutine that drains the
+	// per-store writeQ into the batch, plus the storeImporter's hash
+	// worker pool. The writer goroutine is the SOLE caller of `set`
+	// during the streaming phase, so pebble.Batch's single-writer
+	// requirement is satisfied even with N concurrent hash workers
+	// pushing to writeQ.
+	//
+	// pendingCap is bounded by parState; the writeQ buffer absorbs
+	// the gap between worker hash rate and writer flush rate. 4096
+	// entries × ~150 B encoded ≈ 600 KB peak per store.
+	parWorkers := defaultParWorkers()
+	writeQ := make(chan writeEnt, 4096)
+	writerDone := make(chan error, 1)
+	go func() {
+		var werr error
+		for ent := range writeQ {
+			if werr != nil {
+				continue // drain remaining to let workers exit cleanly
+			}
+			if err := set(ent.key, ent.encoded); err != nil {
+				werr = err
+			}
+		}
+		writerDone <- werr
+	}()
+	si.enableWaveParallel(parWorkers, writeQ)
+
+	// Decoder pipeline: a separate goroutine reads sr.Next() and pushes
+	// decoded items to itemQ. The main loop reads from itemQ instead of
+	// calling sr.Next() inline. Profiling showed sr.Next at ~33% of the
+	// per-store main-goroutine CPU on bbn finality; pulling that off
+	// the main goroutine lets the hash-worker pool run closer to its
+	// throughput ceiling on a single-store-dominated chain.
+	const itemQBuf = 4096
+	itemQ := make(chan *snapItem, itemQBuf)
+	decErr := make(chan error, 1)
+	go func() {
+		defer close(itemQ)
+		for {
+			item, err := sr.Next()
+			if err != nil {
+				decErr <- err
+				return
+			}
+			itemQ <- item
+		}
+	}()
+
 	storeStart := time.Now()
 	var items uint64
-	for {
-		item, err := sr.Next()
-		if err == io.EOF {
-			break
-		}
-		if err != nil {
-			_ = batch.Close()
-			return StoreInfo{}, 0, 0, 0, fmt.Errorf("read item: %w", err)
-		}
+	for item := range itemQ {
 		switch item.Type {
 		case itemTypeStore:
 			// First item must be the StoreItem marking this segment.
@@ -700,6 +754,24 @@ func processStoreSegment(
 		}
 		items++
 	}
+	if err := <-decErr; err != io.EOF {
+		_ = batch.Close()
+		return StoreInfo{}, 0, 0, 0, fmt.Errorf("read item: %w", err)
+	}
+
+	// Drain hash workers, then close writeQ and wait for the writer
+	// goroutine. After the writer exits, the batch is exclusively
+	// owned by the main goroutine, so finalize can call set inline.
+	if err := si.finishStreaming(); err != nil {
+		_ = batch.Close()
+		return StoreInfo{}, 0, 0, 0, fmt.Errorf("finish streaming: %w", err)
+	}
+	close(writeQ)
+	if werr := <-writerDone; werr != nil {
+		_ = batch.Close()
+		return StoreInfo{}, 0, 0, 0, fmt.Errorf("writer goroutine: %w", werr)
+	}
+
 	hash, err := si.finalize(set)
 	if err != nil {
 		_ = batch.Close()
