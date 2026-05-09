@@ -18,9 +18,18 @@
 
 # Output dirs from `malcom snapshot fetch / import` and `malcom bootstrap`.
 # Live wherever -out points; pattern matches the repo-root case.
+# /gaia_*/ is the legacy bootstrap output name (pre chain-flexible
+# rewrite); /home_*/ is the current name.
 /snapshot_*/
 /appdb_*/
 /gaia_*/
+/home_*/
+
+# Per-session scratch dirs the bootstrap and end-to-end test runs drop
+# at the repo root. Kept locally for investigation.
+/bootstrap-test/
+/e2e-test/
+/prof-runs/
 
 # Backup dirs created by `malcom clean`.
 *.bak.*
