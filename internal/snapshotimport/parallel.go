@@ -479,6 +479,12 @@ func stage2RunWorkersFromChan(
 		info StoreInfo
 		err  error
 	}
+	// Buffered enough for typical chains so a fast main goroutine
+	// rarely blocks on receive, but we drain concurrently so workers
+	// also never block on send. The previous code waited on the
+	// WaitGroup before draining, which deadlocked on chains with more
+	// stores than the channel buffer (e.g. dydx-mainnet-1's 40 stores
+	// vs. a numWorkers*4 = 32 buffer).
 	resultsCh := make(chan workerOut, numWorkers*4)
 
 	stats := &Stats{}
@@ -517,8 +523,10 @@ func stage2RunWorkersFromChan(
 			}
 		}(i)
 	}
-	wg.Wait()
-	close(resultsCh)
+	go func() {
+		wg.Wait()
+		close(resultsCh)
+	}()
 
 	var stores []StoreInfo
 	for r := range resultsCh {
