@@ -7,10 +7,13 @@ import (
 	"encoding/binary"
 	"fmt"
 	"io"
+	"log/slog"
 	"os"
 	"path/filepath"
 
 	"github.com/cockroachdb/pebble"
+
+	malcomlog "github.com/zrbecker/cosmos-p2p/internal/log"
 )
 
 // StateSyncStats summarises a CSDS diff after generation.
@@ -37,8 +40,12 @@ func ComputeStateSync(
 	baseDir, targetDir, outPath, tmpDir string,
 	baseHashHex, targetHashHex string,
 	baseHeight, targetHeight uint64,
+	log *slog.Logger,
 ) (StateSyncStats, error) {
 	var stats StateSyncStats
+	if log == nil {
+		log = slog.New(slog.DiscardHandler)
+	}
 
 	dbPath := filepath.Join(tmpDir, "base-index")
 	if err := os.MkdirAll(dbPath, 0o755); err != nil {
@@ -48,6 +55,7 @@ func ComputeStateSync(
 		DisableWAL:   true,
 		MemTableSize: 64 << 20,
 		Cache:        pebble.NewCache(128 << 20),
+		Logger:       malcomlog.PebbleShim(log.With("module", "pebble")),
 	})
 	if err != nil {
 		return stats, fmt.Errorf("open pebble: %w", err)

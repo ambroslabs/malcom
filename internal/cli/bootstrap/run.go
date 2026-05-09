@@ -1,22 +1,23 @@
 // Package bootstrap is the `malcom bootstrap` subcommand: assemble a
-// complete gaiad home directory from:
+// runnable chain home directory from:
 //   - an application.db produced by `malcom snapshot import`
-//   - a cometbft RPC (for state.db + blockstore.db via offline state-sync)
-//   - a chain genesis.json
+//   - a chain binary (operator-supplied, used for `init` and
+//     `tendermint/comet bootstrap-state`)
+//   - a cometbft RPC (for the trust hash + state.db population)
 //
-// Output: <-out>/gaia_<chain>_<height>/{config,data}/. Default -out is
-// the current working directory.
+// Bootstrap orchestrates subprocess invocations of the chain binary
+// rather than re-implementing chain-specific logic in malcom — that
+// keeps the subcommand chain-agnostic. The hand-rolled config
+// templates that used to live here are gone; the binary writes its
+// own config.toml/app.toml/client.toml via `init`, and malcom only
+// patches a small set of fields after the fact.
 //
-// Tuning (trust period, wasm placement, db backends, moniker) lives
-// in the [chains.<id>.bootstrap] section of config.toml.
+// Output: <-out>/home_<chain>_<height>/{config,data}/. Default -out
+// is the current working directory.
 package bootstrap
 
 import (
-	"bytes"
-	"compress/gzip"
 	"context"
-	"crypto/sha256"
-	"encoding/hex"
 	"encoding/json"
 	"flag"
 	"fmt"
@@ -26,32 +27,37 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
-	"time"
-
-	cfg "github.com/cometbft/cometbft/config"
-	"github.com/cometbft/cometbft/node"
 
 	"github.com/zrbecker/cosmos-p2p/internal/config"
 	malcomlog "github.com/zrbecker/cosmos-p2p/internal/log"
+	"github.com/zrbecker/cosmos-p2p/internal/registry"
+	"github.com/zrbecker/cosmos-p2p/internal/snapshotimport"
 )
 
 // Run is the malcom subcommand entry point. Returns the process exit
 // code (0 on success).
 func Run(args []string) int {
 	fs := flag.NewFlagSet("malcom bootstrap", flag.ContinueOnError)
-	chain := fs.String("chain", "", "chain id (required; must have been added with `malcom add <chain-id>`)")
+	chain := fs.String("chain", "", "chain id (override; required if appdb meta.json is missing or omits chain_id)")
 	appdb := fs.String("appdb", "", "directory containing application.db/ and extensions/ (output of `malcom snapshot import`)")
-	height := fs.Int64("height", 0, "snapshot height (must match application.db)")
-	out := fs.String("out", ".", "parent dir for the gaia home (subdir gaia_<chain>_<height>/ created inside)")
+	height := fs.Int64("height", 0, "height override (required if appdb meta.json is missing or omits height)")
+	out := fs.String("out", ".", "parent dir for the chain home (subdir home_<chain>_<height>/ created inside)")
+	binary := fs.String("binary", "", "path to chain binary; default = $PATH lookup of daemon_name from chain-registry")
+	appStrategy := fs.String("app-strategy", "copy", "how to place application.db: copy|move (move is rename(2), same-fs only)")
+	moniker := fs.String("moniker", "", "moniker passed to <chain-exe> init (default = [chains.<id>.bootstrap].moniker, then 'malcom-bootstrap')")
+	minGasPrices := fs.String("minimum-gas-prices", "", "value for app.toml minimum-gas-prices (default = chain-registry fees.fee_tokens[0]); cosmos-sdk daemons refuse to start without one")
+	forwardPeers := fs.Bool("forward-peers", true, "write fetch's served peers into config.toml's persistent_peers")
+	doCopyAddrbook := fs.Bool("copy-addrbook", true, "copy fetch's addrbook into the chain home's config/addrbook.json")
+	skipInit := fs.Bool("skip-init", false, "skip <chain-exe> init (assumes the operator pre-init'd -out)")
+	overwrite := fs.Bool("overwrite", false, "wipe the chain home before bootstrapping (mutually exclusive with -skip-init)")
 	trustHeight := fs.Int64("trust-height", 0, "trust height for light client (defaults to -height)")
-	trustHashHex := fs.String("trust-hash", "", "trust block hash (hex) at -trust-height; auto-fetched from RPC if empty")
-	overwrite := fs.Bool("overwrite", false, "wipe gaia home's data/ before bootstrapping")
-	skipAppCopy := fs.Bool("skip-app-copy", false, "skip cloning <appdb>/application.db into the gaia home; assume it's already there")
+	trustHashHex := fs.String("trust-hash", "", "trust block hash (hex) at -trust-height; auto-fetched from the chain's first RPC if empty")
 	logMode := fs.String("log", "", "log output: auto (default), pretty, text, json")
 	debug := fs.Bool("debug", false, "verbose logging")
 	if err := fs.Parse(args); err != nil {
 		return 2
 	}
+	extraInitArgs := fs.Args() // anything after `--` becomes extra `<chain-exe> init` args
 
 	mode, ok := malcomlog.ParseMode(*logMode)
 	if !ok {
@@ -59,10 +65,65 @@ func Run(args []string) int {
 		return 2
 	}
 
-	if *chain == "" {
-		fmt.Fprintln(os.Stderr, "required: -chain <id>")
+	if *appdb == "" {
+		fmt.Fprintln(os.Stderr, "required: -appdb <dir>")
 		return 2
 	}
+	if *skipInit && *overwrite {
+		fmt.Fprintln(os.Stderr, "-skip-init and -overwrite are mutually exclusive")
+		return 2
+	}
+	strategy, err := ParseAppStrategy(*appStrategy)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		return 2
+	}
+
+	// Read appdb meta.json. chain_id, height, and db_backend are
+	// drawn from there so the operator doesn't have to repeat them;
+	// flags are required overrides only when meta.json is missing.
+	appdbMeta, metaErr := snapshotimport.ReadAppDBMeta(*appdb)
+	switch {
+	case metaErr != nil && !os.IsNotExist(metaErr):
+		fmt.Fprintf(os.Stderr, "read appdb meta: %v\n", metaErr)
+		return 1
+	case metaErr != nil:
+		if *chain == "" || *height == 0 {
+			fmt.Fprintf(os.Stderr, "no meta.json in %s; pass -chain and -height to override\n", *appdb)
+			return 2
+		}
+	default:
+		if appdbMeta.ChainID != "" && *chain != "" && appdbMeta.ChainID != *chain {
+			fmt.Fprintf(os.Stderr, "meta.json chain_id %q does not match -chain %q\n", appdbMeta.ChainID, *chain)
+			return 1
+		}
+		if appdbMeta.Height != 0 && *height != 0 && appdbMeta.Height != *height {
+			fmt.Fprintf(os.Stderr, "meta.json height %d does not match -height %d\n", appdbMeta.Height, *height)
+			return 1
+		}
+		if *chain == "" {
+			if appdbMeta.ChainID == "" {
+				fmt.Fprintln(os.Stderr, "meta.json has no chain_id; pass -chain to override")
+				return 2
+			}
+			*chain = appdbMeta.ChainID
+		}
+		if *height == 0 {
+			if appdbMeta.Height == 0 {
+				fmt.Fprintln(os.Stderr, "meta.json has no height; pass -height to override")
+				return 2
+			}
+			*height = appdbMeta.Height
+		}
+	}
+
+	// db_backend defaults to pebble for any meta.json that pre-dates
+	// the field (only one backend has ever been written).
+	dbBackend := appdbMeta.DBBackend
+	if dbBackend == "" {
+		dbBackend = snapshotimport.DBBackendPebble
+	}
+
 	cfgFile, err := config.Load()
 	if err != nil {
 		fmt.Fprintln(os.Stderr, err)
@@ -84,82 +145,108 @@ func Run(args []string) int {
 	}
 	log := malcomlog.New(logOpts).With("module", "bootstrap")
 
-	if *appdb == "" || *height == 0 {
-		log.Error("required: -appdb -height")
-		return 2
+	// chain-registry lookup gives us daemon_name (PATH fallback) and
+	// recommended_version (informational). Missing registry entry is
+	// fine when the operator passes -binary explicitly.
+	var regInfo *registry.ChainInfo
+	if cacheDir, err := config.RegistryCacheDir(); err == nil {
+		if r, err := registry.Lookup(cacheDir, ch.ChainID); err == nil {
+			regInfo = r
+		} else {
+			log.Debug("chain-registry lookup miss", "chain", ch.ChainID, "err", err)
+		}
 	}
-	genesis, err := resolveGenesis(ch, log)
+	daemonName := ""
+	if regInfo != nil {
+		daemonName = regInfo.DaemonName
+	}
+	binPath, err := findBinary(*binary, daemonName)
 	if err != nil {
-		log.Error("resolve genesis",
-			"err", err, "chain", ch.ChainID, "config", cfgFile.Path(),
-			"hint", fmt.Sprintf("set chains.%s.genesis in %s", ch.ChainID, cfgFile.Path()))
+		log.Error("locate chain binary", "err", err)
 		return 1
 	}
+
+	// RPCs are needed for the trust-hash lookup and for the
+	// [statesync] block we patch into config.toml. Bail early if
+	// missing — later steps will fail anyway.
 	if len(ch.RPCs) == 0 {
 		log.Error("chains.<id>.rpcs is empty", "chain", ch.ChainID, "config", cfgFile.Path())
 		return 1
 	}
-
 	rpcs := append([]string(nil), ch.RPCs...)
 	if len(rpcs) == 1 {
 		// cometbft's light client wants at least 2 (1 primary + 1 witness).
-		// Duplicate the single URL — works in practice for our use case
-		// where we trust the operator's RPC choice.
 		rpcs = append(rpcs, rpcs[0])
 		log.Warn("only 1 RPC URL configured; duplicating for cometbft light-client (requires >=2)")
 	}
 
-	outRoot := filepath.Join(*out, fmt.Sprintf("gaia_%s_%d", ch.ChainID, *height))
-	trustPeriod := ch.Bootstrap.TrustPeriod.Duration()
-	moniker := ch.Bootstrap.Moniker
-	appDBBackend := ch.Bootstrap.AppDBBackend
-	cmtDBBackend := ch.Bootstrap.CmtDBBackend
-	placeWasmFlag := ch.Bootstrap.PlaceWasm
-	writeConfigsFlag := ch.Bootstrap.WriteConfigs
+	if *trustHeight == 0 {
+		*trustHeight = *height
+	}
+	chosenMoniker := *moniker
+	if chosenMoniker == "" {
+		chosenMoniker = ch.Bootstrap.Moniker
+	}
+	if chosenMoniker == "" {
+		chosenMoniker = "malcom-bootstrap"
+	}
+
+	outRoot := filepath.Join(*out, fmt.Sprintf("home_%s_%d", ch.ChainID, *height))
+	configDir := filepath.Join(outRoot, "config")
+	dataDir := filepath.Join(outRoot, "data")
 
 	log.Info("starting",
 		"config", cfgFile.Path(),
 		"chain", ch.ChainID,
+		"height", *height,
 		"out", outRoot,
-		"appdb", *appdb,
-		"height", *height)
-
-	if *trustHeight == 0 {
-		*trustHeight = *height
+		"binary", binPath,
+		"app_strategy", string(strategy),
+		"db_backend", dbBackend)
+	if regInfo != nil && regInfo.RecommendedVersion != "" {
+		log.Info("chain-registry recommended version", "version", regInfo.RecommendedVersion)
 	}
 
-	configDir := filepath.Join(outRoot, "config")
-	dataDir := filepath.Join(outRoot, "data")
-	if err := os.MkdirAll(configDir, 0o755); err != nil {
-		log.Error("mkdir config failed", "err", err)
-		return 1
-	}
 	if *overwrite {
-		_ = os.RemoveAll(filepath.Join(dataDir, "state.db"))
-		_ = os.RemoveAll(filepath.Join(dataDir, "blockstore.db"))
-		_ = os.RemoveAll(filepath.Join(dataDir, "application.db"))
-		_ = os.RemoveAll(filepath.Join(dataDir, "wasm-payloads"))
-	}
-	if err := os.MkdirAll(dataDir, 0o755); err != nil {
-		log.Error("mkdir data failed", "err", err)
-		return 1
+		log.Info("overwrite: wiping out dir", "dir", outRoot)
+		if err := os.RemoveAll(outRoot); err != nil {
+			log.Error("remove out dir", "err", err)
+			return 1
+		}
 	}
 
-	// 1. Copy genesis.json into <out>/config/.
-	gPath := filepath.Join(configDir, "genesis.json")
-	log.Info("genesis copy", "src", genesis, "dst", gPath)
-	srcAbs, _ := filepath.Abs(genesis)
-	dstAbs, _ := filepath.Abs(gPath)
-	if srcAbs != dstAbs {
-		if err := copyFile(genesis, gPath); err != nil {
-			log.Error("copy genesis failed", "err", err)
+	ctx := context.Background()
+
+	// 1. <binary> init <moniker> --chain-id <id> --home <outRoot> [extras]
+	if !*skipInit {
+		if _, err := os.Stat(filepath.Join(configDir, "config.toml")); err == nil {
+			log.Error("chain home already initialized; pass -skip-init or -overwrite", "dir", outRoot)
+			return 1
+		}
+		if err := os.MkdirAll(outRoot, 0o755); err != nil {
+			log.Error("mkdir out failed", "err", err)
+			return 1
+		}
+		initArgs := append([]string{"init", chosenMoniker, "--chain-id", ch.ChainID, "--home", outRoot}, extraInitArgs...)
+		if err := runDaemon(ctx, log, binPath, initArgs...); err != nil {
+			log.Error("daemon init failed", "err", err)
 			return 1
 		}
 	} else {
-		log.Info("genesis: src == dst, skipping copy")
+		if _, err := os.Stat(filepath.Join(configDir, "config.toml")); err != nil {
+			log.Error("-skip-init set but config.toml missing", "path", filepath.Join(configDir, "config.toml"))
+			return 1
+		}
+		log.Info("skip-init: using existing chain home", "dir", outRoot)
 	}
 
-	// 2. Resolve trust hash if missing.
+	// 2. Overlay real genesis.json from chain config (or chain-registry).
+	if err := overlayGenesis(ch, regInfo, configDir, log); err != nil {
+		log.Error("overlay genesis", "err", err)
+		return 1
+	}
+
+	// 3. Resolve trust hash (auto-fetch from RPC if not provided).
 	if *trustHashHex == "" {
 		log.Info("fetching trust hash", "rpc", rpcs[0], "height", *trustHeight)
 		bh, err := fetchBlockHash(rpcs[0], *trustHeight)
@@ -171,290 +258,200 @@ func Run(args []string) int {
 	}
 	log.Info("trust", "height", *trustHeight, "hash", *trustHashHex)
 
-	// 3. Fetch the appHash for safety: state after block H is in block H+1's
-	//    AppHash field.
-	appHashHex, err := fetchAppHash(rpcs[0], *height+1)
-	if err != nil {
-		log.Error("fetch app hash failed", "err", err)
+	// 4. Patch app.toml + config.toml with the values bootstrap-state
+	//    and the runtime daemon will read.
+	appTOML := filepath.Join(configDir, "app.toml")
+	cfgTOML := filepath.Join(configDir, "config.toml")
+	if err := setTOMLString(appTOML, "", "app-db-backend", dbBackend); err != nil {
+		log.Error("patch app.toml app-db-backend", "err", err)
 		return 1
 	}
-	appHash, err := hex.DecodeString(appHashHex)
-	if err != nil {
-		log.Error("decode app hash failed", "err", err)
-		return 1
+	log.Info("app.toml patched", "app-db-backend", dbBackend)
+
+	chosenMinGasPrices := *minGasPrices
+	if chosenMinGasPrices == "" && regInfo != nil {
+		chosenMinGasPrices = regInfo.MinGasPrice
 	}
-	log.Info("apphash", "apphash", appHashHex, "after_block", *height)
-
-	// 4. Build cometbft config rooted at <out>.
-	c := cfg.DefaultConfig()
-	c.SetRoot(outRoot)
-	c.DBBackend = "goleveldb"
-	c.Genesis = "config/genesis.json"
-	c.StateSync.RPCServers = rpcs
-	c.StateSync.TrustHeight = *trustHeight
-	c.StateSync.TrustHash = *trustHashHex
-	c.StateSync.TrustPeriod = trustPeriod
-	c.StateSync.Enable = false
-
-	log.Info("running cometbft offline state-sync bootstrap", "height", *height)
-	t0 := time.Now()
-	if err := node.BootstrapState(context.Background(), c, cfg.DefaultDBProvider, uint64(*height), appHash); err != nil {
-		log.Error("BootstrapState failed", "err", err)
-		return 1
-	}
-	log.Info("cometbft bootstrap done", "elapsed", time.Since(t0).Truncate(time.Second))
-
-	// 5. Copy application.db into the gaia data dir as an independent
-	// tree so the source stays untouched across reruns. See cloneTree
-	// for why we don't hardlink.
-	srcApp := filepath.Join(*appdb, "application.db")
-	dstApp := filepath.Join(dataDir, "application.db")
-	if *skipAppCopy {
-		log.Info("application.db: -skip-app-copy set; expecting it in place", "path", dstApp)
-		if _, err := os.Stat(dstApp); err != nil {
-			log.Error("skip-app-copy target missing", "path", dstApp, "err", err)
+	if chosenMinGasPrices != "" {
+		if err := setTOMLString(appTOML, "", "minimum-gas-prices", chosenMinGasPrices); err != nil {
+			log.Error("patch app.toml minimum-gas-prices", "err", err)
 			return 1
 		}
+		log.Info("app.toml minimum-gas-prices patched", "value", chosenMinGasPrices)
 	} else {
-		log.Info("application.db copy", "src", srcApp, "dst", dstApp)
-		t0 = time.Now()
-		if err := cloneTree(srcApp, dstApp); err != nil {
-			log.Error("place application.db failed", "err", err)
-			return 1
-		}
-		log.Info("application.db placed", "elapsed", time.Since(t0).Truncate(time.Millisecond))
+		log.Warn("no minimum-gas-prices source — daemon will refuse to start until you set it",
+			"hint", "pass -minimum-gas-prices, or set it in app.toml after bootstrap")
 	}
 
-	// 6. Place wasm extension payloads.
-	srcExt := filepath.Join(*appdb, "extensions")
-	if _, err := os.Stat(srcExt); err == nil {
-		dstExt := filepath.Join(dataDir, "wasm-payloads")
-		log.Info("extensions copy", "src", srcExt, "dst", dstExt)
-		if err := cloneTree(srcExt, dstExt); err != nil {
-			log.Error("place extensions failed", "err", err)
-			return 1
+	trustPeriod := ch.Bootstrap.TrustPeriod.Duration().String()
+	rpcServersCSV := strings.Join(rpcs, ",")
+	if err := setTOMLString(cfgTOML, "statesync", "rpc_servers", rpcServersCSV); err != nil {
+		log.Error("patch config.toml statesync.rpc_servers", "err", err)
+		return 1
+	}
+	if err := setTOMLInt64(cfgTOML, "statesync", "trust_height", *trustHeight); err != nil {
+		log.Error("patch config.toml statesync.trust_height", "err", err)
+		return 1
+	}
+	if err := setTOMLString(cfgTOML, "statesync", "trust_hash", *trustHashHex); err != nil {
+		log.Error("patch config.toml statesync.trust_hash", "err", err)
+		return 1
+	}
+	if err := setTOMLString(cfgTOML, "statesync", "trust_period", trustPeriod); err != nil {
+		log.Error("patch config.toml statesync.trust_period", "err", err)
+		return 1
+	}
+	log.Info("config.toml [statesync] patched",
+		"rpc_servers", rpcServersCSV, "trust_height", *trustHeight, "trust_period", trustPeriod)
+
+	// 5. Forward fetch-validated served peers + the chain config's
+	//    bootstrap_peers (chain-registry's seeds + persistent_peers,
+	//    merged at `malcom add` time) into [p2p].persistent_peers.
+	//    served.json comes first because those nodes proved they could
+	//    serve us during fetch; the registry list backfills with
+	//    well-known stable peers in case served entries are pruned or
+	//    don't run blocksync.
+	if *forwardPeers {
+		served, err := readServedPeers(ch.Served, defaultPersistentPeerCount)
+		if err != nil {
+			log.Warn("read served peers (continuing without)", "err", err, "path", ch.Served)
 		}
-		if placeWasmFlag {
-			if err := placeWasmPayloads(srcExt, outRoot, log); err != nil {
-				log.Error("place wasm payloads failed", "err", err)
+		merged := mergePeers(served, ch.Fetch.BootstrapPeers)
+		if len(merged) == 0 {
+			log.Info("no peers to forward (served.json empty and no [fetch].bootstrap_peers)")
+		} else {
+			joined := joinPersistentPeers(merged)
+			if err := setTOMLString(cfgTOML, "p2p", "persistent_peers", joined); err != nil {
+				log.Error("patch config.toml p2p.persistent_peers", "err", err)
 				return 1
 			}
+			log.Info("config.toml [p2p].persistent_peers patched",
+				"served", len(served),
+				"registry", len(ch.Fetch.BootstrapPeers),
+				"merged", len(merged))
 		}
 	}
 
-	// 7. Optionally write minimal config files.
-	if writeConfigsFlag {
-		if err := writeConfigFiles(outRoot, moniker, appDBBackend, cmtDBBackend); err != nil {
-			log.Error("write configs failed", "err", err)
+	// 6. Copy fetch's addrbook into <home>/config/addrbook.json if asked.
+	if *doCopyAddrbook {
+		if err := copyAddrbook(ch.AddrBook, outRoot, log); err != nil {
+			log.Error("copy addrbook", "err", err)
 			return 1
 		}
-		log.Info("config files written", "dir", filepath.Join(outRoot, "config"))
+	}
+
+	// 7. Place application.db.
+	srcAppDB := filepath.Join(*appdb, "application.db")
+	dstAppDB := filepath.Join(dataDir, "application.db")
+	if err := os.MkdirAll(dataDir, 0o755); err != nil {
+		log.Error("mkdir data", "err", err)
+		return 1
+	}
+	if err := placeAppDB(srcAppDB, dstAppDB, strategy, log); err != nil {
+		log.Error("place application.db", "err", err)
+		return 1
+	}
+
+	// 8. Place wasm extension payloads (if any).
+	srcExt := filepath.Join(*appdb, "extensions")
+	if _, err := os.Stat(srcExt); err == nil {
+		if err := placeWasmPayloads(srcExt, outRoot, log); err != nil {
+			log.Error("place wasm payloads", "err", err)
+			return 1
+		}
+	}
+
+	// 9. Probe for the right statesync subcommand path and invoke
+	//    `<binary> {tendermint,comet} bootstrap-state --height <h>`.
+	sub, err := probeStatesyncSubcommand(ctx, binPath)
+	if err != nil {
+		log.Error("probe bootstrap-state subcommand", "err", err)
+		return 1
+	}
+	log.Info("bootstrap-state subcommand probed", "path", sub)
+
+	bsArgs := []string{sub, "bootstrap-state", "--home", outRoot, "--height", fmt.Sprintf("%d", *height)}
+	if err := runDaemon(ctx, log, binPath, bsArgs...); err != nil {
+		log.Error("bootstrap-state failed", "err", err)
+		return 1
 	}
 
 	log.Info("done",
-		"genesis", filepath.Join(outRoot, "config/genesis.json"),
-		"appdb", filepath.Join(outRoot, "data/application.db"),
-		"state_db", filepath.Join(outRoot, "data/state.db"),
-		"blockstore_db", filepath.Join(outRoot, "data/blockstore.db"),
-		"wasm_payloads", filepath.Join(outRoot, "data/wasm-payloads"),
-		"height", *height)
+		"home", outRoot,
+		"genesis", filepath.Join(configDir, "genesis.json"),
+		"appdb", dstAppDB,
+		"state_db", filepath.Join(dataDir, "state.db"),
+		"blockstore_db", filepath.Join(dataDir, "blockstore.db"),
+		"height", *height,
+		"start_command", fmt.Sprintf("%s start --home %s", binPath, outRoot))
 	return 0
 }
 
-// ─── RPC helpers ─────────────────────────────────────────────────────────
+// overlayGenesis copies the chain's real genesis.json into <configDir>.
+// Source priority:
+//  1. chains/<id>.toml's `genesis` field (resolved to a local file).
+//  2. chain-registry's codebase.genesis.genesis_url (downloaded into
+//     malcom's data dir, then copied).
+//
+// Returns nil if neither source is available — `<chain-exe> init` has
+// already written a placeholder genesis, so the operator has at least
+// a starting point. Logged as a warning in that case.
+func overlayGenesis(ch config.Chain, regInfo *registry.ChainInfo, configDir string, log *slog.Logger) error {
+	dst := filepath.Join(configDir, "genesis.json")
 
-func fetchAppHash(rpcBase string, height int64) (string, error) {
-	res, err := rpcGet(rpcBase, "/commit", map[string]string{"height": fmt.Sprintf("%d", height)})
-	if err != nil {
-		return "", err
-	}
-	v, _ := drill(res, "result", "signed_header", "header", "app_hash")
-	s, _ := v.(string)
-	if s == "" {
-		return "", fmt.Errorf("no app_hash in /commit?height=%d", height)
-	}
-	return s, nil
-}
-
-func fetchBlockHash(rpcBase string, height int64) (string, error) {
-	res, err := rpcGet(rpcBase, "/commit", map[string]string{"height": fmt.Sprintf("%d", height)})
-	if err != nil {
-		return "", err
-	}
-	v, _ := drill(res, "result", "signed_header", "commit", "block_id", "hash")
-	s, _ := v.(string)
-	if s == "" {
-		return "", fmt.Errorf("no block hash in /commit?height=%d", height)
-	}
-	return s, nil
-}
-
-func rpcGet(base, path string, params map[string]string) (map[string]interface{}, error) {
-	q := ""
-	first := true
-	for k, v := range params {
-		if first {
-			q = "?"
-			first = false
-		} else {
-			q += "&"
+	if ch.Genesis != "" {
+		src, err := resolveGenesis(ch, log)
+		if err != nil {
+			return err
 		}
-		q += k + "=" + v
+		log.Info("genesis copy", "src", src, "dst", dst)
+		return copyFile(src, dst)
 	}
-	url := strings.TrimRight(base, "/") + path + q
+	if regInfo != nil && regInfo.GenesisURL != "" {
+		dataDir, err := config.DataDir()
+		if err != nil {
+			return err
+		}
+		cached := filepath.Join(dataDir, ch.ChainID, "genesis.json")
+		log.Info("genesis from chain-registry", "url", regInfo.GenesisURL)
+		if err := registry.DownloadGenesis(regInfo.GenesisURL, cached); err != nil {
+			return err
+		}
+		log.Info("genesis copy", "src", cached, "dst", dst)
+		return copyFile(cached, dst)
+	}
+	log.Warn("no genesis source configured; using daemon's init placeholder",
+		"chain", ch.ChainID,
+		"hint", "set chains.<id>.genesis or run `malcom registry refresh`")
+	return nil
+}
+
+// fetchBlockHash retrieves the block hash at height from a cometbft
+// RPC's /commit endpoint. Used to populate config.toml's
+// [statesync].trust_hash.
+func fetchBlockHash(rpcBase string, height int64) (string, error) {
+	url := fmt.Sprintf("%s/commit?height=%d", strings.TrimRight(rpcBase, "/"), height)
 	resp, err := http.Get(url)
 	if err != nil {
-		return nil, err
+		return "", err
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != 200 {
 		body, _ := io.ReadAll(resp.Body)
-		return nil, fmt.Errorf("HTTP %d: %s", resp.StatusCode, body)
+		return "", fmt.Errorf("HTTP %d: %s", resp.StatusCode, body)
 	}
 	var raw map[string]interface{}
 	if err := json.NewDecoder(resp.Body).Decode(&raw); err != nil {
-		return nil, err
+		return "", err
 	}
-	return raw, nil
+	result, _ := raw["result"].(map[string]interface{})
+	signed, _ := result["signed_header"].(map[string]interface{})
+	commit, _ := signed["commit"].(map[string]interface{})
+	blockID, _ := commit["block_id"].(map[string]interface{})
+	hash, _ := blockID["hash"].(string)
+	if hash == "" {
+		return "", fmt.Errorf("no block hash in /commit?height=%d", height)
+	}
+	return hash, nil
 }
 
-func drill(m map[string]interface{}, keys ...string) (interface{}, bool) {
-	var cur interface{} = m
-	for _, k := range keys {
-		mm, ok := cur.(map[string]interface{})
-		if !ok {
-			return nil, false
-		}
-		cur, ok = mm[k]
-		if !ok {
-			return nil, false
-		}
-	}
-	return cur, true
-}
-
-// ─── filesystem helpers ──────────────────────────────────────────────────
-
-func copyFile(src, dst string) error {
-	in, err := os.Open(src)
-	if err != nil {
-		return err
-	}
-	defer in.Close()
-	out, err := os.Create(dst)
-	if err != nil {
-		return err
-	}
-	defer out.Close()
-	_, err = io.Copy(out, in)
-	return err
-}
-
-func sha256sum(b []byte) []byte {
-	h := sha256.Sum256(b)
-	return h[:]
-}
-
-// placeWasmPayloads ungzips each snapshot extension payload, sha256s the raw
-// wasm bytes to get the checksum, and writes the bytecode at the path
-// wasmvm expects:
-//
-//	<root>/wasm/state/wasm/<hex_checksum>                  (cosmwasm — wasmd's BaseDir is <homePath>/wasm)
-//	<root>/data/08-light-client/state/wasm/<hex_checksum>  (IBC 08-wasm)
-//
-// wasmvm compiles on first invocation, so we only place raw bytecode.
-func placeWasmPayloads(extDir, gaiaRoot string, log *slog.Logger) error {
-	if err := placeOneExt(filepath.Join(extDir, "wasm"), filepath.Join(gaiaRoot, "wasm", "state", "wasm"), log); err != nil {
-		return fmt.Errorf("wasm extension: %w", err)
-	}
-	if _, err := os.Stat(filepath.Join(extDir, "08-wasm")); err == nil {
-		dst := filepath.Join(gaiaRoot, "data", "08-light-client", "state", "wasm")
-		if err := placeOneExt(filepath.Join(extDir, "08-wasm"), dst, log); err != nil {
-			return fmt.Errorf("08-wasm extension: %w", err)
-		}
-	}
-	return nil
-}
-
-func placeOneExt(srcDir, dstDir string, log *slog.Logger) error {
-	if _, err := os.Stat(srcDir); err != nil {
-		return nil
-	}
-	if err := os.MkdirAll(dstDir, 0o755); err != nil {
-		return err
-	}
-	entries, err := os.ReadDir(srcDir)
-	if err != nil {
-		return err
-	}
-	count := 0
-	for _, e := range entries {
-		if e.IsDir() || !strings.HasPrefix(e.Name(), "payload-") {
-			continue
-		}
-		gz, err := os.ReadFile(filepath.Join(srcDir, e.Name()))
-		if err != nil {
-			return err
-		}
-		raw, err := gunzip(gz)
-		if err != nil {
-			return fmt.Errorf("gunzip %s: %w", e.Name(), err)
-		}
-		sum := sha256sum(raw)
-		dstPath := filepath.Join(dstDir, hex.EncodeToString(sum))
-		if err := os.WriteFile(dstPath, raw, 0o644); err != nil {
-			return err
-		}
-		count++
-	}
-	log.Info("placed wasm bytecode files", "count", count, "dir", dstDir)
-	return nil
-}
-
-func gunzip(in []byte) ([]byte, error) {
-	r, err := gzip.NewReader(bytes.NewReader(in))
-	if err != nil {
-		return nil, err
-	}
-	defer r.Close()
-	return io.ReadAll(r)
-}
-
-// cloneTree mirrors srcDir to dstDir as an independent on-disk copy.
-//
-// We don't hardlink, even on the same filesystem. Hardlinking is faster
-// (instant) and would otherwise be the obvious choice for a write-once
-// store like pebble, but it has two real downsides:
-//
-//   - flock aliases. Pebble's LOCK file would be a single inode shared
-//     between src and dst, so gaiad's flock at runtime blocks any
-//     tooling running against the source dir (and vice versa).
-//
-//   - lifetime entanglement. gaiad's pebble obsoletes files via
-//     unlink, which only decrements link count; the source dir's
-//     hardlinked names keep them alive. So src stays valid in
-//     practice, but its files are owned by the dst's runtime — if dst
-//     ever unlinks the last surviving name, src loses data. Awkward
-//     for a "pristine reference copy" intended to be reused.
-//
-// Cost on local-attached storage is ~1.5 min for a 14 GB pebble dir,
-// which is small relative to the rest of the snapshot→gaiad pipeline.
-func cloneTree(srcDir, dstDir string) error {
-	if err := os.MkdirAll(dstDir, 0o755); err != nil {
-		return err
-	}
-	return filepath.Walk(srcDir, func(path string, info os.FileInfo, err error) error {
-		if err != nil {
-			return err
-		}
-		rel, err := filepath.Rel(srcDir, path)
-		if err != nil {
-			return err
-		}
-		dst := filepath.Join(dstDir, rel)
-		if info.IsDir() {
-			return os.MkdirAll(dst, info.Mode())
-		}
-		return copyFile(path, dst)
-	})
-}

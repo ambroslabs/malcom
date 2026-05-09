@@ -16,6 +16,7 @@ import (
 	"flag"
 	"fmt"
 	"io"
+	"log/slog"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -27,21 +28,22 @@ import (
 
 	"github.com/zrbecker/cosmos-p2p/internal/config"
 	malcomlog "github.com/zrbecker/cosmos-p2p/internal/log"
+	"github.com/zrbecker/cosmos-p2p/internal/snapshotimport"
 )
 
 // Run is the malcom subcommand entry point.
 func Run(args []string) int {
 	fs := flag.NewFlagSet("malcom verify", flag.ContinueOnError)
-	chain := fs.String("chain", "", "chain id (required)")
+	chain := fs.String("chain", "", "chain id (override; required if appdb meta.json is missing or omits chain_id)")
 	appdb := fs.String("appdb", "", "path to the application.db parent dir (required)")
-	height := fs.Int64("height", 0, "snapshot height committed to application.db (required)")
+	height := fs.Int64("height", 0, "height override (required if appdb meta.json is missing or omits height)")
 	rpcURL := fs.String("rpc", "", "cometbft RPC endpoint (defaults to first chains/<id>.toml rpcs entry)")
 	logMode := fs.String("log", "", "log output: auto (default), pretty, text, json")
 	debug := fs.Bool("debug", false, "verbose logging")
 	if err := fs.Parse(args); err != nil {
 		return 2
 	}
-	if *appdb == "" || *height == 0 || *chain == "" {
+	if *appdb == "" {
 		fs.Usage()
 		return 2
 	}
@@ -51,6 +53,47 @@ func Run(args []string) int {
 		fmt.Fprintf(os.Stderr, "invalid -log %q (want auto/pretty/text/json)\n", *logMode)
 		return 2
 	}
+
+	// Read meta.json from the appdb dir if present. chain id and
+	// height are normally drawn from here so the user doesn't have to
+	// repeat themselves; the -chain / -height flags only kick in when
+	// meta.json is missing or pre-dates the field, in which case they
+	// are required overrides. Any flag value that's set must match.
+	appdbMeta, metaErr := snapshotimport.ReadAppDBMeta(*appdb)
+	switch {
+	case metaErr != nil && !os.IsNotExist(metaErr):
+		fmt.Fprintf(os.Stderr, "read appdb meta: %v\n", metaErr)
+		return 1
+	case metaErr != nil:
+		if *chain == "" || *height == 0 {
+			fmt.Fprintf(os.Stderr, "no meta.json in %s; pass -chain and -height to override\n", *appdb)
+			return 2
+		}
+	default:
+		if appdbMeta.ChainID != "" && *chain != "" && appdbMeta.ChainID != *chain {
+			fmt.Fprintf(os.Stderr, "meta.json chain_id %q does not match -chain %q\n", appdbMeta.ChainID, *chain)
+			return 1
+		}
+		if appdbMeta.Height != 0 && *height != 0 && appdbMeta.Height != *height {
+			fmt.Fprintf(os.Stderr, "meta.json height %d does not match -height %d\n", appdbMeta.Height, *height)
+			return 1
+		}
+		if *chain == "" {
+			if appdbMeta.ChainID == "" {
+				fmt.Fprintln(os.Stderr, "meta.json has no chain_id; pass -chain to override")
+				return 2
+			}
+			*chain = appdbMeta.ChainID
+		}
+		if *height == 0 {
+			if appdbMeta.Height == 0 {
+				fmt.Fprintln(os.Stderr, "meta.json has no height; pass -height to override")
+				return 2
+			}
+			*height = appdbMeta.Height
+		}
+	}
+
 	// Pull [log] from config when available; verify is also runnable
 	// with -rpc and no config, in which case fall back to defaults.
 	var logTuning malcomlog.Tuning
@@ -97,7 +140,7 @@ func Run(args []string) int {
 
 	log.Info("starting", "appdb", *appdb, "height", *height, "rpc", rpc)
 
-	infos, err := readCommitInfo(*appdb, *height)
+	infos, err := readCommitInfo(*appdb, *height, log)
 	if err != nil {
 		log.Error("read commit info failed", "err", err)
 		return 1
@@ -134,9 +177,12 @@ type storeInfo struct {
 	Hash []byte
 }
 
-func readCommitInfo(appdbParent string, height int64) ([]storeInfo, error) {
+func readCommitInfo(appdbParent string, height int64, log *slog.Logger) ([]storeInfo, error) {
 	dbPath := filepath.Join(appdbParent, "application.db")
-	db, err := pebble.Open(dbPath, &pebble.Options{ReadOnly: true})
+	db, err := pebble.Open(dbPath, &pebble.Options{
+		ReadOnly: true,
+		Logger:   malcomlog.PebbleShim(log.With("module", "pebble")),
+	})
 	if err != nil {
 		return nil, err
 	}
