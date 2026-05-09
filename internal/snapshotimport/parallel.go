@@ -151,10 +151,16 @@ func ImportParallel(opts ParallelOptions) (*Stats, error) {
 		MaxConcurrentCompactions:    func() int { return maxCompact },
 		Logger:                      pebbleLog,
 		Levels:                      []pebble.LevelOptions{{Compression: pebble.NoCompression}},
-		// Bulk-load: skip auto compactions during the stream.
-		DisableAutomaticCompactions: true,
-		L0CompactionThreshold:       1024,
-		L0StopWritesThreshold:       4096,
+	}
+	if !opts.CompactDuringImport {
+		// Bulk-load: skip auto compactions during the stream. The user
+		// or gaiad runs compactions afterward.
+		popts.DisableAutomaticCompactions = true
+		popts.L0CompactionThreshold = 1024
+		popts.L0StopWritesThreshold = 4096
+	}
+	if opts.FlushSplitMB > 0 {
+		popts.FlushSplitBytes = int64(opts.FlushSplitMB) << 20
 	}
 	db, err := pebble.Open(appdbDir, popts)
 	if err != nil {
@@ -266,43 +272,17 @@ func ImportParallel(opts ParallelOptions) (*Stats, error) {
 		batch.Close()
 	}
 
-	// ─── final compaction ────────────────────────────────────────────
-	t1 := time.Now()
-	log.Info("starting final compaction")
+	// Flush any remaining memtable data so the closed DB is durable.
+	// We don't run an explicit compact — the user runs
+	// `malcom compact -dir <appdb>` after, or lets gaiad's pebble
+	// auto-compact at runtime. Skipping the upfront compact saves
+	// ~2m wall on cosmoshub-4.
 	if err := db.Flush(); err != nil {
-		log.Warn("pre-compact flush failed", "err", err)
+		log.Warn("pre-close flush failed", "err", err)
 	}
-	if err := db.Compact([]byte{0x00}, []byte{0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff}, true); err != nil {
-		log.Warn("final compact failed", "err", err)
-	}
-	stats.FinalCompactElapsed = time.Since(t1).Truncate(time.Millisecond)
-	log.Info("final compaction complete", "elapsed", stats.FinalCompactElapsed)
-
 	if err := db.Close(); err != nil {
-		log.Warn("close after compact failed", "err", err)
+		log.Warn("close db failed", "err", err)
 	}
-
-	// ─── cleanup pass ────────────────────────────────────────────────
-	t2 := time.Now()
-	log.Info("starting cleanup pass")
-	cleanup, err := pebble.Open(appdbDir, &pebble.Options{
-		MaxConcurrentCompactions: func() int { return maxCompact },
-		Logger:                   pebbleLog,
-	})
-	if err != nil {
-		return nil, fmt.Errorf("cleanup reopen: %w", err)
-	}
-	if err := cleanup.Flush(); err != nil {
-		log.Warn("cleanup flush failed", "err", err)
-	}
-	if err := cleanup.Compact([]byte{0x00}, []byte{0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff}, true); err != nil {
-		log.Warn("cleanup compact failed", "err", err)
-	}
-	if err := cleanup.Close(); err != nil {
-		log.Warn("cleanup close failed", "err", err)
-	}
-	stats.CleanupElapsed = time.Since(t2).Truncate(time.Millisecond)
-	log.Info("cleanup pass complete", "elapsed", stats.CleanupElapsed)
 
 	stats.Elapsed = time.Since(t0).Truncate(time.Millisecond)
 	log.Info("import complete",

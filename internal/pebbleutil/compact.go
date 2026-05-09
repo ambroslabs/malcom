@@ -25,15 +25,20 @@ import (
 	malcomlog "github.com/zrbecker/cosmos-p2p/internal/log"
 )
 
-// CleanupCompact opens a pebble DB at dir with default options,
-// flushes, runs a full-keyspace compaction, and closes. log may be
-// nil for silent operation.
-func CleanupCompact(dir string, log *slog.Logger) error {
+// CleanupCompact opens a pebble DB at dir, flushes, runs a
+// full-keyspace compaction, and closes. log may be nil for silent
+// operation. maxConcurrent caps pebble's compaction goroutines —
+// 0 falls back to 8 (a sensible default for typical multi-core
+// boxes; compactions are largely I/O-bound at cosmos scale).
+func CleanupCompact(dir string, maxConcurrent int, log *slog.Logger) error {
 	if log == nil {
 		log = slog.New(slog.DiscardHandler)
 	}
+	if maxConcurrent <= 0 {
+		maxConcurrent = 8
+	}
 	db, err := pebble.Open(dir, &pebble.Options{
-		MaxConcurrentCompactions: func() int { return 8 },
+		MaxConcurrentCompactions: func() int { return maxConcurrent },
 		Logger:                   malcomlog.PebbleShim(log.With("module", "pebble")),
 	})
 	if err != nil {

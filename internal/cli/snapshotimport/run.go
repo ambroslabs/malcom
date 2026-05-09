@@ -47,8 +47,11 @@ func Run(args []string) int {
 	memProfile := fs.String("memprofile", "", "write a pprof heap profile to this path at end of run")
 	memStats := fs.Bool("mem-stats", false, "log runtime.MemStats every 10s during the run (module=memstats)")
 	parallel := fs.Bool("parallel", false, "use the parallel pipeline: decompress to temp file once, then process stores concurrently across workers")
-	parallelWorkers := fs.Int("workers", 0, "max concurrent store workers in -parallel mode (default min(NumCPU, 4))")
+	parallelWorkers := fs.Int("workers", 0, "max concurrent store workers in -parallel mode (default = NumCPU)")
 	tempDir := fs.String("tmp-dir", "", "where to put the decompressed temp file in -parallel mode (default = -out dir; needs ~snapshot-decompressed-size of free space)")
+	flushSplitMB := fs.Int("flush-split-mb", -1, "cap on L0 SSTable size from memtable flushes; -1 = use [import].flush_split_mb (defaults to memtable_mb)")
+	compactDuringImport := fs.Bool("compact-during-import", false, "enable pebble auto-compactions during import (default off; trades wall time for tighter end-of-import LSM)")
+	compactWorkers := fs.Int("compact-workers", 0, "override [compact].max_concurrent_compactions for this run (only meaningful when -compact-during-import is set)")
 	if err := fs.Parse(args); err != nil {
 		return 2
 	}
@@ -181,6 +184,15 @@ func Run(args []string) int {
 		"max_compact", ch.Import.MaxConcurrentCompactions,
 		"extensions", !*noExt)
 
+	maxCompact := ch.Compact.MaxConcurrentCompactions
+	if *compactWorkers > 0 {
+		maxCompact = *compactWorkers
+	}
+	flushSplit := ch.Import.FlushSplitMB
+	if *flushSplitMB >= 0 {
+		flushSplit = *flushSplitMB
+	}
+	compactDuring := ch.Import.CompactDuringImport || *compactDuringImport
 	importOpts := snapshotimport.Options{
 		SnapshotDir:              *snapshotDir,
 		OutDir:                   outDir,
@@ -188,7 +200,9 @@ func Run(args []string) int {
 		NoExtensions:             *noExt,
 		MemtableMB:               ch.Import.MemtableMB,
 		CacheMB:                  ch.Import.CacheMB,
-		MaxConcurrentCompactions: ch.Import.MaxConcurrentCompactions,
+		MaxConcurrentCompactions: maxCompact,
+		FlushSplitMB:             flushSplit,
+		CompactDuringImport:      compactDuring,
 		Log:                      logger,
 	}
 	var stats *snapshotimport.Stats
@@ -221,8 +235,6 @@ func Run(args []string) int {
 		"stream_decode_elapsed", stats.StreamDecodeElapsed,
 		"stream_iavl_elapsed", stats.StreamIAVLElapsed,
 		"stream_pebble_elapsed", stats.StreamPebbleElapsed,
-		"final_compact_elapsed", stats.FinalCompactElapsed,
-		"cleanup_elapsed", stats.CleanupElapsed,
 		"appdb", finalDB,
 		"appdb_bytes", dbBytes)
 

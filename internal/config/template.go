@@ -114,10 +114,30 @@ max_disk_write_failures = 3
 [import]
 # Pebble bulk-load tuning. Defaults sized for an 8 GiB host with 2-4
 # vCPUs; bump memtable_mb / cache_mb on bigger boxes.
-memtable_mb                = 256   # x2 in-flight = ~512 MiB resident
-cache_mb                   = 64
-max_concurrent_compactions = 2
-min_free_gb                = 20    # cosmoshub-4 import is ~14 GB after cleanup
+memtable_mb           = 256   # x2 in-flight = ~512 MiB resident
+cache_mb              = 64
+min_free_gb           = 20    # cosmoshub-4 import is ~14 GB after compact
+
+# Cap on L0 SSTable size from memtable flushes. 0 = pebble default
+# (4 MiB). Setting equal to memtable_mb yields ~1 SSTable per flush,
+# dramatically reducing post-import L0 file count when the import
+# defers compactions (the default).
+flush_split_mb        = 256
+
+# When false (default), `+"`malcom snapshot import`"+` writes the snapshot
+# in bulk-load mode without running pebble compactions. The resulting
+# appdb has many small L0 SSTables; gaiad's pebble auto-compacts at
+# runtime, or run `+"`malcom compact -dir <appdb>`"+` separately. Set true
+# to compact incrementally during import (slower but tighter LSM at
+# end-of-import).
+# compact_during_import = false
+
+[compact]
+# Pebble compaction tuning. Used by `+"`malcom compact -dir <appdb>`"+` and
+# by `+"`malcom snapshot import`"+` when [import].compact_during_import is
+# true. Default = runtime.NumCPU(); compaction is largely I/O-bound
+# at cosmos-scale so going much higher rarely helps.
+# max_concurrent_compactions = 8
 
 [bootstrap]
 trust_period   = "720h"   # 30d cometbft light-client trust window

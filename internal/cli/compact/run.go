@@ -10,6 +10,7 @@ import (
 	"os"
 	"time"
 
+	"github.com/zrbecker/cosmos-p2p/internal/config"
 	malcomlog "github.com/zrbecker/cosmos-p2p/internal/log"
 	"github.com/zrbecker/cosmos-p2p/internal/pebbleutil"
 )
@@ -18,6 +19,7 @@ import (
 func Run(args []string) int {
 	fs := flag.NewFlagSet("malcom compact", flag.ContinueOnError)
 	dir := fs.String("dir", "", "path to pebble DB directory (required)")
+	workers := fs.Int("workers", 0, "override [compact].max_concurrent_compactions (default = config or 8)")
 	logMode := fs.String("log", "", "log output: auto (default), pretty, text, json")
 	debug := fs.Bool("debug", false, "verbose logging")
 	if err := fs.Parse(args); err != nil {
@@ -43,9 +45,26 @@ func Run(args []string) int {
 		Level:  level,
 	}).With("module", "compact")
 
+	// Resolve max-concurrent-compactions:
+	//   1. -workers flag wins.
+	//   2. else, [compact].max_concurrent_compactions from global config
+	//      (no chain selected — `malcom compact` doesn't take -chain).
+	//   3. else, fall back to the pebbleutil default (8).
+	maxCompact := *workers
+	if maxCompact <= 0 {
+		if cfg, err := config.Load(); err == nil {
+			// applyCompactDefaults runs in Resolve, but the global
+			// config.Load doesn't apply per-chain defaults — apply
+			// our compact-section default here to honor NumCPU.
+			ct := cfg.Compact
+			config.ApplyCompactDefaults(&ct)
+			maxCompact = ct.MaxConcurrentCompactions
+		}
+	}
+
 	t0 := time.Now()
-	log.Info("starting", "dir", *dir)
-	if err := pebbleutil.CleanupCompact(*dir, log); err != nil {
+	log.Info("starting", "dir", *dir, "max_concurrent_compactions", maxCompact)
+	if err := pebbleutil.CleanupCompact(*dir, maxCompact, log); err != nil {
 		log.Error("compact failed", "err", err)
 		return 1
 	}
