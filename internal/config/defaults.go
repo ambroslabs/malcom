@@ -107,12 +107,20 @@ func applyFetchDefaults(t *FetchTuning) {
 }
 
 func applyImportDefaults(t *ImportTuning) {
-	// Defaults sized for an 8 GiB / 2-4 vCPU host. Bigger boxes can
-	// bump memtable_mb / cache_mb in their config.toml; the import is
-	// CPU-bound on the IAVL hashing path past ~512 MiB memtables, so
-	// returns diminish quickly.
+	// Defaults sized for the typical bootstrap host (~8 GiB box). The
+	// IAVL hashing path is CPU-bound past ~2 GiB memtables, so
+	// returns diminish above that. Smaller hosts should drop both
+	// memtable_mb and flush_split_mb proportionally via config.
+	//
+	// 1024 MiB chosen over the previous 256 MiB so each L0 SST produced
+	// during bulk load is ~1 GiB instead of ~256 MiB. Bulk mode forces
+	// FlushSplitBytes=0 (one SST per memtable flush) regardless of
+	// flush_split_mb, so memtable_mb directly sets the L0 SST size.
+	// At 1 GiB, a 140 GiB bbn import lands ~140 L0 files instead of
+	// ~70k, and the follow-on compact reads each file once instead of
+	// thrashing through tens of thousands of bloom/index blocks.
 	if t.MemtableMB == 0 {
-		t.MemtableMB = 256
+		t.MemtableMB = 1024
 	}
 	if t.CacheMB == 0 {
 		t.CacheMB = 64
@@ -120,10 +128,10 @@ func applyImportDefaults(t *ImportTuning) {
 	if t.MinFreeGB == 0 {
 		t.MinFreeGB = 20
 	}
-	// FlushSplitMB defaults to memtable_mb. With CompactDuringImport
-	// off (the default), this means each memtable flush produces ~1
-	// L0 SSTable instead of memtable_mb / 4 = ~64 small ones — gaiad
-	// or the standalone compact then sees a manageable file count.
+	// FlushSplitMB is ignored in bulk-load mode (CompactDuringImport
+	// off, the default). Honored only when compact_during_import =
+	// true. Default to memtable_mb so the value is sensible if the
+	// user flips that flag on.
 	if t.FlushSplitMB == 0 {
 		t.FlushSplitMB = t.MemtableMB
 	}

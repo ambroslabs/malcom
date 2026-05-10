@@ -30,17 +30,43 @@ import (
 // operation. maxConcurrent caps pebble's compaction goroutines —
 // 0 falls back to 8 (a sensible default for typical multi-core
 // boxes; compactions are largely I/O-bound at cosmos scale).
-func CleanupCompact(dir string, maxConcurrent int, log *slog.Logger) error {
+//
+// cacheMB sizes the pebble block cache used during the compact —
+// large is much better here because compaction iterators read the
+// per-SSTable bloom filters and index blocks repeatedly. Default
+// (cacheMB == 0) is 8 GiB. MaxOpenFiles is set to 200_000 so a
+// post-bulk-load LSM with tens of thousands of L0 SSTables doesn't
+// thrash the FD cache; the kernel ulimit is the real backstop.
+//
+// targetFileSizeMB sets pebble's per-level TargetFileSize. 0 leaves
+// pebble defaults (compact wall time wins at the cost of many small
+// L1-L6 files). Setting e.g. 1024 produces a much smaller post-compact
+// LSM but extends wall time because the final merges serialize. See
+// CompactTuning.TargetFileSizeMB for the full trade-off.
+func CleanupCompact(dir string, maxConcurrent, cacheMB, targetFileSizeMB int, log *slog.Logger) error {
 	if log == nil {
 		log = slog.New(slog.DiscardHandler)
 	}
 	if maxConcurrent <= 0 {
 		maxConcurrent = 8
 	}
-	db, err := pebble.Open(dir, &pebble.Options{
+	if cacheMB <= 0 {
+		cacheMB = 8 * 1024
+	}
+	cache := pebble.NewCache(int64(cacheMB) << 20)
+	defer cache.Unref()
+	popts := &pebble.Options{
 		MaxConcurrentCompactions: func() int { return maxConcurrent },
+		Cache:                    cache,
+		MaxOpenFiles:             200_000,
 		Logger:                   malcomlog.PebbleShim(log.With("module", "pebble")),
-	})
+	}
+	if targetFileSizeMB > 0 {
+		popts.Levels = []pebble.LevelOptions{{
+			TargetFileSize: int64(targetFileSizeMB) << 20,
+		}}
+	}
+	db, err := pebble.Open(dir, popts)
 	if err != nil {
 		return fmt.Errorf("open: %w", err)
 	}

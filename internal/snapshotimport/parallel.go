@@ -36,6 +36,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"math"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -177,7 +178,17 @@ func ImportParallel(opts ParallelOptions) (*Stats, error) {
 		MaxOpenFiles:                4096,
 		MaxConcurrentCompactions:    func() int { return maxCompact },
 		Logger:                      pebbleLog,
-		Levels:                      []pebble.LevelOptions{{Compression: pebble.NoCompression}},
+		Levels: []pebble.LevelOptions{{
+			Compression: pebble.NoCompression,
+			// One L0 SST per memtable flush. Pebble's default L0
+			// TargetFileSize is 2 MiB, which fragments every memtable
+			// flush into hundreds of tiny SSTs (we measured ~2.5 MB
+			// average across 71k files on a 140 GiB bbn import). Setting
+			// to math.MaxInt64 disables the file-size splitter so each
+			// flush writes one SST sized = memtable_mb. Combined with
+			// FlushSplitBytes=MaxInt64 below, no splitter fires.
+			TargetFileSize: math.MaxInt64,
+		}},
 	}
 	if !opts.CompactDuringImport {
 		// Bulk-load: skip auto compactions during the stream. The user
@@ -185,8 +196,13 @@ func ImportParallel(opts ParallelOptions) (*Stats, error) {
 		popts.DisableAutomaticCompactions = true
 		popts.L0CompactionThreshold = 1024
 		popts.L0StopWritesThreshold = 4096
-	}
-	if opts.FlushSplitMB > 0 {
+		// FlushSplitBytes governs the OTHER memtable-flush splitter
+		// (L0 sublevel boundary alignment). Pebble's default is 2 MiB
+		// and EnsureDefaults silently replaces 0 with the default, so
+		// pass a sentinel-large positive int to disable it.
+		// opts.FlushSplitMB is ignored in bulk mode.
+		popts.FlushSplitBytes = math.MaxInt64
+	} else if opts.FlushSplitMB > 0 {
 		popts.FlushSplitBytes = int64(opts.FlushSplitMB) << 20
 	}
 	db, err := pebble.Open(appdbDir, popts)

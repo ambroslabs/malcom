@@ -17,6 +17,7 @@ package snapshotimport
 import (
 	"fmt"
 	"log/slog"
+	"math"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -172,15 +173,22 @@ func Import(opts Options) (*Stats, error) {
 		// post-import compact (`malcom compact`) or gaiad's runtime
 		// auto-compactions rewrite them into a snappy-compressed L6
 		// set. Skipping L0 compression saves ~10% of the stream's
-		// CPU budget. Deeper levels keep their default Snappy.
-		Levels: []pebble.LevelOptions{{Compression: pebble.NoCompression}},
+		// CPU budget. TargetFileSize=MaxInt64 disables pebble's
+		// per-flush file-size splitter (default 2 MiB) — see
+		// parallel.go for the full reasoning.
+		Levels: []pebble.LevelOptions{{
+			Compression:    pebble.NoCompression,
+			TargetFileSize: math.MaxInt64,
+		}},
 	}
 	if !opts.CompactDuringImport {
 		popts.DisableAutomaticCompactions = true
 		popts.L0CompactionThreshold = 1024
 		popts.L0StopWritesThreshold = 4096
-	}
-	if opts.FlushSplitMB > 0 {
+		// One L0 SST per memtable flush — see parallel.go for the
+		// reasoning. opts.FlushSplitMB is ignored in bulk mode.
+		popts.FlushSplitBytes = math.MaxInt64
+	} else if opts.FlushSplitMB > 0 {
 		popts.FlushSplitBytes = int64(opts.FlushSplitMB) << 20
 	}
 	db, err := pebble.Open(appdbDir, popts)

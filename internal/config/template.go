@@ -114,15 +114,16 @@ max_disk_write_failures = 3
 [import]
 # Pebble bulk-load tuning. Defaults sized for an 8 GiB host with 2-4
 # vCPUs; bump memtable_mb / cache_mb on bigger boxes.
-memtable_mb           = 256   # x2 in-flight = ~512 MiB resident
+memtable_mb           = 1024  # x2 in-flight = ~2 GiB resident
 cache_mb              = 64
 min_free_gb           = 20    # cosmoshub-4 import is ~14 GB after compact
 
-# Cap on L0 SSTable size from memtable flushes. 0 = pebble default
-# (4 MiB). Setting equal to memtable_mb yields ~1 SSTable per flush,
-# dramatically reducing post-import L0 file count when the import
-# defers compactions (the default).
-flush_split_mb        = 256
+# Ignored in bulk-load mode (the default — compact_during_import
+# off). Bulk mode forces FlushSplitBytes=0 so each memtable flush
+# produces one L0 SSTable; pebble's L0-sublevel splitter would
+# otherwise fragment flushes into hundreds of small SSTs once L0
+# is non-empty. Honored only when compact_during_import = true.
+flush_split_mb        = 1024
 
 # When false (default), `+"`malcom snapshot import`"+` writes the snapshot
 # in bulk-load mode without running pebble compactions. The resulting
@@ -138,6 +139,14 @@ flush_split_mb        = 256
 # true. Default = runtime.NumCPU(); compaction is largely I/O-bound
 # at cosmos-scale so going much higher rarely helps.
 # max_concurrent_compactions = 8
+
+# Per-level pebble TargetFileSize in MiB. 0 (default) keeps pebble's
+# defaults — the compact runs fast and produces many small L1-L6
+# files. Bump to 1024+ to merge the post-import LSM into a small
+# number of large files; the trade-off is wall time, since the
+# final merges serialize. Measured on 147 GiB bbn: default = 1822
+# files / 25m12s; 1024 = 6 files / 47m55s.
+# target_file_size_mb = 0
 
 [bootstrap]
 trust_period   = "720h"   # 30d cometbft light-client trust window
