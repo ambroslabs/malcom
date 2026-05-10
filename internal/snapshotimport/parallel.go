@@ -32,7 +32,6 @@
 package snapshotimport
 
 import (
-	"bufio"
 	"context"
 	"fmt"
 	"io"
@@ -60,9 +59,20 @@ type ParallelOptions struct {
 	// the bookkeeping is bounded so it doesn't break.
 	Workers int
 
-	// TempDir holds the decompressed-stream temp file. Default =
-	// OutDir; the temp file is removed when ImportParallel returns.
+	// TempDir was the directory for decompressed.tmp under the old
+	// disk-temp-file design. The pipeline now keeps decompressed
+	// bytes in an in-memory chunk ring and never writes to disk;
+	// the field is preserved for backward CLI compatibility but
+	// has no effect.
 	TempDir string
+
+	// ChunkMB caps the in-memory chunk ring (the streaming buffer
+	// between stage 1 decompression and stage 2 per-store readers).
+	// 0 = use defaultChunkMB (512 MiB). Bigger values reduce stage-1
+	// backpressure on multi-store-concurrent chains (cosmoshub bank+
+	// ibc, osmosis cl/ibc/wasm) at the cost of more peak RSS. Single-
+	// polestar chains (bbn finality) don't benefit from larger rings.
+	ChunkMB int
 
 	// WaveParallel turns on within-store wave-parallel hashing per
 	// store: each per-store worker spawns a hash worker pool and
@@ -109,24 +119,24 @@ func ImportParallel(opts ParallelOptions) (*Stats, error) {
 		}
 	}
 
-	tmpRoot := opts.TempDir
-	if tmpRoot == "" {
-		tmpRoot = opts.OutDir
+	// In-memory chunk ring replaces the on-disk decompressed.tmp.
+	// Stage 1 streams decompressed bytes into the ring; stage 2
+	// workers each create a reader at their store's start offset.
+	// Readers' min-cursor pins eviction so old chunks free as the
+	// slowest reader advances. The ring uses an internal free-list
+	// so its memory budget (active chunks + free slabs) is bounded
+	// at exactly chunkMB MiB regardless of allocation rate.
+	const ringChunkSize = 4 << 20
+	chunkMB := opts.ChunkMB
+	if chunkMB <= 0 {
+		chunkMB = defaultChunkMB
 	}
-	if err := os.MkdirAll(tmpRoot, 0o755); err != nil {
-		return nil, fmt.Errorf("mkdir tmp root: %w", err)
+	ringMaxBytes := int64(chunkMB) << 20
+	if ringMaxBytes < int64(ringChunkSize) {
+		ringMaxBytes = int64(ringChunkSize)
 	}
-	tempPath := filepath.Join(tmpRoot, "decompressed.tmp")
-	// Pre-create the temp file so stage-2 workers can open it before
-	// stage 1's own os.Create runs. The file is truncated again by
-	// stage 1's open (no-op since we just emptied it), then grows
-	// as stage 1 streams decompressed bytes in.
-	if f, err := os.Create(tempPath); err != nil {
-		return nil, fmt.Errorf("create temp %s: %w", tempPath, err)
-	} else {
-		f.Close()
-	}
-	defer os.Remove(tempPath)
+	log.Info("chunk ring sized", "chunk_mb", chunkMB, "default", opts.ChunkMB <= 0)
+	ring := newChunkRing(ringChunkSize, ringMaxBytes)
 
 	memMB := opts.MemtableMB
 	if memMB <= 0 {
@@ -204,8 +214,9 @@ func ImportParallel(opts ParallelOptions) (*Stats, error) {
 	}
 	stage1Out := make(chan stage1Result, 1)
 	go func() {
-		idx, err := stage1WriteAndIndex(opts.SnapshotDir, tempPath, storeCh, log)
+		idx, err := stage1WriteRingAndIndex(opts.SnapshotDir, ring, storeCh, log)
 		close(storeCh)
+		ring.Close(err)
 		stage1Out <- stage1Result{idx: idx, err: err}
 	}()
 
@@ -213,7 +224,7 @@ func ImportParallel(opts ParallelOptions) (*Stats, error) {
 	// all in-flight workers drain.
 	stage2Start := time.Now()
 	stores, parStats, err := stage2RunWorkersFromChan(
-		storeCh, tempPath, db, opts.Height, ingestTmpDir, log, workers, opts.WaveParallel)
+		storeCh, ring, db, opts.Height, ingestTmpDir, log, workers, opts.WaveParallel)
 	if err != nil {
 		_ = db.Close()
 		// Drain stage 1 to surface its error too if it had one.
@@ -252,7 +263,7 @@ func ImportParallel(opts ParallelOptions) (*Stats, error) {
 	// ─── stage 3: extensions (sequential) ────────────────────────────
 	if !opts.NoExtensions && idx.ExtStart > 0 {
 		stage3Start := time.Now()
-		if err := stage3Extensions(tempPath, idx.ExtStart, idx.TotalBytes, db, extDir, stats, log); err != nil {
+		if err := stage3ExtensionsFromRing(ring, idx.ExtStart, idx.TotalBytes, db, extDir, stats, log); err != nil {
 			_ = db.Close()
 			return nil, fmt.Errorf("stage 3: %w", err)
 		}
@@ -303,19 +314,25 @@ func ImportParallel(opts ParallelOptions) (*Stats, error) {
 	return stats, nil
 }
 
-// stage1WriteAndIndex decompresses the snapshot once, writing the
-// decompressed bytes to tempPath while building the per-store offset
-// index AND emitting StoreEntry events to storeCh as each store's
-// full byte range becomes known. This lets stage 2 workers start
-// processing bank (and other stores) as soon as their end offsets
-// are identified, instead of waiting for the whole stream to be
-// scanned.
+// stage1WriteRingAndIndex decompresses the snapshot once, writing
+// the decompressed bytes to the in-memory chunkRing while building
+// the per-store offset index AND emitting StoreEntry events to
+// storeCh.
 //
-// Caller closes storeCh after this function returns. Final flush +
-// fsync of the temp file happen here so workers see a stable file
-// before they read.
-func stage1WriteAndIndex(
-	snapshotDir, tempPath string,
+// Each StoreEntry is emitted as soon as the store OPENS (its
+// DecompressedStart is known), with an EndCh single-shot channel
+// the consumer reads to learn the store's end offset (= when the
+// next StoreItem or the extension tail is parsed). This lets stage
+// 2 workers start processing the polestar (e.g., bbn finality) the
+// moment its bytes start flowing into the ring, pipelining stage 1
+// decompression with stage 2 hashing. Previously stage 2 had to
+// wait for stage 1 to scan past the polestar to learn its End.
+//
+// Caller closes storeCh after this function returns and calls
+// ring.Close to signal EOF.
+func stage1WriteRingAndIndex(
+	snapshotDir string,
+	ring *chunkRing,
 	storeCh chan<- StoreEntry,
 	log *slog.Logger,
 ) (*SnapshotIndex, error) {
@@ -328,56 +345,59 @@ func stage1WriteAndIndex(
 	pf := newPrefetchReader(context.Background(), cr, 8, 1<<20)
 	defer pf.Close()
 
-	f, err := os.Create(tempPath)
-	if err != nil {
-		return nil, fmt.Errorf("create temp file %s: %w", tempPath, err)
-	}
-	defer f.Close()
+	teeR := io.TeeReader(pf, ring)
 
-	// Use bufio for the write side, flushed at every store boundary
-	// so workers reading the temp file see a consistent end-of-store
-	// position. Reads from the same fd would also see un-flushed
-	// bytes via the page cache, but workers open a separate fd.
-	bw := bufio.NewWriterSize(f, 4<<20)
-	teeR := io.TeeReader(pf, bw)
-
-	emit := func(s StoreEntry) error {
-		// Flush so the worker that picks up this store sees all of
-		// its bytes on disk via its independent fd.
-		if err := bw.Flush(); err != nil {
-			return fmt.Errorf("flush before emit %q: %w", s.Name, err)
+	// Per-store EndCh map so onClose can signal the matching open
+	// emission. Closed (without value) on stage-1 error so worker
+	// goroutines waiting on receive don't leak.
+	ends := make(map[string]chan int64)
+	defer func() {
+		for _, ch := range ends {
+			close(ch)
 		}
+	}()
+
+	onOpen := func(s StoreEntry) error {
+		s.EndCh = make(chan int64, 1)
+		ends[s.Name] = s.EndCh
 		storeCh <- s
 		return nil
 	}
+	onClose := func(name string, end int64) error {
+		ch, ok := ends[name]
+		if !ok {
+			return fmt.Errorf("internal: onClose for unknown store %q", name)
+		}
+		ch <- end
+		close(ch)
+		delete(ends, name)
+		return nil
+	}
 
-	idx, err := buildIndexFromReader(teeR, emit, log)
+	idx, err := buildIndexFromReader(teeR, onOpen, onClose, log)
 	if err != nil {
 		return nil, err
-	}
-
-	if err := bw.Flush(); err != nil {
-		return nil, fmt.Errorf("flush temp: %w", err)
-	}
-	if err := f.Sync(); err != nil {
-		return nil, fmt.Errorf("fsync temp: %w", err)
 	}
 	return idx, nil
 }
 
-// buildIndexFromReader scans the stream, builds the per-store index,
-// and (when emit != nil) calls emit(store) as each store's full
-// range becomes known — i.e., when the next StoreItem or the
-// extension tail is encountered. emit returning an error aborts the
-// scan.
+// buildIndexFromReader scans the stream, builds the per-store
+// index, and emits open/close events as it goes:
 //
-// Stores are emitted in stream order. The returned SnapshotIndex
-// (with .Stores re-sorted big-first) is for callers that want the
-// full tabular view; the channel-based dispatch path doesn't depend
-// on that sort.
+//   - onOpen(StoreEntry) fires the moment a StoreItem is encountered
+//     (DecompressedStart known; DecompressedEnd unknown).
+//   - onClose(name, end) fires when the next StoreItem or the
+//     extension tail is encountered (the store's last byte offset is
+//     `end`).
+//
+// Either callback may be nil. Returning an error from either aborts
+// the scan. Stores are emitted in stream order. The returned
+// SnapshotIndex carries fully-populated DecompressedStart/End for
+// every store so the caller can use it as a tabular view.
 func buildIndexFromReader(
 	r io.Reader,
-	emit func(StoreEntry) error,
+	onOpen func(StoreEntry) error,
+	onClose func(name string, end int64) error,
 	log *slog.Logger,
 ) (*SnapshotIndex, error) {
 	t0 := time.Now()
@@ -392,12 +412,11 @@ func buildIndexFromReader(
 			return nil
 		}
 		curStore.DecompressedEnd = end
-		if emit != nil {
-			if err := emit(*curStore); err != nil {
-				return err
-			}
-		}
+		name := curStore.Name
 		curStore = nil
+		if onClose != nil {
+			return onClose(name, end)
+		}
 		return nil
 	}
 	for {
@@ -434,6 +453,11 @@ func buildIndexFromReader(
 				ItemCount:         1,
 			})
 			curStore = &idx.Stores[len(idx.Stores)-1]
+			if onOpen != nil {
+				if err := onOpen(*curStore); err != nil {
+					return nil, err
+				}
+			}
 		case itemTypeIAVL:
 			if err := scanner.discard(int64(envLen)); err != nil {
 				return nil, fmt.Errorf("discard IAVL body at offset %d: %w", envStart, err)
@@ -473,16 +497,17 @@ func buildIndexFromReader(
 
 // stage2RunWorkersFromChan consumes StoreEntry events from storeCh
 // (sent by stage 1) and dispatches them to a fixed-size worker
-// pool. Each worker opens its own *os.File handle on tempPath and
-// seeks to the store's offset, then runs the IAVL stack + ingest
-// path. Returns when storeCh closes and all in-flight workers
-// drain.
+// pool. Each worker creates a chunkRingReader at the store's
+// DecompressedStart and reads sequentially via the ring (which
+// shares decompressed bytes across all readers and evicts behind
+// the slowest cursor). Returns when storeCh closes and all
+// in-flight workers drain.
 //
 // Stores arrive in stream order from stage 1 — bank typically lands
 // at position 4 (after 08-wasm, acc, authz), so the longest-pole
 // store starts processing well before stage 1 finishes.
 func stage2RunWorkersFromChan(
-	storeCh <-chan StoreEntry, tempPath string, db *pebble.DB, height int64,
+	storeCh <-chan StoreEntry, ring *chunkRing, db *pebble.DB, height int64,
 	ingestTmpDir string, log *slog.Logger, numWorkers int, waveParallel bool,
 ) ([]StoreInfo, *Stats, error) {
 
@@ -508,19 +533,12 @@ func stage2RunWorkersFromChan(
 		wg.Add(1)
 		go func(wid int) {
 			defer wg.Done()
-			file, err := os.Open(tempPath)
-			if err != nil {
-				resultsCh <- workerOut{err: fmt.Errorf("worker %d open temp: %w", wid, err)}
-				return
-			}
-			defer file.Close()
-
 			ing := newFastIngester(db, ingestTmpDir, log)
 			defer ing.cleanup()
 
 			for store := range storeCh {
 				info, items, ivl, pbl, err := processStoreSegment(
-					file, store, db, height, ing, log, waveParallel)
+					ring, store, db, height, ing, log, waveParallel)
 				if err != nil {
 					resultsCh <- workerOut{err: fmt.Errorf("store %q: %w", store.Name, err)}
 					continue
@@ -539,12 +557,22 @@ func stage2RunWorkersFromChan(
 		close(resultsCh)
 	}()
 
-	var stores []StoreInfo
+	var (
+		stores   []StoreInfo
+		firstErr error
+	)
 	for r := range resultsCh {
 		if r.err != nil {
-			return nil, nil, r.err
+			if firstErr == nil {
+				firstErr = r.err
+				log.Error("worker error", "err", r.err)
+			}
+			continue
 		}
 		stores = append(stores, r.info)
+	}
+	if firstErr != nil {
+		return nil, nil, firstErr
 	}
 	stats.Items = itemsTotal
 	stats.StreamIAVLElapsed = time.Duration(iavlNanos)
@@ -636,19 +664,29 @@ func (w *asyncBatchWriter) drain() error {
 // segment of the temp file. Returns the store's root hash + per-bucket
 // timings (for stats aggregation across workers).
 func processStoreSegment(
-	file *os.File, store StoreEntry, db *pebble.DB, height int64,
+	ring *chunkRing, store StoreEntry, db *pebble.DB, height int64,
 	ing *fastIngester, log *slog.Logger, waveParallel bool,
 ) (StoreInfo, uint64, int64, int64, error) {
 
 	var iavlNanos, pebbleNanos int64
 
-	if _, err := file.Seek(store.DecompressedStart, io.SeekStart); err != nil {
-		return StoreInfo{}, 0, 0, 0, fmt.Errorf("seek: %w", err)
+	// Open a reader at the store's start; the end limit is left
+	// unset (-1) until stage 1 sends the close offset on store.EndCh,
+	// at which point the goroutine below calls SetEnd. Reads past
+	// the end return io.EOF — same shape as the prior os.File +
+	// io.LimitReader path.
+	rdr := ring.NewReader(store.DecompressedStart, -1)
+	defer rdr.Close()
+	if store.EndCh != nil {
+		go func() {
+			if end, ok := <-store.EndCh; ok {
+				rdr.SetEnd(end)
+			}
+		}()
+	} else if store.DecompressedEnd > 0 {
+		rdr.SetEnd(store.DecompressedEnd)
 	}
-	span := store.DecompressedEnd - store.DecompressedStart
-	r := io.LimitReader(file, span)
-	br := bufio.NewReaderSize(r, 1<<20)
-	sr := newSnapReader(br)
+	sr := newSnapReader(rdr)
 
 	// Async batch commit pipeline: the main thread keeps building the
 	// next batch while a writer goroutine commits the previous one.
@@ -740,32 +778,62 @@ func processStoreSegment(
 			}
 		}()
 
+		first := true
+	wpLoop:
 		for item := range itemQ {
 			switch item.Type {
 			case itemTypeStore:
-				if item.StoreName != store.Name {
-					_ = batch.Close()
-					return StoreInfo{}, 0, 0, 0, fmt.Errorf(
-						"expected StoreItem %q, got %q at offset %d",
-						store.Name, item.StoreName, store.DecompressedStart)
+				if first {
+					if item.StoreName != store.Name {
+						_ = batch.Close()
+						return StoreInfo{}, 0, 0, 0, fmt.Errorf(
+							"expected StoreItem %q, got %q at offset %d",
+							store.Name, item.StoreName, store.DecompressedStart)
+					}
+				} else {
+					// Read past our store's last byte; the next store
+					// is starting. Treat as end-of-store. (The reader's
+					// SetEnd may not have been called yet by the EndCh
+					// listener goroutine — the boundary item itself is
+					// the authoritative signal.)
+					break wpLoop
 				}
 			case itemTypeIAVL:
+				if first {
+					_ = batch.Close()
+					return StoreInfo{}, 0, 0, 0, fmt.Errorf(
+						"first item not StoreItem (got IAVL) for store %q at offset %d",
+						store.Name, store.DecompressedStart)
+				}
 				if err := si.addNode(set, setFast,
 					item.IAVLHeight, item.IAVLVersion,
 					item.IAVLKey, item.IAVLValue); err != nil {
 					_ = batch.Close()
 					return StoreInfo{}, 0, 0, 0, fmt.Errorf("add node: %w", err)
 				}
+			case itemTypeExtMeta, itemTypeExtPayload:
+				// Extension tail — last store has ended.
+				break wpLoop
 			default:
 				_ = batch.Close()
 				return StoreInfo{}, 0, 0, 0, fmt.Errorf(
 					"unexpected item type %d in store segment", item.Type)
 			}
+			first = false
 			items++
 		}
-		if err := <-decErr; err != io.EOF {
-			_ = batch.Close()
-			return StoreInfo{}, 0, 0, 0, fmt.Errorf("read item: %w", err)
+		// At this point either itemQ closed (sr error/EOF) or we broke
+		// out on a boundary item. Either way the store is done; we
+		// don't drain decErr because the decoder may keep producing
+		// for the next worker. Best-effort: surface decoder error if
+		// already seen and not yet drained.
+		select {
+		case err := <-decErr:
+			if err != io.EOF {
+				_ = batch.Close()
+				return StoreInfo{}, 0, 0, 0, fmt.Errorf("read item: %w", err)
+			}
+		default:
 		}
 
 		if err := si.finishStreaming(); err != nil {
@@ -781,6 +849,8 @@ func processStoreSegment(
 		// Synchronous path: main thread does decode + addNode inline.
 		// No hash worker pool, no writer goroutine — just async batch
 		// commits via the existing asyncBatchWriter from PR #71.
+		first := true
+	syncLoop:
 		for {
 			item, err := sr.Next()
 			if err == io.EOF {
@@ -792,24 +862,42 @@ func processStoreSegment(
 			}
 			switch item.Type {
 			case itemTypeStore:
-				if item.StoreName != store.Name {
-					_ = batch.Close()
-					return StoreInfo{}, 0, 0, 0, fmt.Errorf(
-						"expected StoreItem %q, got %q at offset %d",
-						store.Name, item.StoreName, store.DecompressedStart)
+				if first {
+					if item.StoreName != store.Name {
+						_ = batch.Close()
+						return StoreInfo{}, 0, 0, 0, fmt.Errorf(
+							"expected StoreItem %q, got %q at offset %d",
+							store.Name, item.StoreName, store.DecompressedStart)
+					}
+				} else {
+					// Boundary into next store — treat as end-of-store.
+					// The reader's EndCh-driven SetEnd may not have
+					// fired yet for tiny stores; the boundary item
+					// itself is the authoritative signal.
+					break syncLoop
 				}
 			case itemTypeIAVL:
+				if first {
+					_ = batch.Close()
+					return StoreInfo{}, 0, 0, 0, fmt.Errorf(
+						"first item not StoreItem (got IAVL) for store %q at offset %d",
+						store.Name, store.DecompressedStart)
+				}
 				if err := si.addNode(set, setFast,
 					item.IAVLHeight, item.IAVLVersion,
 					item.IAVLKey, item.IAVLValue); err != nil {
 					_ = batch.Close()
 					return StoreInfo{}, 0, 0, 0, fmt.Errorf("add node: %w", err)
 				}
+			case itemTypeExtMeta, itemTypeExtPayload:
+				// Extension tail — last store has ended.
+				break syncLoop
 			default:
 				_ = batch.Close()
 				return StoreInfo{}, 0, 0, 0, fmt.Errorf(
 					"unexpected item type %d in store segment", item.Type)
 			}
+			first = false
 			items++
 		}
 	}
@@ -847,25 +935,23 @@ func processStoreSegment(
 	return StoreInfo{Name: store.Name, Hash: hash}, items, iavlNanos, pebbleNanos, nil
 }
 
-// stage3Extensions reads the extension tail of the temp file and
-// runs the existing extensionWriter sequentially. Extensions are
-// not parallelizable — they're a small fraction of total work
+// stage3ExtensionsFromRing reads the extension tail from the ring
+// and runs the existing extensionWriter sequentially. Extensions
+// are not parallelizable — they're a small fraction of total work
 // (~100MB on cosmoshub-4) and live at the very end of the stream.
-func stage3Extensions(
-	tempPath string, extStart, extEnd int64,
+//
+// Called after stage 1 has finished writing to the ring (closed) and
+// stage 2 readers have all closed. The ring's eviction logic only
+// fires when readers exist, so the ext bytes (which were never
+// pinned by a stage-2 reader) are still in memory when stage 3
+// allocates its reader.
+func stage3ExtensionsFromRing(
+	ring *chunkRing, extStart, extEnd int64,
 	db *pebble.DB, extDir string, stats *Stats, log *slog.Logger,
 ) error {
-	f, err := os.Open(tempPath)
-	if err != nil {
-		return fmt.Errorf("open temp for extensions: %w", err)
-	}
-	defer f.Close()
-	if _, err := f.Seek(extStart, io.SeekStart); err != nil {
-		return fmt.Errorf("seek to extensions: %w", err)
-	}
-	r := io.LimitReader(f, extEnd-extStart)
-	br := bufio.NewReaderSize(r, 1<<20)
-	sr := newSnapReader(br)
+	rdr := ring.NewReader(extStart, extEnd)
+	defer rdr.Close()
+	sr := newSnapReader(rdr)
 
 	const flushBytes = 64 << 20
 	batch := db.NewBatch()
