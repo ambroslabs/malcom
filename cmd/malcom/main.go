@@ -6,6 +6,7 @@
 //	malcom registry refresh   re-fetch the cached chain-registry snapshot
 //	malcom snapshot fetch     download a state-sync snapshot
 //	malcom snapshot import    snapshot dir → application.db + extensions/
+//	malcom snapshot serve     advertise a local snapshot over state-sync P2P
 //	malcom bootstrap          assemble a runnable gaiad home dir
 //	malcom verify             check the imported AppHash against a cometbft RPC
 //	malcom compact            full-keyspace pebble compaction (post-import slack)
@@ -27,6 +28,7 @@ import (
 	"github.com/zrbecker/cosmos-p2p/internal/cli/snapshotfetch"
 	"github.com/zrbecker/cosmos-p2p/internal/cli/snapshotimport"
 	"github.com/zrbecker/cosmos-p2p/internal/cli/snapshotindex"
+	"github.com/zrbecker/cosmos-p2p/internal/cli/snapshotserve"
 	"github.com/zrbecker/cosmos-p2p/internal/cli/verify"
 )
 
@@ -75,6 +77,8 @@ func snapshotDispatch(args []string) int {
 		return snapshotimport.Run(rest)
 	case "index":
 		return snapshotindex.Run(rest)
+	case "serve":
+		return snapshotserve.Run(rest)
 	case "-h", "--help", "help":
 		snapshotUsage()
 		return 0
@@ -111,5 +115,6 @@ usage: malcom snapshot <subcommand> [args...]
 
 subcommands:
   fetch    download a snapshot via state-sync P2P
-  import   convert a downloaded snapshot dir into application.db + extensions/`)
+  import   convert a downloaded snapshot dir into application.db + extensions/
+  serve    advertise a local snapshot dir over the state-sync P2P protocol`)
 }
