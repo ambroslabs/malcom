@@ -121,3 +121,119 @@ func appendBytesField(dst []byte, field int, b []byte) []byte {
 func appendEmbeddedField(dst []byte, field int, body []byte) []byte {
 	return appendBytesField(dst, field, body)
 }
+
+// ─── decoders (used by the standalone verify-fast subcommand) ────────────
+
+// DecodeLatestVersion extracts the version from a `latest_version`
+// pebble value (the same protobuf shape latestVersionBytes writes).
+func DecodeLatestVersion(b []byte) (int64, error) {
+	pos := 0
+	for pos < len(b) {
+		tag, n := binary.Uvarint(b[pos:])
+		if n <= 0 {
+			return 0, fmt.Errorf("bad tag varint")
+		}
+		pos += n
+		field, wire := tag>>3, tag&7
+		switch wire {
+		case 0:
+			v, n := binary.Uvarint(b[pos:])
+			if n <= 0 {
+				return 0, fmt.Errorf("bad varint")
+			}
+			if field == 1 {
+				return int64(v), nil
+			}
+			pos += n
+		case 2:
+			length, n := binary.Uvarint(b[pos:])
+			if n <= 0 {
+				return 0, fmt.Errorf("bad length")
+			}
+			pos += n + int(length)
+		default:
+			return 0, fmt.Errorf("unsupported wire type %d", wire)
+		}
+	}
+	return 0, fmt.Errorf("latest_version: missing version field")
+}
+
+// DecodeStoreNames extracts store names from a CommitInfo pebble
+// value (the same protobuf shape commitInfoBytes writes). The
+// returned names follow stream order from the encoder, which sorted
+// stores by Name before encoding.
+func DecodeStoreNames(b []byte) ([]string, error) {
+	var names []string
+	pos := 0
+	for pos < len(b) {
+		tag, n := binary.Uvarint(b[pos:])
+		if n <= 0 {
+			return nil, fmt.Errorf("bad tag varint")
+		}
+		pos += n
+		field, wire := tag>>3, tag&7
+		switch wire {
+		case 0:
+			_, n := binary.Uvarint(b[pos:])
+			if n <= 0 {
+				return nil, fmt.Errorf("bad varint")
+			}
+			pos += n
+		case 2:
+			length, n := binary.Uvarint(b[pos:])
+			if n <= 0 {
+				return nil, fmt.Errorf("bad length")
+			}
+			pos += n
+			end := pos + int(length)
+			if end > len(b) {
+				return nil, fmt.Errorf("length-delim out of bounds")
+			}
+			if field == 2 {
+				name, err := decodeStoreInfoName(b[pos:end])
+				if err != nil {
+					return nil, fmt.Errorf("StoreInfo: %w", err)
+				}
+				names = append(names, name)
+			}
+			pos = end
+		default:
+			return nil, fmt.Errorf("unsupported wire type %d", wire)
+		}
+	}
+	return names, nil
+}
+
+func decodeStoreInfoName(b []byte) (string, error) {
+	pos := 0
+	for pos < len(b) {
+		tag, n := binary.Uvarint(b[pos:])
+		if n <= 0 {
+			return "", fmt.Errorf("bad tag")
+		}
+		pos += n
+		field, wire := tag>>3, tag&7
+		switch wire {
+		case 0:
+			_, n := binary.Uvarint(b[pos:])
+			pos += n
+		case 2:
+			length, n := binary.Uvarint(b[pos:])
+			pos += n
+			end := pos + int(length)
+			if field == 1 {
+				return string(b[pos:end]), nil
+			}
+			pos = end
+		}
+	}
+	return "", fmt.Errorf("missing name field")
+}
+
+// CommitInfoKey returns the pebble key under which CommitInfo for
+// `version` is stored; exported for the standalone verify-fast path.
+func CommitInfoKey(version int64) []byte { return commitInfoKey(version) }
+
+// LatestVersionKey is the fixed pebble key used for latest_version;
+// exported for the standalone verify-fast path.
+var LatestVersionKey = latestVersionKey
