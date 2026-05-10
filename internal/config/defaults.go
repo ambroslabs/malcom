@@ -112,12 +112,13 @@ func applyImportDefaults(t *ImportTuning) {
 	// returns diminish above that. Smaller hosts should drop both
 	// memtable_mb and flush_split_mb proportionally via config.
 	//
-	// 1024 MiB chosen over the previous 256 MiB to keep the post-
-	// import L0 file count manageable: each memtable flush produces
-	// roughly one SST per flush_split_mb of payload, so a 4× bigger
-	// memtable cuts file count ~4× and compaction wall accordingly.
-	// On bbn finality (~150 GiB s/) this drops L0 from ~70k files
-	// to ~hundreds.
+	// 1024 MiB chosen over the previous 256 MiB so each L0 SST produced
+	// during bulk load is ~1 GiB instead of ~256 MiB. Bulk mode forces
+	// FlushSplitBytes=0 (one SST per memtable flush) regardless of
+	// flush_split_mb, so memtable_mb directly sets the L0 SST size.
+	// At 1 GiB, a 140 GiB bbn import lands ~140 L0 files instead of
+	// ~70k, and the follow-on compact reads each file once instead of
+	// thrashing through tens of thousands of bloom/index blocks.
 	if t.MemtableMB == 0 {
 		t.MemtableMB = 1024
 	}
@@ -127,10 +128,10 @@ func applyImportDefaults(t *ImportTuning) {
 	if t.MinFreeGB == 0 {
 		t.MinFreeGB = 20
 	}
-	// FlushSplitMB defaults to memtable_mb so each memtable flush
-	// produces ~1 L0 SSTable instead of the pebble default ~64
-	// small ones. With CompactDuringImport off (the default), this
-	// is what gaiad / the standalone compact will see.
+	// FlushSplitMB is ignored in bulk-load mode (CompactDuringImport
+	// off, the default). Honored only when compact_during_import =
+	// true. Default to memtable_mb so the value is sensible if the
+	// user flips that flag on.
 	if t.FlushSplitMB == 0 {
 		t.FlushSplitMB = t.MemtableMB
 	}

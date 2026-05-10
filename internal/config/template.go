@@ -118,10 +118,11 @@ memtable_mb           = 1024  # x2 in-flight = ~2 GiB resident
 cache_mb              = 64
 min_free_gb           = 20    # cosmoshub-4 import is ~14 GB after compact
 
-# Cap on L0 SSTable size from memtable flushes. 0 = pebble default
-# (4 MiB). Setting equal to memtable_mb yields ~1 SSTable per flush,
-# dramatically reducing post-import L0 file count when the import
-# defers compactions (the default).
+# Ignored in bulk-load mode (the default — compact_during_import
+# off). Bulk mode forces FlushSplitBytes=0 so each memtable flush
+# produces one L0 SSTable; pebble's L0-sublevel splitter would
+# otherwise fragment flushes into hundreds of small SSTs once L0
+# is non-empty. Honored only when compact_during_import = true.
 flush_split_mb        = 1024
 
 # When false (default), `+"`malcom snapshot import`"+` writes the snapshot
