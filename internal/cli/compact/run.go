@@ -21,6 +21,7 @@ func Run(args []string) int {
 	dir := fs.String("dir", "", "path to pebble DB directory (required)")
 	workers := fs.Int("workers", 0, "override [compact].max_concurrent_compactions (default = config or 8)")
 	cacheMB := fs.Int("cache-mb", 0, "pebble block-cache size in MiB during the compact (default 8192). Larger = more bloom/index blocks resident, fewer disk reads on the L0→L1 pass when the DB has tens of thousands of L0 SSTables.")
+	targetFileSizeMB := fs.Int("target-file-size-mb", -1, "override [compact].target_file_size_mb (per-level TargetFileSize in MiB; 0 = pebble defaults; e.g. 1024 = merge into a small number of large output files at the cost of wall time)")
 	logMode := fs.String("log", "", "log output: auto (default), pretty, text, json")
 	debug := fs.Bool("debug", false, "verbose logging")
 	if err := fs.Parse(args); err != nil {
@@ -46,26 +47,35 @@ func Run(args []string) int {
 		Level:  level,
 	}).With("module", "compact")
 
-	// Resolve max-concurrent-compactions:
-	//   1. -workers flag wins.
-	//   2. else, [compact].max_concurrent_compactions from global config
-	//      (no chain selected — `malcom compact` doesn't take -chain).
-	//   3. else, fall back to the pebbleutil default (8).
+	// Resolve max-concurrent-compactions and target-file-size-mb:
+	//   1. CLI flag wins.
+	//   2. else, [compact] from global config (no chain selected —
+	//      `malcom compact` doesn't take -chain).
+	//   3. else, the pebbleutil default (8 / pebble defaults).
 	maxCompact := *workers
-	if maxCompact <= 0 {
+	targetFS := *targetFileSizeMB
+	if maxCompact <= 0 || targetFS < 0 {
 		if cfg, err := config.Load(); err == nil {
 			// applyCompactDefaults runs in Resolve, but the global
 			// config.Load doesn't apply per-chain defaults — apply
 			// our compact-section default here to honor NumCPU.
 			ct := cfg.Compact
 			config.ApplyCompactDefaults(&ct)
-			maxCompact = ct.MaxConcurrentCompactions
+			if maxCompact <= 0 {
+				maxCompact = ct.MaxConcurrentCompactions
+			}
+			if targetFS < 0 {
+				targetFS = ct.TargetFileSizeMB
+			}
 		}
+	}
+	if targetFS < 0 {
+		targetFS = 0
 	}
 
 	t0 := time.Now()
-	log.Info("starting", "dir", *dir, "max_concurrent_compactions", maxCompact, "cache_mb", *cacheMB)
-	if err := pebbleutil.CleanupCompact(*dir, maxCompact, *cacheMB, log); err != nil {
+	log.Info("starting", "dir", *dir, "max_concurrent_compactions", maxCompact, "cache_mb", *cacheMB, "target_file_size_mb", targetFS)
+	if err := pebbleutil.CleanupCompact(*dir, maxCompact, *cacheMB, targetFS, log); err != nil {
 		log.Error("compact failed", "err", err)
 		return 1
 	}

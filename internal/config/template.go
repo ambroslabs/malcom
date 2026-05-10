@@ -140,6 +140,14 @@ flush_split_mb        = 1024
 # at cosmos-scale so going much higher rarely helps.
 # max_concurrent_compactions = 8
 
+# Per-level pebble TargetFileSize in MiB. 0 (default) keeps pebble's
+# defaults — the compact runs fast and produces many small L1-L6
+# files. Bump to 1024+ to merge the post-import LSM into a small
+# number of large files; the trade-off is wall time, since the
+# final merges serialize. Measured on 147 GiB bbn: default = 1822
+# files / 25m12s; 1024 = 6 files / 47m55s.
+# target_file_size_mb = 0
+
 [bootstrap]
 trust_period   = "720h"   # 30d cometbft light-client trust window
 app_db_backend = "pebbledb"

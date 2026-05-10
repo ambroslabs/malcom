@@ -75,6 +75,17 @@ type CompactTuning struct {
 	// I/O-bound on cosmos-scale chains; bumping past NumCPU rarely
 	// helps.
 	MaxConcurrentCompactions int `toml:"max_concurrent_compactions"`
+
+	// TargetFileSizeMB sets pebble's per-level TargetFileSize in MiB.
+	// 0 = pebble defaults (~2 MiB at L0 doubling per level, ~64 MiB at
+	// L6 effective). Bumping to 1024+ MiB makes the compact merge its
+	// inputs into a small number of large files instead of re-fragmenting
+	// them — the trade-off is wall time: bigger output files serialize
+	// more of the work near the end (one big merge instead of many small
+	// ones). Measured on a 147 GiB bbn appdb: default = 1822 files /
+	// 25m12s; 1024 = 6 files / 47m55s. Operators who want the leanest
+	// post-compact LSM can opt in here; everyone else gets fast wall.
+	TargetFileSizeMB int `toml:"target_file_size_mb"`
 }
 
 // LogTuning maps onto internal/log.Tuning. Edit config.toml to surface
