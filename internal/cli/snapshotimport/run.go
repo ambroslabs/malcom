@@ -50,6 +50,7 @@ func Run(args []string) int {
 	parallelWorkers := fs.Int("workers", 0, "max concurrent store workers in -parallel mode (default = NumCPU)")
 	tempDir := fs.String("tmp-dir", "", "(unused — preserved for backward CLI compatibility; the parallel pipeline streams through an in-memory chunk ring rather than a temp file)")
 	chunkMB := fs.Int("chunk-mb", 0, "in-memory chunk-ring budget in MiB (the streaming buffer between stage 1 decompression and stage 2 readers). 0 = default 512. Bigger values reduce stage-1 backpressure on multi-store-concurrent chains (cosmoshub bank+ibc, osmosis cl/ibc/wasm) at the cost of more peak RSS; single-polestar chains (bbn finality) don't benefit from larger rings.")
+	fastIngest := fs.Bool("fast-ingest", true, "route f/ (fast-storage) entries through pebble's bulk-ingest path (per-store sstable.Writer + db.Ingest at end-of-store). Disable to send them through the regular pebble.Batch instead. Output is bit-identical either way; this flag exists to A/B the bulk-ingest performance benefit.")
 	waveParallel := fs.Bool("wave-parallel", false, "within-store wave-parallel hashing: each per-store worker spawns a hash worker pool to overlap iavl hash + encode work across cores. Helps single-store-dominated chains (bbn finality: ~-2 min vs async-only). Slightly regresses chains where multiple polestar stores run concurrent (osmosis cl/ibc/wasm). Default off.")
 	flushSplitMB := fs.Int("flush-split-mb", -1, "cap on L0 SSTable size from memtable flushes; -1 = use [import].flush_split_mb (defaults to memtable_mb)")
 	compactDuringImport := fs.Bool("compact-during-import", false, "enable pebble auto-compactions during import (default off; trades wall time for tighter end-of-import LSM)")
@@ -215,6 +216,7 @@ func Run(args []string) int {
 			TempDir:      *tempDir,
 			ChunkMB:      *chunkMB,
 			WaveParallel: *waveParallel,
+			FastIngest:   *fastIngest,
 		})
 	} else {
 		if *waveParallel {

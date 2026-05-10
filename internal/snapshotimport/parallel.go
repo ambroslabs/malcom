@@ -74,6 +74,12 @@ type ParallelOptions struct {
 	// polestar chains (bbn finality) don't benefit from larger rings.
 	ChunkMB int
 
+	// FastIngest routes f/ (fast-storage) entries through pebble's
+	// bulk-ingest path: per-store sstable.Writer → db.Ingest at end-
+	// of-store. When false, f/ entries flow through the same
+	// pebble.Batch as s/ entries (memtable + WAL + L0 build).
+	FastIngest bool
+
 	// WaveParallel turns on within-store wave-parallel hashing per
 	// store: each per-store worker spawns a hash worker pool and
 	// dispatcher (see importer_par.go) so the IAVL hash + encode
@@ -224,7 +230,7 @@ func ImportParallel(opts ParallelOptions) (*Stats, error) {
 	// all in-flight workers drain.
 	stage2Start := time.Now()
 	stores, parStats, err := stage2RunWorkersFromChan(
-		storeCh, ring, db, opts.Height, ingestTmpDir, log, workers, opts.WaveParallel)
+		storeCh, ring, db, opts.Height, ingestTmpDir, log, workers, opts.WaveParallel, opts.FastIngest)
 	if err != nil {
 		_ = db.Close()
 		// Drain stage 1 to surface its error too if it had one.
@@ -360,6 +366,14 @@ func stage1WriteRingAndIndex(
 	onOpen := func(s StoreEntry) error {
 		s.EndCh = make(chan int64, 1)
 		ends[s.Name] = s.EndCh
+		// Pin the ring's eviction at this store's DecompressedStart
+		// by creating the reader NOW, while stage 1 has just
+		// produced the bytes at that offset. If we let the worker
+		// create the reader after pulling from storeCh, other readers
+		// could advance their cursors past start in the meantime,
+		// causing the start chunk to be evicted before this store's
+		// worker arrives.
+		s.reader = ring.NewReader(s.DecompressedStart, -1)
 		storeCh <- s
 		return nil
 	}
@@ -508,7 +522,7 @@ func buildIndexFromReader(
 // store starts processing well before stage 1 finishes.
 func stage2RunWorkersFromChan(
 	storeCh <-chan StoreEntry, ring *chunkRing, db *pebble.DB, height int64,
-	ingestTmpDir string, log *slog.Logger, numWorkers int, waveParallel bool,
+	ingestTmpDir string, log *slog.Logger, numWorkers int, waveParallel, fastIngest bool,
 ) ([]StoreInfo, *Stats, error) {
 
 	type workerOut struct {
@@ -538,7 +552,7 @@ func stage2RunWorkersFromChan(
 
 			for store := range storeCh {
 				info, items, ivl, pbl, err := processStoreSegment(
-					ring, store, db, height, ing, log, waveParallel)
+					ring, store, db, height, ing, log, waveParallel, fastIngest)
 				if err != nil {
 					resultsCh <- workerOut{err: fmt.Errorf("store %q: %w", store.Name, err)}
 					continue
@@ -665,17 +679,19 @@ func (w *asyncBatchWriter) drain() error {
 // timings (for stats aggregation across workers).
 func processStoreSegment(
 	ring *chunkRing, store StoreEntry, db *pebble.DB, height int64,
-	ing *fastIngester, log *slog.Logger, waveParallel bool,
+	ing *fastIngester, log *slog.Logger, waveParallel, fastIngest bool,
 ) (StoreInfo, uint64, int64, int64, error) {
 
 	var iavlNanos, pebbleNanos int64
 
-	// Open a reader at the store's start; the end limit is left
-	// unset (-1) until stage 1 sends the close offset on store.EndCh,
-	// at which point the goroutine below calls SetEnd. Reads past
-	// the end return io.EOF — same shape as the prior os.File +
-	// io.LimitReader path.
-	rdr := ring.NewReader(store.DecompressedStart, -1)
+	// store.reader was pre-created by stage 1's onOpen callback to
+	// pin the ring's eviction at DecompressedStart; we just use it.
+	// The fallback path (BuildIndex/non-streaming callers) opens a
+	// reader on the fly using the populated DecompressedEnd.
+	rdr := store.reader
+	if rdr == nil {
+		rdr = ring.NewReader(store.DecompressedStart, store.DecompressedEnd)
+	}
 	defer rdr.Close()
 	if store.EndCh != nil {
 		go func() {
@@ -683,8 +699,6 @@ func processStoreSegment(
 				rdr.SetEnd(end)
 			}
 		}()
-	} else if store.DecompressedEnd > 0 {
-		rdr.SetEnd(store.DecompressedEnd)
 	}
 	sr := newSnapReader(rdr)
 
@@ -718,13 +732,20 @@ func processStoreSegment(
 		}
 		return nil
 	}
-	setFast := func(key, value []byte) error {
-		return ing.set(key, value)
-	}
-
-	if err := ing.openStore(store.Name); err != nil {
-		_ = batch.Close()
-		return StoreInfo{}, 0, 0, 0, fmt.Errorf("open fast SSTable: %w", err)
+	// setFast routes f/ entries either to the per-store SSTable
+	// bulk-ingest path (FastIngest) or to the regular pebble.Batch
+	// (same path as s/ entries; pebble sorts at flush time so the
+	// order workers emit doesn't matter). Output is bit-identical
+	// either way.
+	var setFast func(key, value []byte) error
+	if fastIngest {
+		setFast = func(key, value []byte) error { return ing.set(key, value) }
+		if err := ing.openStore(store.Name); err != nil {
+			_ = batch.Close()
+			return StoreInfo{}, 0, 0, 0, fmt.Errorf("open fast SSTable: %w", err)
+		}
+	} else {
+		setFast = set
 	}
 
 	si := newStoreImporter(store.Name, height)
@@ -914,8 +935,10 @@ func processStoreSegment(
 	if err := bw.drain(); err != nil {
 		return StoreInfo{}, 0, 0, 0, fmt.Errorf("drain async writer: %w", err)
 	}
-	if err := ing.ingestStore(store.Name); err != nil {
-		return StoreInfo{}, 0, 0, 0, fmt.Errorf("ingest fast: %w", err)
+	if fastIngest {
+		if err := ing.ingestStore(store.Name); err != nil {
+			return StoreInfo{}, 0, 0, 0, fmt.Errorf("ingest fast: %w", err)
+		}
 	}
 
 	storeWall := time.Since(storeStart).Nanoseconds()

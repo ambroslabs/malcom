@@ -67,6 +67,15 @@ type StoreEntry struct {
 	// end. BuildIndex returns entries with EndCh == nil and the
 	// final DecompressedEnd populated normally.
 	EndCh chan int64
+
+	// reader is set by stage 1's onOpen callback at the moment the
+	// store is emitted, NOT when the worker pulls it from storeCh.
+	// Creating the reader at emit time pins the ring's eviction at
+	// DecompressedStart — without this, the start chunk could be
+	// evicted while the StoreEntry sits in storeCh waiting for a
+	// worker (other readers advance, ring.head climbs past start).
+	// nil for BuildIndex callers.
+	reader *chunkRingReader
 }
 
 // BuildIndex decompresses the snapshot once and emits a per-store
