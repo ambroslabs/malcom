@@ -955,7 +955,7 @@ func processStoreSegment(
 		"inner", si.innerCount,
 		"elapsed", time.Duration(storeWall).Truncate(time.Millisecond))
 
-	return StoreInfo{Name: store.Name, Hash: hash, LeafCount: si.leafCount}, items, iavlNanos, pebbleNanos, nil
+	return StoreInfo{Name: store.Name, Hash: hash}, items, iavlNanos, pebbleNanos, nil
 }
 
 // stage3ExtensionsFromRing reads the extension tail from the ring

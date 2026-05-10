@@ -27,7 +27,6 @@ import (
 	"github.com/zrbecker/cosmos-p2p/internal/cli/snapshotfetch"
 	"github.com/zrbecker/cosmos-p2p/internal/cli/snapshotimport"
 	"github.com/zrbecker/cosmos-p2p/internal/cli/snapshotindex"
-	"github.com/zrbecker/cosmos-p2p/internal/cli/snapshotverifyfast"
 	"github.com/zrbecker/cosmos-p2p/internal/cli/verify"
 )
 
@@ -76,8 +75,6 @@ func snapshotDispatch(args []string) int {
 		return snapshotimport.Run(rest)
 	case "index":
 		return snapshotindex.Run(rest)
-	case "verify-fast":
-		return snapshotverifyfast.Run(rest)
 	case "-h", "--help", "help":
 		snapshotUsage()
 		return 0
@@ -113,8 +110,6 @@ func snapshotUsage() {
 usage: malcom snapshot <subcommand> [args...]
 
 subcommands:
-  fetch        download a snapshot via state-sync P2P
-  import       convert a downloaded snapshot dir into application.db + extensions/
-  index        scan a downloaded snapshot dir and print a per-store offset+size index
-  verify-fast  count-only sanity check on an imported appdb's f/ entries`)
+  fetch    download a snapshot via state-sync P2P
+  import   convert a downloaded snapshot dir into application.db + extensions/`)
 }
