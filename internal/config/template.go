@@ -114,7 +114,7 @@ max_disk_write_failures = 3
 [import]
 # Pebble bulk-load tuning. Defaults sized for an 8 GiB host with 2-4
 # vCPUs; bump memtable_mb / cache_mb on bigger boxes.
-memtable_mb           = 256   # x2 in-flight = ~512 MiB resident
+memtable_mb           = 1024  # x2 in-flight = ~2 GiB resident
 cache_mb              = 64
 min_free_gb           = 20    # cosmoshub-4 import is ~14 GB after compact
 
@@ -122,7 +122,7 @@ min_free_gb           = 20    # cosmoshub-4 import is ~14 GB after compact
 # (4 MiB). Setting equal to memtable_mb yields ~1 SSTable per flush,
 # dramatically reducing post-import L0 file count when the import
 # defers compactions (the default).
-flush_split_mb        = 256
+flush_split_mb        = 1024
 
 # When false (default), `+"`malcom snapshot import`"+` writes the snapshot
 # in bulk-load mode without running pebble compactions. The resulting

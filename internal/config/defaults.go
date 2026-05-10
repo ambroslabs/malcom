@@ -107,12 +107,19 @@ func applyFetchDefaults(t *FetchTuning) {
 }
 
 func applyImportDefaults(t *ImportTuning) {
-	// Defaults sized for an 8 GiB / 2-4 vCPU host. Bigger boxes can
-	// bump memtable_mb / cache_mb in their config.toml; the import is
-	// CPU-bound on the IAVL hashing path past ~512 MiB memtables, so
-	// returns diminish quickly.
+	// Defaults sized for the typical bootstrap host (~8 GiB box). The
+	// IAVL hashing path is CPU-bound past ~2 GiB memtables, so
+	// returns diminish above that. Smaller hosts should drop both
+	// memtable_mb and flush_split_mb proportionally via config.
+	//
+	// 1024 MiB chosen over the previous 256 MiB to keep the post-
+	// import L0 file count manageable: each memtable flush produces
+	// roughly one SST per flush_split_mb of payload, so a 4× bigger
+	// memtable cuts file count ~4× and compaction wall accordingly.
+	// On bbn finality (~150 GiB s/) this drops L0 from ~70k files
+	// to ~hundreds.
 	if t.MemtableMB == 0 {
-		t.MemtableMB = 256
+		t.MemtableMB = 1024
 	}
 	if t.CacheMB == 0 {
 		t.CacheMB = 64
@@ -120,10 +127,10 @@ func applyImportDefaults(t *ImportTuning) {
 	if t.MinFreeGB == 0 {
 		t.MinFreeGB = 20
 	}
-	// FlushSplitMB defaults to memtable_mb. With CompactDuringImport
-	// off (the default), this means each memtable flush produces ~1
-	// L0 SSTable instead of memtable_mb / 4 = ~64 small ones — gaiad
-	// or the standalone compact then sees a manageable file count.
+	// FlushSplitMB defaults to memtable_mb so each memtable flush
+	// produces ~1 L0 SSTable instead of the pebble default ~64
+	// small ones. With CompactDuringImport off (the default), this
+	// is what gaiad / the standalone compact will see.
 	if t.FlushSplitMB == 0 {
 		t.FlushSplitMB = t.MemtableMB
 	}
