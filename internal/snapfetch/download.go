@@ -143,6 +143,12 @@ type chunkScheduler struct {
 	// fiddling with filesystem permissions.
 	writeFile func(path string, data []byte, mode os.FileMode) error
 
+	// onChunkReady, when non-nil, fires once per verified chunk
+	// after it lands durably on disk — both freshly-downloaded chunks
+	// and chunks resumed from a prior partial run. Used by the
+	// pipelined-import orchestrator to advance its tailing reader.
+	onChunkReady func(idx uint32)
+
 	// job
 	chainID     string
 	target      *snapshotOffer
@@ -183,7 +189,8 @@ func download(ctx context.Context, sw *p2p.Switch, ssR *statesync.Reactor,
 	good []p2p.ID, snapDir string,
 	perPeer int, chunkTimeout time.Duration, peerFailLimit int,
 	provisionalStrikes, provisionalInflight, maxDiskFails int,
-	watch *peerWatch, mgr *connect.Manager, srv *served.Set) (uint64, error) {
+	watch *peerWatch, mgr *connect.Manager, srv *served.Set,
+	onChunkReady func(idx uint32)) (uint64, error) {
 
 	N := target.Chunks
 	pending := make([]bool, N)
@@ -200,6 +207,7 @@ func download(ctx context.Context, sw *p2p.Switch, ssR *statesync.Reactor,
 		srv:                 srv,
 		log:                 logctx.From(ctx),
 		writeFile:           writeFileAtomic,
+		onChunkReady:        onChunkReady,
 		chainID:             chainID,
 		target:              target,
 		chunkHashes:         chunkHashes,
@@ -325,6 +333,9 @@ func (s *chunkScheduler) resumeFromDisk() (resumed, removed int) {
 			s.bytesTotal += uint64(len(data))
 			s.doneCount++
 			resumed++
+			if s.onChunkReady != nil {
+				s.onChunkReady(idx)
+			}
 			continue
 		}
 		if rmErr := os.Remove(path); rmErr != nil {
@@ -722,6 +733,9 @@ func (s *chunkScheduler) onChunk(ev statesync.Event) {
 	s.completed[idx] = true
 	s.doneCount++
 	s.bytesTotal += uint64(len(ev.Chunk.Bytes))
+	if s.onChunkReady != nil {
+		s.onChunkReady(idx)
+	}
 	s.dispatch()
 }
 

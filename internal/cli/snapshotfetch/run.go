@@ -49,6 +49,13 @@ func Run(args []string) int {
 	noVerifyHash := fs.Bool("no-verify-hash", false, "skip the post-download SHA256(chunks) == offer.Hash check; per-chunk hashes are still verified against metadata. Run `malcom verify` afterwards if you skip.")
 	debug := fs.Bool("debug", false, "verbose snapfetch logging")
 	logMode := fs.String("log", "", "log output: auto (default), pretty, text, json")
+	pipelineImport := fs.Bool("import", false, "after the snapshot dir + chunk count are known, start `malcom snapshot import` in parallel (parallel/chunk-ring path) and stream chunks to it as they land. Snapshot is still persisted to <-out>; cancel with Ctrl-C aborts both stages.")
+	importOut := fs.String("import-out", "", "(with -import) parent dir for the appdb output. Default: same as -out.")
+	importNoExtensions := fs.Bool("import-no-extensions", false, "(with -import) skip writing extension payloads")
+	importWorkers := fs.Int("import-workers", 0, "(with -import) parallel-import store workers; 0 = NumCPU")
+	importChunkMB := fs.Int("import-chunk-mb", 0, "(with -import) chunk-ring budget in MiB; 0 = default (512)")
+	importWaveParallel := fs.Bool("import-wave-parallel", false, "(with -import) within-store wave-parallel hashing")
+	importFastIngest := fs.Bool("import-fast-ingest", true, "(with -import) bulk-ingest the f/ fast-storage entries via per-store sstable.Writer")
 	if err := fs.Parse(args); err != nil {
 		return ExitConfig
 	}
@@ -224,9 +231,68 @@ func Run(args []string) int {
 		os.Exit(130)
 	}()
 
-	if err := snapfetch.RunFetch(rootCtx, scfg, *out); err != nil {
-		fetchLog.Error("snapfetch failed", "err", err)
-		return mapExitCode(err, interrupted.Load())
+	// Pipelined-import orchestrator. Wires snapfetch's
+	// OnDownloadReady/OnChunkReady callbacks to a TailingChunkSource
+	// that the parallel importer consumes as its decompressed-stream
+	// source. See pipeline.go for the rationale.
+	var pipeline *pipelineState
+	if *pipelineImport {
+		appdbOut := *importOut
+		if appdbOut == "" {
+			appdbOut = *out
+		}
+		if err := os.MkdirAll(appdbOut, 0o755); err != nil {
+			fetchLog.Error("mkdir import-out failed", "err", err, "dir", appdbOut)
+			return ExitDiskFailed
+		}
+		pipeline = &pipelineState{
+			chain:          ch,
+			importOutDir:   appdbOut,
+			noExtensions:   *importNoExtensions,
+			cancelFetchCtx: cancel,
+			logger:         logger,
+			parallelOpts: pipelineImportTuning{
+				Workers:      *importWorkers,
+				ChunkMB:      *importChunkMB,
+				WaveParallel: *importWaveParallel,
+				FastIngest:   *importFastIngest,
+			},
+		}
+		scfg.OnDownloadReady = pipeline.onDownloadReady
+		scfg.OnChunkReady = pipeline.onChunkReady
+		fetchLog.Info("pipelined import enabled",
+			"appdb_out", appdbOut,
+			"workers", *importWorkers,
+			"chunk_mb", *importChunkMB,
+			"wave_parallel", *importWaveParallel,
+			"fast_ingest", *importFastIngest)
+	}
+
+	fetchErr := snapfetch.RunFetch(rootCtx, scfg, *out)
+
+	if pipeline != nil {
+		stats, err := pipeline.finalize(fetchErr)
+		if err != nil {
+			if fetchErr != nil {
+				fetchLog.Error("snapfetch failed", "err", fetchErr)
+			} else {
+				fetchLog.Error("import failed", "err", err)
+			}
+			return mapExitCode(err, interrupted.Load())
+		}
+		if stats != nil {
+			fetchLog.Info("pipeline complete",
+				"import_elapsed", stats.Elapsed,
+				"items", stats.Items,
+				"stores", len(stats.Stores))
+		}
+		fetchLog.Info("WARNING: snapshot contents are not authenticated by p2p — run `malcom verify` against a trusted RPC before using this snapshot in production")
+		return ExitSuccess
+	}
+
+	if fetchErr != nil {
+		fetchLog.Error("snapfetch failed", "err", fetchErr)
+		return mapExitCode(fetchErr, interrupted.Load())
 	}
 	fetchLog.Info("WARNING: snapshot contents are not authenticated by p2p — run `malcom verify` against a trusted RPC before using this snapshot in production")
 	return ExitSuccess

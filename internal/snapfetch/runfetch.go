@@ -57,6 +57,17 @@ func RunFetch(ctx context.Context, c Config, outRoot string) error {
 		}
 	}
 
+	// Hand the snapshot dir + total chunk count to a pipelined-import
+	// orchestrator if one is wired up. Fired here (post-prepareSnapshotDir,
+	// pre-download) so the orchestrator can stand up its tailing reader
+	// before download.resumeFromDisk starts firing OnChunkReady for any
+	// pre-existing chunks from a prior partial run.
+	if c.OnDownloadReady != nil {
+		if err := c.OnDownloadReady(snapDir, offer.Height, offer.Chunks); err != nil {
+			return fmt.Errorf("on-download-ready: %w", err)
+		}
+	}
+
 	fetchCtx, fetchCancel := context.WithTimeout(ctx, c.MaxFetchTime)
 	bytesTotal, err := s.download(fetchCtx, offer, good, chunkHashes, snapDir)
 	fetchCancel()

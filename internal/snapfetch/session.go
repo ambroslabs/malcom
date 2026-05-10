@@ -382,7 +382,7 @@ func (s *fetchSession) download(ctx context.Context, offer *snapshotOffer, good 
 		s.cfg.PerPeerLimit, s.cfg.ChunkTimeout, s.cfg.PeerFailLimit,
 		s.cfg.ProvisionalProbeStrikes, s.cfg.ProvisionalProbeInflight,
 		s.cfg.MaxDiskWriteFailures,
-		s.watch, s.mgr, s.srv)
+		s.watch, s.mgr, s.srv, s.cfg.OnChunkReady)
 }
 
 // verifySnapshotHash recomputes the wire-level snapshot hash from the
