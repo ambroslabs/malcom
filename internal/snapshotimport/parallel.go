@@ -91,6 +91,29 @@ type ParallelOptions struct {
 	// Off by default; enable per chain via the `-wave-parallel` CLI
 	// flag when the polestar runs solo.
 	WaveParallel bool
+
+	// DecompressedSource, when non-nil, is used in place of opening
+	// SnapshotDir's chunk_NNNNN.bin files + zlib-decoding them. It must
+	// yield the same byte stream that openChunkDir would (the
+	// SnapshotItem wire format). Closed by ImportParallel before
+	// returning.
+	//
+	// The pipelined-fetch orchestrator (`malcom snapshot fetch -import`)
+	// passes a TailingChunkSource here so stage 1 can begin streaming
+	// chunk 0 while later chunks are still in flight on the wire.
+	// SnapshotDir is still required (used for ext payloads in stage 3
+	// via the chunk ring, and by the .complete check unless
+	// AllowIncomplete is set).
+	DecompressedSource io.ReadCloser
+
+	// AllowIncomplete skips the snapshot-dir .complete-marker check.
+	// Set by the pipelined orchestrator: at the time ImportParallel
+	// starts, fetch is mid-flight and the marker hasn't been written
+	// yet. The marker is the user's "fetch finished cleanly" sentinel
+	// — for the in-process pipeline the orchestrator itself owns that
+	// invariant (it only finalizes after both sides return without
+	// error), so the on-disk marker is redundant.
+	AllowIncomplete bool
 }
 
 // ImportParallel is the parallel sibling of Import. Same output, same
@@ -106,11 +129,13 @@ func ImportParallel(opts ParallelOptions) (*Stats, error) {
 	if opts.Height == 0 {
 		return nil, fmt.Errorf("Options.Height is required")
 	}
-	if _, err := os.Stat(filepath.Join(opts.SnapshotDir, ".complete")); err != nil {
-		if os.IsNotExist(err) {
-			return nil, fmt.Errorf("snapshot dir %s is missing .complete marker", opts.SnapshotDir)
+	if !opts.AllowIncomplete {
+		if _, err := os.Stat(filepath.Join(opts.SnapshotDir, ".complete")); err != nil {
+			if os.IsNotExist(err) {
+				return nil, fmt.Errorf("snapshot dir %s is missing .complete marker", opts.SnapshotDir)
+			}
+			return nil, err
 		}
-		return nil, err
 	}
 	log := opts.Log
 	if log == nil {
@@ -235,8 +260,21 @@ func ImportParallel(opts ParallelOptions) (*Stats, error) {
 		err error
 	}
 	stage1Out := make(chan stage1Result, 1)
+
+	// Pick the decompressed-stream source. Default: open SnapshotDir's
+	// chunk files + zlib-decode in one shot. Pipelined-fetch caller
+	// supplies a TailingChunkSource that opens chunks as they land.
+	decompressed := opts.DecompressedSource
+	if decompressed == nil {
+		cr, err := openChunkDir(opts.SnapshotDir)
+		if err != nil {
+			_ = db.Close()
+			return nil, fmt.Errorf("open snapshot dir: %w", err)
+		}
+		decompressed = cr
+	}
 	go func() {
-		idx, err := stage1WriteRingAndIndex(opts.SnapshotDir, ring, storeCh, log)
+		idx, err := stage1WriteRingAndIndex(decompressed, ring, storeCh, log)
 		close(storeCh)
 		ring.Close(err)
 		stage1Out <- stage1Result{idx: idx, err: err}
@@ -336,10 +374,15 @@ func ImportParallel(opts ParallelOptions) (*Stats, error) {
 	return stats, nil
 }
 
-// stage1WriteRingAndIndex decompresses the snapshot once, writing
-// the decompressed bytes to the in-memory chunkRing while building
-// the per-store offset index AND emitting StoreEntry events to
-// storeCh.
+// stage1WriteRingAndIndex consumes the decompressed SnapshotItem
+// stream from `decompressed`, writing those bytes to the in-memory
+// chunkRing while building the per-store offset index AND emitting
+// StoreEntry events to storeCh.
+//
+// `decompressed` is closed before this function returns (success or
+// error). The caller passes either a chunkReader (snapshot-dir +
+// zlib) for the standard one-shot import or a TailingChunkSource for
+// the pipelined `fetch -import` mode where chunks are still in flight.
 //
 // Each StoreEntry is emitted as soon as the store OPENS (its
 // DecompressedStart is known), with an EndCh single-shot channel
@@ -353,18 +396,14 @@ func ImportParallel(opts ParallelOptions) (*Stats, error) {
 // Caller closes storeCh after this function returns and calls
 // ring.Close to signal EOF.
 func stage1WriteRingAndIndex(
-	snapshotDir string,
+	decompressed io.ReadCloser,
 	ring *chunkRing,
 	storeCh chan<- StoreEntry,
 	log *slog.Logger,
 ) (*SnapshotIndex, error) {
-	cr, err := openChunkDir(snapshotDir)
-	if err != nil {
-		return nil, fmt.Errorf("open snapshot dir: %w", err)
-	}
-	defer cr.Close()
+	defer decompressed.Close()
 
-	pf := newPrefetchReader(context.Background(), cr, 8, 1<<20)
+	pf := newPrefetchReader(context.Background(), decompressed, 8, 1<<20)
 	defer pf.Close()
 
 	teeR := io.TeeReader(pf, ring)

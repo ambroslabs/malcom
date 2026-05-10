@@ -29,7 +29,9 @@
 # at the repo root. Kept locally for investigation.
 /bootstrap-test/
 /e2e-test/
+/e2e-test-*/
 /prof-runs/
+/bench-results/
 
 # Backup dirs created by `malcom clean`.
 *.bak.*

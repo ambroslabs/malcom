@@ -135,6 +135,31 @@ type Config struct {
 	// "success" that fails at import with a confusing zlib error.
 	// Default 3.
 	MaxDiskWriteFailures int
+
+	// OnDownloadReady, when non-nil, is invoked after the snapshot
+	// directory is prepared (offer chosen, metadata.bin written) and
+	// before the chunk-download phase begins. The callback receives
+	// the absolute snapshot dir path, the chosen offer's height
+	// (which can differ from cfg.TargetHeight — that flag is a floor,
+	// not an exact match), and the final chunk count from the offer.
+	// Returning a non-nil error aborts the fetch before any chunks
+	// are pulled.
+	//
+	// Used by the pipelined `fetch -import` orchestrator to spin up
+	// the import goroutine + tailing reader at the right point in the
+	// fetch lifecycle (before resumeFromDisk, which fires
+	// OnChunkReady for any pre-existing chunks).
+	OnDownloadReady func(snapDir string, height uint64, totalChunks uint32) error
+
+	// OnChunkReady, when non-nil, is invoked after each chunk is
+	// successfully verified and durably written to disk (post-rename).
+	// It also fires once per chunk picked up via resumeFromDisk at
+	// download start — so a pipelined-import consumer sees every
+	// chunk regardless of whether it arrived on this run or was
+	// inherited from a prior partial fetch.
+	//
+	// Runs on the chunk scheduler's main goroutine; must not block.
+	OnChunkReady func(idx uint32)
 }
 
 // applyDefaults fills in zero-valued fields with defaults. Mutates cfg.
