@@ -467,7 +467,7 @@ func runImport(r io.Reader, db *pebble.DB, height int64, extDir, ingestTmpDir st
 		if err := ing.ingestStore(current.storeName); err != nil {
 			return fmt.Errorf("ingest fast SSTable for %q: %w", curName, err)
 		}
-		stores = append(stores, StoreInfo{Name: curName, Hash: hash})
+		stores = append(stores, StoreInfo{Name: curName, Hash: hash, LeafCount: current.leafCount})
 		stats.Items += current.itemCount
 		log.Info("store complete",
 			"store", curName,

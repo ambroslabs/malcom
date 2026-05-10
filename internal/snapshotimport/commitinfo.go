@@ -46,6 +46,12 @@ import (
 type StoreInfo struct {
 	Name string
 	Hash []byte
+
+	// LeafCount is the number of IAVL leaves the import wrote into
+	// this store. Populated by the import; used by VerifyFast to
+	// cross-check the f/ entry count. Not part of the on-wire
+	// CommitInfo (encodeStoreInfo only reads Name+Hash).
+	LeafCount uint64
 }
 
 // commitInfoBytes returns the protobuf-encoded CommitInfo for the given
