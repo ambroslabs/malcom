@@ -68,10 +68,10 @@ type ParallelOptions struct {
 
 	// ChunkMB caps the in-memory chunk ring (the streaming buffer
 	// between stage 1 decompression and stage 2 per-store readers).
-	// 0 = auto: 15% of total RAM, capped at 8 GiB, floored at
-	// 256 MiB. Lower values reduce peak RSS at the cost of more
-	// stage-1 backpressure on multi-store-concurrent chains. On bbn
-	// finality (single polestar) any reasonable cap suffices.
+	// 0 = use defaultChunkMB (512 MiB). Bigger values reduce stage-1
+	// backpressure on multi-store-concurrent chains (cosmoshub bank+
+	// ibc, osmosis cl/ibc/wasm) at the cost of more peak RSS. Single-
+	// polestar chains (bbn finality) don't benefit from larger rings.
 	ChunkMB int
 
 	// WaveParallel turns on within-store wave-parallel hashing per
@@ -129,13 +129,13 @@ func ImportParallel(opts ParallelOptions) (*Stats, error) {
 	const ringChunkSize = 4 << 20
 	chunkMB := opts.ChunkMB
 	if chunkMB <= 0 {
-		chunkMB = defaultChunkMB()
+		chunkMB = defaultChunkMB
 	}
 	ringMaxBytes := int64(chunkMB) << 20
 	if ringMaxBytes < int64(ringChunkSize) {
 		ringMaxBytes = int64(ringChunkSize)
 	}
-	log.Info("chunk ring sized", "chunk_mb", chunkMB, "auto", opts.ChunkMB <= 0)
+	log.Info("chunk ring sized", "chunk_mb", chunkMB, "default", opts.ChunkMB <= 0)
 	ring := newChunkRing(ringChunkSize, ringMaxBytes)
 
 	memMB := opts.MemtableMB

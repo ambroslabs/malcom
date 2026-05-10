@@ -23,33 +23,16 @@ import (
 	"fmt"
 	"io"
 	"sync"
-	"syscall"
 )
 
-// defaultChunkMB returns the default chunk-ring memory budget (in
-// MiB) when the user passes 0 (auto). Heuristic: 15% of total RAM,
-// capped at 8 GiB, floored at 256 MiB. On systems where the
-// syscall fails, falls back to 1024 MiB.
-func defaultChunkMB() int {
-	const (
-		fallback = 1024
-		floor    = 256
-		ceiling  = 8 * 1024
-	)
-	var info syscall.Sysinfo_t
-	if err := syscall.Sysinfo(&info); err != nil {
-		return fallback
-	}
-	totalBytes := uint64(info.Totalram) * uint64(info.Unit)
-	target := totalBytes * 15 / 100 / (1 << 20)
-	if target > ceiling {
-		target = ceiling
-	}
-	if target < floor {
-		target = floor
-	}
-	return int(target)
-}
+// defaultChunkMB is the chunk-ring memory budget (in MiB) when the
+// user doesn't pass -chunk-mb. 512 MiB picks predictable, modest
+// RSS over peak wall throughput: bbn-1's solo polestar runs equally
+// fast at 512 MiB or higher (one consumer easily keeps up); cosmoshub
+// and osmosis pay ~23% more wall vs an oversized ring because their
+// multi-polestar concurrent readers spread the slowest cursor across
+// a wider byte range. Operators on big boxes can opt up via the flag.
+const defaultChunkMB = 512
 
 // chunkEnt is one in-memory decompressed chunk, owned by the ring
 // until evicted. start is its offset in the decompressed stream;
