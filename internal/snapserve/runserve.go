@@ -229,6 +229,18 @@ func RunServe(ctx context.Context, c Config) error {
 		return fmt.Errorf("switch.Start: %w", err)
 	}
 
+	// Periodic persistence (#81): a crash/OOM/SIGKILL between clean
+	// shutdowns loses every PEX-learned addr. Goroutine ticks at
+	// c.PersistInterval, saves the addrbook + banlist. The clean-
+	// shutdown defer below still runs a final save; this is the
+	// crash-survivor.
+	persistCtx, persistCancel := context.WithCancel(ctx)
+	defer persistCancel()
+	go runPersistLoop(persistCtx, c.PersistInterval,
+		book.Save,
+		bans.Save,
+		log.With("module", "persist"))
+
 	// In dir-watch mode, start the rescan goroutine now that the
 	// reactor is running. OnStore is wired here (not at Catalog
 	// construction) so we can capture ssR after sw.Start without
@@ -252,6 +264,32 @@ func RunServe(ctx context.Context, c Config) error {
 		}
 	}
 	defer func() {
+		// Graceful drain (#82): tell the reactor to fast-fail every
+		// new ChunkRequest with Missing=true, then give in-flight
+		// ChunkResponse sends c.ShutdownDrain to flush through their
+		// MConnection send queues. Without this, sw.Stop closing
+		// sockets mid-send leaves peers waiting on their per-chunk
+		// timeout — they'd refetch eventually, but slowly, and the
+		// partial bytes they received are wasted.
+		//
+		// We don't have a hook for "MConnection drained"; the budget
+		// is just a fixed window. cometbft's send rate cap is 10 MiB/s
+		// per peer, so 30s drains ~300 MiB per peer — comfortably
+		// above one chunk (10 MiB).
+		// Always put the reactor into drain mode — fast-failing new
+		// inbound ChunkRequest with Missing=true is cheap (one
+		// atomic.Store + no provider lookup) and helpful for peer
+		// UX regardless of how long we wait before closing sockets.
+		// The Sleep below is the only thing the operator can opt
+		// out of with -shutdown-drain 0.
+		ssR.BeginShutdown()
+		if c.ShutdownDrain > 0 {
+			log.Info("draining in-flight chunks", "budget", c.ShutdownDrain)
+			time.Sleep(c.ShutdownDrain)
+			log.Info("drain window elapsed",
+				"chunks_drained", ssR.Drained())
+		}
+
 		// Mirror snapfetch's shutdown ordering: addrbook + banlist
 		// saves first (so a slow sw.Stop can't lose them), then
 		// switch stop bounded by 1s, then manager.
@@ -303,6 +341,7 @@ func RunServe(ctx context.Context, c Config) error {
 				"snapshots_served", snapshots,
 				"chunks_served", chunks,
 				"chunks_missing", missing,
+				"chunks_drained", ssR.Drained(),
 				"bytes_recv", recv,
 				"bytes_sent", sent)
 		}

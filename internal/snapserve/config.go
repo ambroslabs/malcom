@@ -82,7 +82,36 @@ type Config struct {
 	WarmRefreshInterval time.Duration
 	PeerRedialBackoff   time.Duration
 	MaxRedialBackoff    time.Duration
-	MaxRedials          int
+
+	// MaxRedials caps consecutive disconnect/redial cycles for a
+	// pinned peer before connect.Manager auto-bans it for the run.
+	// 0 = unlimited.
+	//
+	// Serve defaults to 0 (unlimited) — unlike fetch, where 4 is
+	// reasonable for a 10-minute run, serve is a long-lived daemon
+	// where a legitimate peer with intermittent connectivity would
+	// hit any non-zero cap and stay banned until the next restart.
+	// See #80.
+	MaxRedials int
+
+	// PersistInterval controls how often RunServe persists the
+	// addrbook and banlist to disk via a background goroutine.
+	// Without this, a crash/OOM/SIGKILL loses every PEX-learned peer
+	// since the last clean shutdown — fine for fetch (minutes-long
+	// runs) but unacceptable for serve, where each cold restart
+	// would rediscover the network from bootstrap_peers. Default 5m
+	// (set in applyDefaults).
+	PersistInterval time.Duration
+
+	// ShutdownDrain is how long RunServe waits for in-flight
+	// ChunkResponse sends to flush after ctx is cancelled. During
+	// the drain window the reactor fast-fails new ChunkRequest
+	// arrivals with Missing=true so they can refetch elsewhere
+	// rather than waiting for our per-chunk timeout. After the
+	// drain, sw.Stop runs with its existing 1s cap.
+	//
+	// Default 30s (set in applyDefaults). See #82.
+	ShutdownDrain time.Duration
 }
 
 func (c *Config) applyDefaults() {
@@ -107,9 +136,15 @@ func (c *Config) applyDefaults() {
 	if c.MaxRedialBackoff == 0 {
 		c.MaxRedialBackoff = 5 * time.Minute
 	}
-	if c.MaxRedials == 0 {
-		c.MaxRedials = 5
-	}
+	// MaxRedials intentionally has no default — 0 means unlimited at
+	// the connect.Manager level, which is what serve wants. See #80.
+	//
+	// PersistInterval and ShutdownDrain are deliberately *not*
+	// defaulted here: 0 means "off" for both (no periodic persist,
+	// no drain wait). The CLI supplies sensible non-zero defaults
+	// at the flag layer, so library callers passing 0 get 0 — which
+	// is what the -shutdown-drain 0 help text promises and what
+	// dev workflows asking for fast restart actually want.
 	if c.MaxOutboundPeers == 0 {
 		// Lower than fetch (64). A serve node doesn't need a wide
 		// outbound mesh — its job is to be reachable, and PEX

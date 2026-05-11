@@ -45,6 +45,7 @@ import (
 	"strings"
 	"sync/atomic"
 	"syscall"
+	"time"
 
 	"github.com/zrbecker/cosmos-p2p/internal/config"
 	malcomlog "github.com/zrbecker/cosmos-p2p/internal/log"
@@ -83,6 +84,9 @@ func Run(args []string) int {
 	snapshotsRoot := fs.String("snapshots", "", "parent directory to scan for snapshot subdirs (dir-watch mode; rescans on -rescan-interval and on SIGHUP). Mutually exclusive with -snapshot.")
 	rescanInterval := fs.Duration("rescan-interval", 0, "(with -snapshots) how often to rescan the root dir for new/removed snapshots. Default 30s; 0 disables periodic rescan (SIGHUP-only refresh).")
 
+	peerRedials := fs.Int("peer-redials", 0, "cap on consecutive disconnect/redial cycles before connect.Manager auto-bans a pinned peer for the run. 0 = unlimited (the serve default — a long-running daemon shouldn't permanently bench legitimate peers with intermittent connectivity). Pass a positive value to opt into the fetch-style cap.")
+	shutdownDrain := fs.Duration("shutdown-drain", 30*time.Second, "on SIGINT/SIGTERM, how long to fast-fail inbound ChunkRequest with Missing=true while in-flight ChunkResponse sends flush. 0 disables the drain (legacy behaviour: peers mid-transfer get torn off when the socket closes).")
+	persistInterval := fs.Duration("persist-interval", 5*time.Minute, "how often the addrbook + banlist are persisted to disk by a background goroutine. Without this, a crash/OOM/SIGKILL loses every PEX-learned peer since the last clean shutdown.")
 	verifyMode := fs.String("verify", "aggregate", "verify on startup: 'metadata' (cheap, no chunk reads), 'aggregate' (one read pass, checks SHA256 of concatenated chunks), or 'per-chunk' (one read pass, checks per-chunk hashes). Default 'aggregate'. In dir-watch mode, applied to every rescan.")
 	debug := fs.Bool("debug", false, "verbose snapserve logging")
 	logMode := fs.String("log", "", "log output: auto (default), pretty, text, json")
@@ -213,7 +217,14 @@ func Run(args []string) int {
 		AddrBookBanDuration: ch.Fetch.AddrBookBanDuration.Duration(),
 		MaxDialFailures:     ch.Fetch.MaxDialFailures,
 		PeerRedialBackoff:   ch.Fetch.RedialBackoff.Duration(),
-		MaxRedials:          ch.Fetch.PeerRedials,
+		// MaxRedials is deliberately *not* read from ch.Fetch.PeerRedials
+		// — serve defaults to 0 (unlimited) so we don't permanently
+		// bench legitimate peers with intermittent connectivity over
+		// weeks of uptime. -peer-redials lets operators opt back into
+		// the fetch-style cap if they want it.
+		MaxRedials:      *peerRedials,
+		PersistInterval: *persistInterval,
+		ShutdownDrain:   *shutdownDrain,
 	}
 
 	serveLog.Info("config", "path", cfg.Path())
