@@ -59,3 +59,12 @@ malcom bootstrap       -chain cosmoshub-4 \
 malcom verify          -chain cosmoshub-4 \
     -appdb /data/appdb/appdb_cosmoshub-4_<H> -height <H>
 ```
+
+## Running `snapshot serve` under systemd
+
+A template unit file is provided at
+[`dist/systemd/malcom-snapshot-serve@.service`](dist/systemd/) for
+operators who want serve running as a long-lived daemon. One unit, one
+instance per chain (`malcom-snapshot-serve@cosmoshub-4`). See
+[`dist/systemd/README.md`](dist/systemd/README.md) for install and
+operation notes.
