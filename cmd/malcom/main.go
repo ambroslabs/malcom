@@ -51,6 +51,8 @@ func main() {
 		os.Exit(snapshotDispatch(rest))
 	case "bootstrap":
 		os.Exit(bootstrap.Run(rest))
+	case "heal":
+		os.Exit(bootstrap.RunHeal(rest))
 	case "verify":
 		os.Exit(verify.Run(rest))
 	case "compact":
@@ -102,6 +104,7 @@ commands:
   snapshot fetch     download a state-sync snapshot
   snapshot import    convert a snapshot dir into application.db + extensions/
   bootstrap          assemble a runnable gaiad home directory
+  heal               recover a chain home bricked by a failed first start (re-runs bootstrap-state)
   verify             check the imported AppHash against a cometbft RPC
   compact            full-keyspace pebble compaction (reclaim slack post-import)
 
