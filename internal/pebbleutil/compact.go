@@ -34,9 +34,14 @@ import (
 // cacheMB sizes the pebble block cache used during the compact —
 // large is much better here because compaction iterators read the
 // per-SSTable bloom filters and index blocks repeatedly. Default
-// (cacheMB == 0) is 8 GiB. MaxOpenFiles is set to 200_000 so a
-// post-bulk-load LSM with tens of thousands of L0 SSTables doesn't
-// thrash the FD cache; the kernel ulimit is the real backstop.
+// (cacheMB == 0) is 256 MiB; was 8 GiB until #100 showed it
+// OOM-killing 8 GiB hosts. The malcom compact CLI no longer reaches
+// this fallback (it resolves cacheMB via /proc/meminfo + cgroup
+// limit + config) — the small default exists only for direct API
+// callers that pass cacheMB=0 and don't want to think about it.
+// MaxOpenFiles is set to 200_000 so a post-bulk-load LSM with tens
+// of thousands of L0 SSTables doesn't thrash the FD cache; the
+// kernel ulimit is the real backstop.
 //
 // targetFileSizeMB sets pebble's per-level TargetFileSize. 0 leaves
 // pebble defaults (compact wall time wins at the cost of many small
@@ -51,7 +56,7 @@ func CleanupCompact(dir string, maxConcurrent, cacheMB, targetFileSizeMB int, lo
 		maxConcurrent = 8
 	}
 	if cacheMB <= 0 {
-		cacheMB = 8 * 1024
+		cacheMB = 256
 	}
 	cache := pebble.NewCache(int64(cacheMB) << 20)
 	defer cache.Unref()

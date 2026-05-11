@@ -57,45 +57,47 @@ func Run(args []string) int {
 	//      MemAvailable, clamped to [64, 1024] MiB — see #100).
 	maxCompact := *workers
 	targetFS := *targetFileSizeMB
-	cacheMBValue := *cacheMB
-	if maxCompact <= 0 || targetFS < 0 || cacheMBValue <= 0 {
+	var cfgCompact config.CompactTuning
+	if maxCompact <= 0 || targetFS < 0 || *cacheMB <= 0 {
 		if cfg, err := config.Load(); err == nil {
 			// applyCompactDefaults runs in Resolve, but the global
 			// config.Load doesn't apply per-chain defaults — apply
 			// our compact-section default here to honor NumCPU.
-			ct := cfg.Compact
-			config.ApplyCompactDefaults(&ct)
+			cfgCompact = cfg.Compact
+			config.ApplyCompactDefaults(&cfgCompact)
 			if maxCompact <= 0 {
-				maxCompact = ct.MaxConcurrentCompactions
+				maxCompact = cfgCompact.MaxConcurrentCompactions
 			}
 			if targetFS < 0 {
-				targetFS = ct.TargetFileSizeMB
-			}
-			if cacheMBValue <= 0 && ct.CacheMB > 0 {
-				cacheMBValue = ct.CacheMB
+				targetFS = cfgCompact.TargetFileSizeMB
 			}
 		}
 	}
 	if targetFS < 0 {
 		targetFS = 0
 	}
-	if cacheMBValue <= 0 {
-		// Memory-proportional heuristic. On a missing /proc/meminfo
-		// (sandbox / non-Linux), fall back to a conservative 256 MiB
-		// — much smaller than the old 8192 default that OOM-killed
-		// 8 GiB hosts. Operators on truly constrained boxes should
-		// set [compact].cache_mb explicitly anyway.
-		if memMB, err := readMemAvailableMB(); err == nil {
-			cacheMBValue = defaultCompactCacheMB(memMB)
-			log.Info("cache-mb heuristic",
-				"mem_available_mb", memMB,
-				"cache_mb", cacheMBValue,
-				"hint", "set [compact].cache_mb to pin")
-		} else {
-			cacheMBValue = 256
-			log.Warn("could not read /proc/meminfo; using conservative cache-mb fallback",
-				"cache_mb", cacheMBValue, "err", err)
+
+	// cache-mb resolution. Both /proc/meminfo and the cgroup limit
+	// feed the heuristic — using the smaller keeps containers and
+	// systemd MemoryMax= units from picking a host-sized cache that
+	// would OOM their own cgroup. resolveCacheMB is pure (testable);
+	// the I/O happens here.
+	memMB, memErr := readMemAvailableMB()
+	if memErr == nil {
+		if cgroupMB, cgErr := readCgroupMemMaxMB(); cgErr == nil {
+			memMB = effectiveAvailableMB(memMB, cgroupMB)
 		}
+		// cgroup parse errors are non-fatal: fall through with the
+		// uncorrected /proc/meminfo value. The heuristic's clamp
+		// still bounds the damage.
+	}
+	resolved := resolveCacheMB(*cacheMB, cfgCompact.CacheMB, memMB, memErr)
+	cacheMBValue := resolved.Value
+	logKVs := append([]any{"cache_mb", cacheMBValue, "source", resolved.Source}, resolved.LogKVs...)
+	if resolved.Source == "fallback" {
+		log.Warn("cache-mb fallback (could not read /proc/meminfo)", logKVs...)
+	} else if resolved.Source == "heuristic" {
+		log.Info("cache-mb heuristic", append(logKVs, "hint", "set [compact].cache_mb to pin")...)
 	}
 
 	t0 := time.Now()
