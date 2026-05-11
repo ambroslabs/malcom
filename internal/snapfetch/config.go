@@ -11,13 +11,13 @@ import (
 // Config holds all knobs for RunFetch. Field defaults are documented in
 // the comments — pass zero values to opt into the defaults via Defaults().
 type Config struct {
-	ChainID           string
-	NodeKeyPath       string
-	Listen            string // default "tcp://0.0.0.0:0"
-	Moniker           string // default "cosmos-p2p-snapfetch"
-	AddrBook          string // path to cometbft PEX-managed addrbook (required)
-	Banlist           string // path to cross-run banlist (required)
-	Served            string // path to cross-run served-peers list (required)
+	ChainID        string
+	NodeKeyPath    string
+	Listen         string // default "tcp://0.0.0.0:0"
+	Moniker        string // default "cosmos-p2p-snapfetch"
+	AddrBook       string // path to cometbft PEX-managed addrbook (required)
+	Banlist        string // path to cross-run banlist (required)
+	Served         string // path to cross-run served-peers list (required)
 	BootstrapPeers []string
 
 	DiscoverFor       time.Duration // default 25s
@@ -27,7 +27,6 @@ type Config struct {
 	MinGoodPeers      int           // default 1
 	PerPeerLimit      int           // default 2
 	ChunkTimeout      time.Duration // default 45s
-	MaxFetchTime      time.Duration // default 60m
 	PeerFailLimit     int           // default 3 (hash-mismatch / missing-chunk strikes before ban)
 	MaxRedials        int           // default 5 (consecutive disconnect/redial cycles before benching).
 	PeerRedialBackoff time.Duration // default 5s — base backoff between redial attempts; doubles on each retry up to MaxRedialBackoff
@@ -190,9 +189,6 @@ func (c *Config) applyDefaults() {
 	}
 	if c.ChunkTimeout == 0 {
 		c.ChunkTimeout = 45 * time.Second
-	}
-	if c.MaxFetchTime == 0 {
-		c.MaxFetchTime = 60 * time.Minute
 	}
 	if c.PeerFailLimit == 0 {
 		c.PeerFailLimit = 3

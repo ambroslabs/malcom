@@ -19,10 +19,14 @@ import (
 // <outRoot>/snapshot_<chain>_<height>/ (chunks + metadata.bin +
 // meta.json + .complete marker).
 //
-// MaxFetchTime bounds only the chunk-download phase. The walk phase
-// (height discovery + chunk-0 verify) inherits its deadline from the
-// parent ctx; a stuck walk requires Ctrl-C or a parent-ctx timeout
-// to terminate.
+// Both walk and download inherit their deadline from the parent ctx —
+// snapfetch itself imposes no wall-time ceiling. A stuck run requires
+// Ctrl-C, SIGTERM, or a caller-supplied context.WithTimeout to
+// terminate. Stuck-state detection lives downstream: per-chunk
+// timeouts re-ask different peers, hash-mismatch strikes ban
+// misbehavers, and the disk-write cap surfaces wedged filesystems.
+// "Slow" and "stuck" are different problems; this function only
+// catches the latter.
 //
 // On error any partial output under outRoot is left in place — no
 // .complete marker is written. The importer refuses to run on a dir
@@ -68,9 +72,7 @@ func RunFetch(ctx context.Context, c Config, outRoot string) error {
 		}
 	}
 
-	fetchCtx, fetchCancel := context.WithTimeout(ctx, c.MaxFetchTime)
-	bytesTotal, err := s.download(fetchCtx, offer, good, chunkHashes, snapDir)
-	fetchCancel()
+	bytesTotal, err := s.download(ctx, offer, good, chunkHashes, snapDir)
 	if err != nil {
 		// download() can surface ErrDiskFailed when chunk-write
 		// failures hit the cap. Don't shadow that with
@@ -78,12 +80,6 @@ func RunFetch(ctx context.Context, c Config, outRoot string) error {
 		// classification and maps to ExitDiskFailed.
 		if errors.Is(err, ErrDiskFailed) {
 			return err
-		}
-		// Distinguish our timeout from a parent cancel (Ctrl-C). Only
-		// the former wants the config-knob hint.
-		if fetchCtx.Err() == context.DeadlineExceeded && ctx.Err() == nil {
-			return fmt.Errorf("%w: exceeded max_fetch=%s — raise [chains.%s.fetch] max_fetch in config.toml: %w",
-				ErrDownloadFailed, c.MaxFetchTime, c.ChainID, err)
 		}
 		return fmt.Errorf("%w: %w", ErrDownloadFailed, err)
 	}

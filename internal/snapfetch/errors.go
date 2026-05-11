@@ -21,7 +21,7 @@ var (
 	ErrWalkFailed = errors.New("walk failed: no servable snapshot")
 
 	// ErrDownloadFailed — chunk-fetch phase failed mid-stream: every
-	// peer banned before completion, max_fetch deadline exceeded, etc.
+	// peer was banned before completion, parent ctx was cancelled, etc.
 	ErrDownloadFailed = errors.New("download failed")
 
 	// ErrDiskFailed — a filesystem operation against the snapshot
