@@ -100,6 +100,50 @@ func TestIsJumpCandidateSkipsFailedHeights(t *testing.T) {
 	}
 }
 
+// effectiveHeightWindow encodes the contract for the -target-height
+// flag (issue #75): when TargetHeight is pinned, the walk window
+// collapses to exactly {TargetHeight}, not [TargetHeight, MaxHeight].
+// Without this, walk's range-match clauses silently accept offers at
+// any height ≥ TargetHeight.
+func TestEffectiveHeightWindow_TargetHeightClampsBoth(t *testing.T) {
+	gotMin, gotMax := effectiveHeightWindow(Config{
+		TargetHeight: 5000,
+		// Caller-supplied MinHeight/MaxHeight are deliberately
+		// ignored when TargetHeight is set.
+		MinHeight: 0,
+		MaxHeight: 0,
+	})
+	if gotMin != 5000 || gotMax != 5000 {
+		t.Fatalf("TargetHeight=5000 → window (%d, %d), want (5000, 5000)", gotMin, gotMax)
+	}
+}
+
+func TestEffectiveHeightWindow_TargetHeightWinsOverExplicitMaxHeight(t *testing.T) {
+	// An explicit MaxHeight greater than TargetHeight must NOT widen
+	// the window — the operator pinned TargetHeight.
+	gotMin, gotMax := effectiveHeightWindow(Config{
+		TargetHeight: 5000,
+		MinHeight:    1,
+		MaxHeight:    9000,
+	})
+	if gotMin != 5000 || gotMax != 5000 {
+		t.Fatalf("TargetHeight pinning must beat explicit MaxHeight; got (%d, %d)", gotMin, gotMax)
+	}
+}
+
+func TestEffectiveHeightWindow_RangeModePassesThrough(t *testing.T) {
+	// Without TargetHeight, the caller's (MinHeight, MaxHeight) is
+	// returned verbatim — that's the existing range-walk semantics
+	// for chains that don't pin a height.
+	gotMin, gotMax := effectiveHeightWindow(Config{
+		MinHeight: 7000,
+		MaxHeight: 9000,
+	})
+	if gotMin != 7000 || gotMax != 9000 {
+		t.Fatalf("range mode pass-through: got (%d, %d), want (7000, 9000)", gotMin, gotMax)
+	}
+}
+
 // An adversarial peer that always offers a slightly higher height
 // than the current target must not be able to keep the walker jumping
 // forever. The walker gates jumps on a per-walk cap; this test drives
