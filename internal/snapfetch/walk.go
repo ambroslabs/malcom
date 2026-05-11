@@ -65,6 +65,19 @@ func walkBackward(
 		}
 	}
 
+	// Exact-match contract for TargetHeight (issue #75). The
+	// match clauses inside the per-height loop use the
+	// [target, cfg.MaxHeight] window — range-based so that chains
+	// whose snapshot heights aren't multiples of SnapshotInterval
+	// still match at the natural walk step. When the operator pins
+	// TargetHeight, we want that range to collapse to exactly
+	// {TargetHeight}, which means clamping MinHeight and MaxHeight
+	// to TargetHeight here. Without this, the offer-match clause
+	// accepts any offer ≥ TargetHeight (and unbounded above when
+	// the CLI leaves MaxHeight=0 because TargetHeight was set),
+	// silently fetching a height the operator didn't ask for.
+	cfg.MinHeight, cfg.MaxHeight = effectiveHeightWindow(cfg)
+
 	// Target list.
 	var targets []uint64
 	switch {
@@ -391,6 +404,18 @@ func walkBackward(
 
 	return nil, nil, nil, fmt.Errorf("%w: window [%d, %d] — %s",
 		ErrWalkFailed, cfg.MinHeight, cfg.MaxHeight, hintNoServable(cfg.ChainID))
+}
+
+// effectiveHeightWindow returns the (min, max) window walkBackward
+// should treat offers within: exactly {TargetHeight, TargetHeight}
+// when TargetHeight is pinned, otherwise the caller-supplied
+// {MinHeight, MaxHeight}. Centralised so the policy is testable on
+// its own and applied once at the top of walkBackward.
+func effectiveHeightWindow(cfg Config) (min, max uint64) {
+	if cfg.TargetHeight != 0 {
+		return cfg.TargetHeight, cfg.TargetHeight
+	}
+	return cfg.MinHeight, cfg.MaxHeight
 }
 
 // isJumpCandidate reports whether a fresher offer at newHeight is
