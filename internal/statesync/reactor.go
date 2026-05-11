@@ -105,7 +105,12 @@ type Reactor struct {
 	Out       chan Event // Connected, Removed, Snapshot
 	OutChunks chan Event // Chunk
 
-	provider SnapshotProvider
+	// provider is swappable at runtime via SetProvider — see the
+	// snapserve Catalog, which rescans its root dir periodically and
+	// installs a fresh Store on each successful scan. We hold the
+	// interface in a one-field wrapper so atomic.Pointer can give us
+	// lock-free reads on the hot Receive path.
+	provider atomic.Pointer[providerSlot]
 	probe    bool
 
 	bytesRecv  atomic.Int64
@@ -117,6 +122,13 @@ type Reactor struct {
 	chunksServed    atomic.Int64
 	chunksMissing   atomic.Int64
 }
+
+// providerSlot wraps SnapshotProvider so we can store it in an
+// atomic.Pointer. atomic.Pointer needs a concrete type, and we want
+// the interface flexibility, so the indirection costs one allocation
+// per swap (cheap — swaps happen on the rescan cadence, not per
+// request).
+type providerSlot struct{ p SnapshotProvider }
 
 const outChunksCapacity = 8
 
@@ -137,9 +149,28 @@ func NewReactor(logger log.Logger) *Reactor {
 }
 
 // SetProvider installs a SnapshotProvider so the reactor responds to
-// inbound SnapshotsRequest / ChunkRequest from peers. Must be called
-// before sw.Start(). Pass nil to clear (probe-only).
-func (r *Reactor) SetProvider(p SnapshotProvider) { r.provider = p }
+// inbound SnapshotsRequest / ChunkRequest from peers. Safe to call any
+// time — including while the reactor is running and serving requests
+// — so a Catalog rescan can swap the active store without dropping
+// peers. Pass nil to clear (probe-only).
+func (r *Reactor) SetProvider(p SnapshotProvider) {
+	if p == nil {
+		r.provider.Store(nil)
+		return
+	}
+	r.provider.Store(&providerSlot{p: p})
+}
+
+// loadProvider returns the current SnapshotProvider (or nil). One
+// atomic load on the Receive hot path; the interface wrapper costs
+// nothing once the slot is in cache.
+func (r *Reactor) loadProvider() SnapshotProvider {
+	slot := r.provider.Load()
+	if slot == nil {
+		return nil
+	}
+	return slot.p
+}
 
 // SetProbe controls whether AddPeer fires a SnapshotsRequest. Probe is
 // true by default (fetch mode); serve mode passes false so we don't
@@ -263,13 +294,14 @@ func (r *Reactor) Receive(env p2p.Envelope) {
 		}
 
 	case *ssproto.SnapshotsRequest:
-		if r.provider == nil {
+		prov := r.loadProvider()
+		if prov == nil {
 			// Probe-only build: cometbft does the same when its
 			// ListSnapshots ABCI call returns empty — silence rather than
 			// an empty response.
 			return
 		}
-		snaps := r.provider.ListSnapshots()
+		snaps := prov.ListSnapshots()
 		for i := range snaps {
 			s := &snaps[i]
 			resp := &ssproto.SnapshotsResponse{
@@ -292,10 +324,11 @@ func (r *Reactor) Receive(env p2p.Envelope) {
 		}
 
 	case *ssproto.ChunkRequest:
-		if r.provider == nil {
+		prov := r.loadProvider()
+		if prov == nil {
 			return
 		}
-		data, found, err := r.provider.LoadChunk(m.Height, m.Format, m.Index)
+		data, found, err := prov.LoadChunk(m.Height, m.Format, m.Index)
 		if err != nil {
 			// Treat read errors as Missing on the wire so requesters
 			// move on instead of waiting for their per-chunk timeout.

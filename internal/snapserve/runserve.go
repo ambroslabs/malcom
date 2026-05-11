@@ -27,27 +27,94 @@ import (
 // accept inbound connections but won't participate in PEX.
 var ErrNoPeers = errors.New("no peers configured")
 
+// ErrSnapshotSourceMissing means neither SnapshotDirs nor SnapshotsRoot
+// is set; we have nothing to serve.
+var ErrSnapshotSourceMissing = errors.New("set either SnapshotDirs (static list) or SnapshotsRoot (dir-watch); not neither")
+
+// ErrSnapshotSourceConflict means the caller set both SnapshotDirs and
+// SnapshotsRoot. The two modes have distinct semantics (strict-load vs
+// scan-and-skip, no-rescan vs periodic-rescan) — picking one keeps
+// behavior unambiguous.
+var ErrSnapshotSourceConflict = errors.New("SnapshotDirs and SnapshotsRoot are mutually exclusive; set exactly one")
+
+func validateConfig(c *Config) error {
+	hasList := len(c.SnapshotDirs) > 0
+	hasRoot := c.SnapshotsRoot != ""
+	if hasList && hasRoot {
+		return ErrSnapshotSourceConflict
+	}
+	if !hasList && !hasRoot {
+		return ErrSnapshotSourceMissing
+	}
+	return nil
+}
+
 // RunServe is the library entry point. Loads + verifies the snapshot
-// store, builds the same p2p/PEX stack snapfetch uses, plugs the store
-// into the statesync reactor in serve mode, and blocks until ctx is
-// cancelled (typically by a SIGINT/SIGTERM in the CLI wrapper).
+// catalogue, builds the same p2p/PEX stack snapfetch uses, plugs the
+// catalogue into the statesync reactor in serve mode, and blocks until
+// ctx is cancelled (typically by a SIGINT/SIGTERM in the CLI wrapper).
+//
+// One of SnapshotDirs (static list) or SnapshotsRoot (auto-discovery
+// + periodic rescan) must be set, not both. In SnapshotsRoot mode the
+// reactor's catalogue is swapped lock-free on every successful rescan,
+// without disconnecting peers — call ReloadSnapshots to trigger an
+// immediate rescan from outside (the CLI hooks this to SIGHUP).
 //
 // On clean shutdown, the addrbook and banlist are persisted before
-// returning. The store itself is read-only; nothing on disk under
-// SnapshotDirs is mutated by serving.
+// returning. Nothing on disk under SnapshotDirs / SnapshotsRoot is
+// mutated by serving.
 func RunServe(ctx context.Context, c Config) error {
 	c.applyDefaults()
 	ctx = logctx.WithFields(ctx, "module", "serve")
 	log := logctx.From(ctx)
 
-	store, err := LoadStore(c.SnapshotDirs, c.VerifyMode, log)
-	if err != nil {
-		return fmt.Errorf("load store: %w", err)
+	if err := validateConfig(&c); err != nil {
+		return err
 	}
-	log.Info("snapshot store ready",
-		"snapshots", store.Len(),
-		"summary", store.Describe(),
-		"verify", c.VerifyMode)
+
+	var (
+		initialStore *Store
+		catalog      *Catalog
+	)
+	switch {
+	case c.SnapshotsRoot != "":
+		// Build the catalog but don't start its rescan goroutine
+		// until after sw.Start, so the initial reactor handoff and
+		// the background rescan don't race during setup.
+		catalog = NewCatalog(CatalogConfig{
+			RootDir:        c.SnapshotsRoot,
+			ChainID:        c.ChainID,
+			VerifyMode:     c.VerifyMode,
+			RescanInterval: c.RescanInterval,
+			Logger:         log,
+		})
+		if err := catalog.Rescan(ctx); err != nil {
+			return fmt.Errorf("initial scan of %s: %w", c.SnapshotsRoot, err)
+		}
+		initialStore = catalog.Current()
+		log.Info("snapshot catalog ready",
+			"mode", "dir-watch",
+			"root", c.SnapshotsRoot,
+			"rescan", c.RescanInterval,
+			"snapshots", initialStore.Len(),
+			"summary", initialStore.Describe(),
+			"verify", c.VerifyMode)
+		if initialStore.Len() == 0 {
+			log.Warn("catalog is empty at startup — server is running but advertising nothing until snapshots are dropped under root",
+				"root", c.SnapshotsRoot)
+		}
+	default:
+		s, err := LoadStore(c.SnapshotDirs, c.ChainID, c.VerifyMode, log)
+		if err != nil {
+			return fmt.Errorf("load store: %w", err)
+		}
+		initialStore = s
+		log.Info("snapshot catalog ready",
+			"mode", "static",
+			"snapshots", initialStore.Len(),
+			"summary", initialStore.Describe(),
+			"verify", c.VerifyMode)
+	}
 
 	nodeKey, err := nodekey.LoadOrGen(c.NodeKeyPath)
 	if err != nil {
@@ -92,7 +159,7 @@ func RunServe(ctx context.Context, c Config) error {
 	}
 
 	ssR := statesync.NewReactor(malcomlog.CmtShim(log.With("module", "statesync")))
-	ssR.SetProvider(store)
+	ssR.SetProvider(initialStore)
 	ssR.SetProbe(false) // serve mode: don't pester peers for their snapshots
 
 	book, err := addrbook.NewAddrBook(c.AddrBook, malcomlog.CmtShim(log.With("module", "addrbook")))
@@ -153,6 +220,28 @@ func RunServe(ctx context.Context, c Config) error {
 	if err := sw.Start(); err != nil {
 		return fmt.Errorf("switch.Start: %w", err)
 	}
+
+	// In dir-watch mode, start the rescan goroutine now that the
+	// reactor is running. OnStore is wired here (not at Catalog
+	// construction) so we can capture ssR after sw.Start without
+	// hoisting Catalog handling above the p2p setup.
+	if catalog != nil {
+		catalog.cfg.OnStore = func(s *Store) {
+			ssR.SetProvider(s)
+			log.Info("reactor catalogue swapped",
+				"snapshots", s.Len(), "summary", s.Describe())
+		}
+		// We've already done an initial Rescan synchronously above
+		// (so the reactor's initialStore is non-nil before sw.Start);
+		// the loop goroutine just runs the periodic + trigger cycle.
+		// Catalog.Start would re-run the initial Rescan, which is
+		// redundant — go straight to the loop.
+		go catalog.loop(ctx)
+		defer catalog.Stop()
+		if c.OnReloader != nil {
+			c.OnReloader(catalog.Trigger)
+		}
+	}
 	defer func() {
 		// Mirror snapfetch's shutdown ordering: addrbook + banlist
 		// saves first (so a slow sw.Stop can't lose them), then
@@ -176,7 +265,7 @@ func RunServe(ctx context.Context, c Config) error {
 	log.Info("serving",
 		"listen", listenAddr.DialString(),
 		"node_id", string(nodeKey.ID()),
-		"snapshots", store.Len())
+		"snapshots", initialStore.Len())
 
 	// Periodic served-counter logs so the operator has something to
 	// look at without enabling debug. Cheap (atomic loads). Cadence

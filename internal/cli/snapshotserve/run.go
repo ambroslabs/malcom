@@ -7,18 +7,29 @@
 // SnapshotsRequest, and serves chunk_NNNNN.bin bytes in response to
 // ChunkRequest. No consensus, no block sync, no application.db.
 //
-// Typical use cases:
+// Two source modes:
+//
+//   - Static (\`-snapshot <dir>\` repeatable): explicit list, loaded
+//     once at startup, no rescan. Best for one-shot benchmarks where
+//     you know exactly what to serve.
+//
+//   - Dir-watch (\`-snapshots <root>\`): scan a parent directory once
+//     at startup and periodically (or on SIGHUP) thereafter. Wrong-
+//     chain entries and incomplete fetches are skipped. Operator
+//     workflow: drop a finished snapshot into the root, send SIGHUP
+//     (or wait for the next rescan), and it goes live.
+//
+// Examples:
 //
 //	# benchmark fetch against a local server
 //	malcom snapshot serve -chain cosmoshub-4 \
 //	    -snapshot /data/snapshots/snapshot_cosmoshub-4_<H>
 //
-//	# advertise multiple heights
+//	# advertise everything under /data/snapshots for this chain
 //	malcom snapshot serve -chain cosmoshub-4 \
-//	    -snapshot /data/snapshots/snapshot_cosmoshub-4_<H1> \
-//	    -snapshot /data/snapshots/snapshot_cosmoshub-4_<H2>
+//	    -snapshots /data/snapshots
 //
-// See `malcom snapshot serve -h` for flags. Tuning knobs that overlap
+// See \`malcom snapshot serve -h\` for flags. Tuning knobs that overlap
 // with snapfetch (PEX wave size, addrbook ban duration, etc.) are
 // shared via the same [chains.<id>.fetch] section in config.toml.
 package snapshotserve
@@ -68,9 +79,11 @@ func Run(args []string) int {
 	pexDisabled := fs.Bool("pex-disabled", false, "override config.fetch.pex_disabled. When true, the server only dials peers in bootstrap_peers and won't accept addrbook entries — useful for isolated benchmarks.")
 
 	var snapshots stringSliceFlag
-	fs.Var(&snapshots, "snapshot", "snapshot directory to serve (repeatable; at least one required)")
+	fs.Var(&snapshots, "snapshot", "snapshot directory to serve (repeatable; static mode — no rescan). Mutually exclusive with -snapshots.")
+	snapshotsRoot := fs.String("snapshots", "", "parent directory to scan for snapshot subdirs (dir-watch mode; rescans on -rescan-interval and on SIGHUP). Mutually exclusive with -snapshot.")
+	rescanInterval := fs.Duration("rescan-interval", 0, "(with -snapshots) how often to rescan the root dir for new/removed snapshots. Default 30s; 0 disables periodic rescan (SIGHUP-only refresh).")
 
-	verifyMode := fs.String("verify", "aggregate", "verify on startup: 'metadata' (cheap, no chunk reads), 'aggregate' (one read pass, checks SHA256 of concatenated chunks), or 'per-chunk' (one read pass, checks per-chunk hashes). Default 'aggregate'.")
+	verifyMode := fs.String("verify", "aggregate", "verify on startup: 'metadata' (cheap, no chunk reads), 'aggregate' (one read pass, checks SHA256 of concatenated chunks), or 'per-chunk' (one read pass, checks per-chunk hashes). Default 'aggregate'. In dir-watch mode, applied to every rescan.")
 	debug := fs.Bool("debug", false, "verbose snapserve logging")
 	logMode := fs.String("log", "", "log output: auto (default), pretty, text, json")
 	if err := fs.Parse(args); err != nil {
@@ -81,8 +94,12 @@ func Run(args []string) int {
 		fmt.Fprintln(os.Stderr, "required: -chain <id>")
 		return ExitConfig
 	}
-	if len(snapshots) == 0 {
-		fmt.Fprintln(os.Stderr, "required: at least one -snapshot <dir>")
+	if len(snapshots) == 0 && *snapshotsRoot == "" {
+		fmt.Fprintln(os.Stderr, "required: -snapshot <dir> (repeatable) or -snapshots <root>")
+		return ExitConfig
+	}
+	if len(snapshots) > 0 && *snapshotsRoot != "" {
+		fmt.Fprintln(os.Stderr, "-snapshot and -snapshots are mutually exclusive")
 		return ExitConfig
 	}
 
@@ -136,6 +153,15 @@ func Run(args []string) int {
 		}
 		absDirs[i] = abs
 	}
+	absRoot := ""
+	if *snapshotsRoot != "" {
+		abs, err := filepath.Abs(*snapshotsRoot)
+		if err != nil {
+			serveLog.Error("resolve snapshots root failed", "err", err, "dir", *snapshotsRoot)
+			return ExitConfig
+		}
+		absRoot = abs
+	}
 
 	listenAddr := ch.Fetch.Listen
 	if *listen != "" {
@@ -176,6 +202,8 @@ func Run(args []string) int {
 		Banlist:             ch.Banlist,
 		BootstrapPeers:      bootstrapPeers,
 		SnapshotDirs:        absDirs,
+		SnapshotsRoot:       absRoot,
+		RescanInterval:      *rescanInterval,
 		VerifyMode:          mode,
 		MaxOutboundPeers:    ch.Fetch.MaxOutboundPeers,
 		AllowDuplicateIP:    ch.Fetch.AllowDuplicateIP,
@@ -190,24 +218,50 @@ func Run(args []string) int {
 
 	serveLog.Info("config", "path", cfg.Path())
 	serveLog.Info("chain", "id", ch.ChainID)
-	serveLog.Info("snapshots", "dirs", absDirs)
+	if absRoot != "" {
+		serveLog.Info("snapshots", "mode", "dir-watch", "root", absRoot)
+	} else {
+		serveLog.Info("snapshots", "mode", "static", "dirs", absDirs)
+	}
 	serveLog.Info("node key", "path", ch.NodeKey)
 
 	rootCtx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	rootCtx = logctx.With(rootCtx, logger)
-	sigCh := make(chan os.Signal, 2)
-	signal.Notify(sigCh, os.Interrupt, syscall.SIGTERM)
+
+	// Shutdown channel — SIGINT/SIGTERM only. Two signals force exit.
+	sigShutdown := make(chan os.Signal, 2)
+	signal.Notify(sigShutdown, os.Interrupt, syscall.SIGTERM)
 	var interrupted atomic.Bool
 	go func() {
-		<-sigCh
+		<-sigShutdown
 		interrupted.Store(true)
 		serveLog.Info("interrupted, shutting down (press Ctrl-C again to force exit)")
 		cancel()
-		<-sigCh
+		<-sigShutdown
 		fmt.Fprintln(os.Stderr, "snapserve: forced exit on second signal")
 		os.Exit(130)
 	}()
+
+	// Reload channel — SIGHUP triggers an immediate catalog rescan in
+	// dir-watch mode. Wired via OnReloader: RunServe hands us the
+	// catalog's Trigger fn once the catalog is up, and we forward
+	// every HUP to it. In static mode (no -snapshots) the reloader is
+	// never invoked, so HUP is a no-op.
+	sigReload := make(chan os.Signal, 1)
+	signal.Notify(sigReload, syscall.SIGHUP)
+	var trigger atomic.Pointer[func()]
+	go func() {
+		for range sigReload {
+			if t := trigger.Load(); t != nil {
+				serveLog.Info("SIGHUP — triggering catalog rescan")
+				(*t)()
+			} else {
+				serveLog.Info("SIGHUP — no catalog to rescan (static mode); ignoring")
+			}
+		}
+	}()
+	scfg.OnReloader = func(t func()) { trigger.Store(&t) }
 
 	if err := snapserve.RunServe(rootCtx, scfg); err != nil {
 		if interrupted.Load() || errors.Is(err, context.Canceled) {

@@ -21,9 +21,11 @@ import (
 // loadedSnapshot is one snapshot dir prepared for serving: catalogue
 // fields (Height/Format/Chunks/Hash/Metadata) ready to drop into a
 // SnapshotsResponse, plus the dir path so LoadChunk knows where to
-// read chunk_NNNNN.bin files.
+// read chunk_NNNNN.bin files. ChainID is retained for filtering by
+// the dir-scan loader; the reactor itself doesn't need it.
 type loadedSnapshot struct {
 	Dir      string
+	ChainID  string
 	Height   uint64
 	Format   uint32
 	Chunks   uint32
@@ -46,9 +48,10 @@ type metaJSON struct {
 // Store is a read-only catalogue of verified snapshot dirs that
 // implements statesync.SnapshotProvider.
 //
-// All snapshots are loaded and verified up front by LoadStore — a
-// running server won't pick up new dirs or notice mutated chunk files.
-// Restart the server to refresh.
+// A Store is immutable after construction. To pick up newly-landed
+// snapshots, build a fresh Store (see LoadStoreFromRoot) and swap it
+// onto the reactor via SetProvider — that's what Catalog does on
+// rescan.
 type Store struct {
 	snapshots []loadedSnapshot
 }
@@ -92,16 +95,21 @@ func (m VerifyMode) String() string {
 	}
 }
 
-// LoadStore reads each dir, verifies it according to mode, and returns
-// a Store ready to plug into the statesync reactor. Returns an error
-// on the first bad dir — there's no point standing up a serve node
-// against a half-broken snapshot set.
+// LoadStore reads each explicit dir, verifies it according to mode,
+// and returns a Store ready to plug into the statesync reactor.
+// Returns an error on the first bad dir — explicit -snapshot flags
+// represent operator intent, so we surface mismatches loudly rather
+// than skipping silently.
+//
+// If chainID is non-empty, each snapshot's meta.json chain_id must
+// match; a mismatch is a hard error (the operator probably pointed
+// us at the wrong dir).
 //
 // Duplicate (height, format) pairs are rejected: the SnapshotsResponse
 // catalogue must be unambiguous, and CometBFT requesters key
 // ChunkRequest off (height, format) so two snapshots claiming the
 // same key would fight for the same chunk reads.
-func LoadStore(dirs []string, mode VerifyMode, logger *slog.Logger) (*Store, error) {
+func LoadStore(dirs []string, chainID string, mode VerifyMode, logger *slog.Logger) (*Store, error) {
 	if len(dirs) == 0 {
 		return nil, errors.New("no snapshot dirs provided")
 	}
@@ -112,6 +120,10 @@ func LoadStore(dirs []string, mode VerifyMode, logger *slog.Logger) (*Store, err
 		s, err := loadOne(dir, mode, logger)
 		if err != nil {
 			return nil, fmt.Errorf("snapshot %s: %w", dir, err)
+		}
+		if chainID != "" && s.ChainID != chainID {
+			return nil, fmt.Errorf("snapshot %s: chain_id %q != expected %q",
+				dir, s.ChainID, chainID)
 		}
 		key := fmt.Sprintf("%d_%d", s.Height, s.Format)
 		if prior, ok := seen[key]; ok {
@@ -131,13 +143,107 @@ func LoadStore(dirs []string, mode VerifyMode, logger *slog.Logger) (*Store, err
 				"elapsed", time.Since(t0).Truncate(time.Millisecond))
 		}
 	}
+	return newStore(loaded), nil
+}
+
+// LoadStoreFromRoot scans rootDir one level deep for snapshot dirs,
+// filters to entries with chain_id == chainID (if non-empty), verifies
+// each per mode, and returns a Store. Designed for the dir-watch
+// workflow (Catalog) — per-dir failures are *not* fatal:
+//
+//   - non-directories and entries missing .complete are debug-skipped
+//     (we'd see in-progress fetches and stray files here);
+//   - wrong chain_id is debug-skipped (one root can hold multiple
+//     chains' snapshots, each served by its own process);
+//   - actual integrity errors (bad metadata, hash mismatch) are warn-
+//     logged and skipped — leaving the rest of the catalogue
+//     advertisable.
+//
+// A missing or unreadable rootDir is a hard error (operator misconfig).
+// An empty rootDir yields an empty store, which is legal — the server
+// runs and just doesn't advertise anything until a snapshot lands.
+//
+// Duplicate (height, format) pairs surviving the chain-id filter are
+// rejected (warn + skip the second). The first-loaded wins; the order
+// is whatever os.ReadDir returns, which on most filesystems is dir-
+// order, not stable.
+func LoadStoreFromRoot(rootDir, chainID string, mode VerifyMode, logger *slog.Logger) (*Store, error) {
+	entries, err := os.ReadDir(rootDir)
+	if err != nil {
+		return nil, fmt.Errorf("scan snapshots root %s: %w", rootDir, err)
+	}
+	loaded := make([]loadedSnapshot, 0, len(entries))
+	seen := map[string]string{}
+	for _, e := range entries {
+		dir := filepath.Join(rootDir, e.Name())
+		// os.Stat follows symlinks — useful in practice because
+		// operators often symlink finished snapshots from elsewhere
+		// (large mount, network FS) into the pool dir. Lstat + IsDir
+		// would refuse those.
+		info, err := os.Stat(dir)
+		if err != nil || !info.IsDir() {
+			continue
+		}
+		// Cheap pre-check: skip entries that don't even look like a
+		// snapshot dir, without spamming the log for stray files /
+		// in-progress fetches.
+		if _, err := os.Stat(filepath.Join(dir, ".complete")); err != nil {
+			if logger != nil {
+				logger.Debug("dir-scan: skipping (no .complete marker)", "dir", dir)
+			}
+			continue
+		}
+		t0 := time.Now()
+		s, err := loadOne(dir, mode, logger)
+		if err != nil {
+			if logger != nil {
+				logger.Warn("dir-scan: skipping (verification failed)",
+					"dir", dir, "err", err)
+			}
+			continue
+		}
+		if chainID != "" && s.ChainID != chainID {
+			if logger != nil {
+				logger.Debug("dir-scan: skipping (wrong chain)",
+					"dir", dir, "snapshot_chain_id", s.ChainID, "want", chainID)
+			}
+			continue
+		}
+		key := fmt.Sprintf("%d_%d", s.Height, s.Format)
+		if prior, ok := seen[key]; ok {
+			if logger != nil {
+				logger.Warn("dir-scan: skipping (duplicate height/format)",
+					"dir", dir, "height", s.Height, "format", s.Format,
+					"already_loaded_from", prior)
+			}
+			continue
+		}
+		seen[key] = dir
+		loaded = append(loaded, s)
+		if logger != nil {
+			logger.Info("dir-scan: snapshot loaded",
+				"dir", dir,
+				"height", s.Height,
+				"format", s.Format,
+				"chunks", s.Chunks,
+				"verify", mode,
+				"elapsed", time.Since(t0).Truncate(time.Millisecond))
+		}
+	}
+	return newStore(loaded), nil
+}
+
+// newStore is the shared tail of LoadStore / LoadStoreFromRoot.
+// Sorts the catalogue newest-first so the cosmos-sdk requester sees
+// the highest height first on the wire.
+func newStore(loaded []loadedSnapshot) *Store {
 	// Newest height first. Cosmos-SDK's statesync requester picks the
 	// highest offer it sees, so we advertise newest first to minimise
 	// time-to-first-acceptance over an MConn that can drop tail bytes.
 	sort.Slice(loaded, func(i, j int) bool {
 		return loaded[i].Height > loaded[j].Height
 	})
-	return &Store{snapshots: loaded}, nil
+	return &Store{snapshots: loaded}
 }
 
 func loadOne(dir string, mode VerifyMode, logger *slog.Logger) (loadedSnapshot, error) {
@@ -208,6 +314,7 @@ func loadOne(dir string, mode VerifyMode, logger *slog.Logger) (loadedSnapshot, 
 
 	return loadedSnapshot{
 		Dir:      dir,
+		ChainID:  meta.ChainID,
 		Height:   meta.Height,
 		Format:   meta.Format,
 		Chunks:   meta.Chunks,
