@@ -376,6 +376,21 @@ func Run(args []string) int {
 		return 1
 	}
 
+	// Record the bootstrap height in the home so `malcom heal` can
+	// re-apply it after a failed first start consumes cometbft's
+	// OfflineStateSyncHeight signal. See #95 and markerfile.go.
+	// Best-effort: a failure to write the marker doesn't fail the
+	// bootstrap (the home is otherwise valid), but the operator gets
+	// a loud warning so they know recovery will need -height.
+	if err := WriteHeightMarker(outRoot, *height); err != nil {
+		log.Warn("write bootstrap-height marker failed; `malcom heal` will require -height",
+			"err", err, "marker", BootstrapHeightMarker)
+	} else {
+		log.Info("bootstrap-height marker written",
+			"path", filepath.Join(outRoot, BootstrapHeightMarker),
+			"height", *height)
+	}
+
 	log.Info("done",
 		"home", outRoot,
 		"genesis", filepath.Join(configDir, "genesis.json"),
@@ -454,4 +469,3 @@ func fetchBlockHash(rpcBase string, height int64) (string, error) {
 	}
 	return hash, nil
 }
-
