@@ -14,6 +14,7 @@ malcom registry refresh   re-fetch the cached chain-registry snapshot
 malcom clean              back up (or -clobber) the XDG malcom dirs
 malcom snapshot fetch     download a state-sync snapshot
 malcom snapshot import    snapshot dir → application.db + extensions/
+malcom snapshot serve     advertise a local snapshot over state-sync P2P
 malcom bootstrap          assemble a runnable gaiad home directory
 malcom verify             check the imported AppHash against a cometbft RPC
 malcom compact            full-keyspace pebble compaction

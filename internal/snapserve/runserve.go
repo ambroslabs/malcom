@@ -1,0 +1,280 @@
+package snapserve
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"strings"
+	"time"
+
+	cfg "github.com/cometbft/cometbft/config"
+	"github.com/cometbft/cometbft/p2p"
+	"github.com/cometbft/cometbft/p2p/conn"
+	"github.com/cometbft/cometbft/version"
+
+	"github.com/zrbecker/cosmos-p2p/internal/connect"
+	"github.com/zrbecker/cosmos-p2p/internal/helpers/addrbook"
+	"github.com/zrbecker/cosmos-p2p/internal/helpers/banlist"
+	"github.com/zrbecker/cosmos-p2p/internal/helpers/nodekey"
+	malcomlog "github.com/zrbecker/cosmos-p2p/internal/log"
+	"github.com/zrbecker/cosmos-p2p/internal/logctx"
+	localpex "github.com/zrbecker/cosmos-p2p/internal/pex"
+	"github.com/zrbecker/cosmos-p2p/internal/statesync"
+)
+
+// ErrNoPeers signals that BootstrapPeers was empty AND the addrbook
+// loaded zero entries. Without anyone to dial, the node can still
+// accept inbound connections but won't participate in PEX.
+var ErrNoPeers = errors.New("no peers configured")
+
+// RunServe is the library entry point. Loads + verifies the snapshot
+// store, builds the same p2p/PEX stack snapfetch uses, plugs the store
+// into the statesync reactor in serve mode, and blocks until ctx is
+// cancelled (typically by a SIGINT/SIGTERM in the CLI wrapper).
+//
+// On clean shutdown, the addrbook and banlist are persisted before
+// returning. The store itself is read-only; nothing on disk under
+// SnapshotDirs is mutated by serving.
+func RunServe(ctx context.Context, c Config) error {
+	c.applyDefaults()
+	ctx = logctx.WithFields(ctx, "module", "serve")
+	log := logctx.From(ctx)
+
+	store, err := LoadStore(c.SnapshotDirs, c.VerifyMode, log)
+	if err != nil {
+		return fmt.Errorf("load store: %w", err)
+	}
+	log.Info("snapshot store ready",
+		"snapshots", store.Len(),
+		"summary", store.Describe(),
+		"verify", c.VerifyMode)
+
+	nodeKey, err := nodekey.LoadOrGen(c.NodeKeyPath)
+	if err != nil {
+		return fmt.Errorf("node key: %w", err)
+	}
+
+	peerAddrs, err := buildServePeerAddrs(ctx, c)
+	if err != nil {
+		return err
+	}
+
+	listenAddr, err := p2p.NewNetAddressString(p2p.IDAddressString(nodeKey.ID(), c.Listen))
+	if err != nil {
+		return fmt.Errorf("listen addr: %w", err)
+	}
+	log.Info("starting",
+		"node_id", string(nodeKey.ID()),
+		"listen", listenAddr.DialString(),
+		"chain", c.ChainID,
+		"peer_addrs", len(peerAddrs))
+
+	// Same channel set as fetch (PEX + state-sync). Advertising the
+	// state-sync channels is what tells well-behaved peers we'll
+	// answer their SnapshotsRequest.
+	nodeInfo := p2p.DefaultNodeInfo{
+		ProtocolVersion: p2p.NewProtocolVersion(version.P2PProtocol, version.BlockProtocol, 0),
+		DefaultNodeID:   nodeKey.ID(),
+		ListenAddr:      listenAddr.DialString(),
+		Network:         c.ChainID,
+		Version:         version.TMCoreSemVer,
+		Channels:        []byte{localpex.Channel, statesync.SnapshotChannel, statesync.ChunkChannel},
+		Moniker:         c.Moniker,
+		Other:           p2p.DefaultNodeInfoOther{TxIndex: "off"},
+	}
+	if err := nodeInfo.Validate(); err != nil {
+		return fmt.Errorf("nodeInfo invalid: %w", err)
+	}
+
+	transport := p2p.NewMultiplexTransport(nodeInfo, *nodeKey, buildMConnConfig())
+	if err := transport.Listen(*listenAddr); err != nil {
+		return fmt.Errorf("transport.Listen: %w", err)
+	}
+
+	ssR := statesync.NewReactor(malcomlog.CmtShim(log.With("module", "statesync")))
+	ssR.SetProvider(store)
+	ssR.SetProbe(false) // serve mode: don't pester peers for their snapshots
+
+	book, err := addrbook.NewAddrBook(c.AddrBook, malcomlog.CmtShim(log.With("module", "addrbook")))
+	if err != nil {
+		return fmt.Errorf("addrbook: %w", err)
+	}
+	bans, err := banlist.New(c.Banlist)
+	if err != nil {
+		return fmt.Errorf("banlist: %w", err)
+	}
+	log.Info("addrbook loaded", "path", c.AddrBook)
+	log.Info("banlist loaded", "path", c.Banlist, "size", bans.Len())
+
+	if selfAddr, err := p2p.NewNetAddressString(p2p.IDAddressString(nodeKey.ID(), listenAddr.DialString())); err == nil {
+		book.AddOurAddress(selfAddr)
+	}
+
+	res := addrbook.Populate(book, bans, peerAddrs)
+	log.Info("addrbook ready",
+		"path", c.AddrBook,
+		"added", res.Added,
+		"skipped_banned", res.SkippedBanned)
+
+	sw := p2p.NewSwitch(buildP2PConfig(c.MaxOutboundPeers, c.AllowDuplicateIP), transport)
+	sw.SetLogger(malcomlog.CmtShim(log.With("module", "p2p")))
+	sw.SetNodeKey(nodeKey)
+	sw.SetNodeInfo(nodeInfo)
+	sw.SetAddrBook(book)
+
+	mgr := connect.New(ctx, connect.Config{
+		Switch:          sw,
+		Book:            book,
+		Banlist:         bans,
+		Pool:            peerAddrs,
+		WarmTarget:      c.PEXTargetPeers,
+		DialBatch:       c.PEXMaxPerWave,
+		RefreshTick:     c.WarmRefreshInterval,
+		BookBias:        50,
+		Backoff:         c.PeerRedialBackoff,
+		MaxBackoff:      c.MaxRedialBackoff,
+		MaxRedials:      c.MaxRedials,
+		MaxDialFailures: c.MaxDialFailures,
+		BanDuration:     c.AddrBookBanDuration,
+		BookDisabled:    c.PEXDisabled,
+	})
+
+	if !c.PEXDisabled {
+		pexR := localpex.NewAutoReactor(book, localpex.AutoConfig{
+			Banlist: bans,
+			Kicker:  mgr,
+		}, malcomlog.CmtShim(log.With("module", "pex")))
+		sw.AddReactor("PEX", pexR)
+	} else {
+		log.Info("pex disabled: gossip dial pool restricted to bootstrap_peers")
+	}
+	sw.AddReactor("STATESYNC", ssR)
+
+	if err := sw.Start(); err != nil {
+		return fmt.Errorf("switch.Start: %w", err)
+	}
+	defer func() {
+		// Mirror snapfetch's shutdown ordering: addrbook + banlist
+		// saves first (so a slow sw.Stop can't lose them), then
+		// switch stop bounded by 1s, then manager.
+		book.Save()
+		if err := bans.Save(); err != nil {
+			log.Error("save banlist failed", "path", c.Banlist, "err", err)
+		} else {
+			log.Info("banlist saved", "path", c.Banlist, "size", bans.Len())
+		}
+		stopped := make(chan struct{})
+		go func() { _ = sw.Stop(); close(stopped) }()
+		select {
+		case <-stopped:
+		case <-time.After(1 * time.Second):
+			log.Debug("sw.Stop slow; skipping wait")
+		}
+		mgr.Stop()
+	}()
+
+	log.Info("serving",
+		"listen", listenAddr.DialString(),
+		"node_id", string(nodeKey.ID()),
+		"snapshots", store.Len())
+
+	// Periodic served-counter logs so the operator has something to
+	// look at without enabling debug. Cheap (atomic loads). Cadence
+	// matches fetch's stat lines.
+	stats := time.NewTicker(30 * time.Second)
+	defer stats.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			snapshots, chunks, missing := ssR.Served()
+			recv, sent := ssR.Bytes()
+			log.Info("shutting down",
+				"snapshots_served", snapshots,
+				"chunks_served", chunks,
+				"chunks_missing", missing,
+				"bytes_recv", recv,
+				"bytes_sent", sent)
+			return nil
+		case <-stats.C:
+			snapshots, chunks, missing := ssR.Served()
+			recv, sent := ssR.Bytes()
+			out, in, dialing := sw.NumPeers()
+			log.Info("stats",
+				"peers_out", out, "peers_in", in, "dialing", dialing,
+				"snapshots_served", snapshots,
+				"chunks_served", chunks,
+				"chunks_missing", missing,
+				"bytes_recv", recv,
+				"bytes_sent", sent)
+		}
+	}
+}
+
+func buildServePeerAddrs(ctx context.Context, c Config) ([]addrbook.PeerAddr, error) {
+	var peerAddrs []addrbook.PeerAddr
+	if !c.PEXDisabled {
+		peerAddrs = loadAddrbookPeers(ctx, c.AddrBook)
+	}
+	for _, s := range c.BootstrapPeers {
+		s = strings.TrimSpace(s)
+		if s != "" {
+			peerAddrs = append([]addrbook.PeerAddr{{Addr: s, Source: addrbook.SourceBootstrap}}, peerAddrs...)
+		}
+	}
+	if len(peerAddrs) == 0 {
+		// In serve mode an empty pool isn't fatal — a node with a
+		// public listen addr can still accept inbound connections,
+		// it just won't participate in PEX outbound. Surface as a
+		// warning and proceed.
+		logctx.From(ctx).Warn("no bootstrap_peers and addrbook empty — serving inbound-only (no PEX gossip out)")
+	}
+	return peerAddrs, nil
+}
+
+func loadAddrbookPeers(ctx context.Context, addrBookPath string) []addrbook.PeerAddr {
+	if addrBookPath == "" {
+		return nil
+	}
+	items, err := addrbook.Load(addrBookPath)
+	if err != nil {
+		logctx.From(ctx).Error("load addrbook failed", "err", err)
+		return nil
+	}
+	out := make([]addrbook.PeerAddr, 0, len(items))
+	seen := map[string]bool{}
+	for _, it := range items {
+		s := it.String()
+		if seen[s] {
+			continue
+		}
+		seen[s] = true
+		out = append(out, addrbook.PeerAddr{Addr: s, Source: addrbook.SourceAddrbook})
+	}
+	return out
+}
+
+// buildP2PConfig duplicates snapfetch.buildP2PConfig — the values are
+// the same (we want fast handshake/dial timeouts and the same outbound
+// peer cap behavior). Keeping it local here avoids a snapfetch import
+// cycle.
+func buildP2PConfig(maxOutbound int, allowDuplicateIP bool) *cfg.P2PConfig {
+	p := cfg.DefaultP2PConfig()
+	p.AllowDuplicateIP = allowDuplicateIP
+	p.HandshakeTimeout = 5 * time.Second
+	p.DialTimeout = 5 * time.Second
+	p.MaxNumOutboundPeers = maxOutbound
+	return p
+}
+
+// buildMConnConfig matches snapfetch's MConn tuning. The serve side
+// also benefits from the larger packet payload (the chunks we ship
+// are 10 MiB) and the higher Send/RecvRate (cometbft's defaults
+// would throttle a 10 MiB chunk well below typical peer-side caps).
+func buildMConnConfig() conn.MConnConfig {
+	mConfig := conn.DefaultMConnConfig()
+	mConfig.MaxPacketMsgPayloadSize = 256 * 1024
+	mConfig.SendRate = 10 * 1024 * 1024
+	mConfig.RecvRate = 10 * 1024 * 1024
+	return mConfig
+}

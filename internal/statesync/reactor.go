@@ -1,10 +1,15 @@
-// Package statesync implements a minimal CometBFT state-sync client reactor
-// that speaks just enough of channels 0x60 (snapshot) and 0x61 (chunk) to
-// probe peers for available snapshots and optionally fetch a single chunk
-// to measure its size.
+// Package statesync implements a minimal CometBFT state-sync reactor
+// that speaks just enough of channels 0x60 (snapshot) and 0x61 (chunk)
+// for two roles:
 //
-// We don't apply snapshots — we have no app to feed them to. This is purely
-// a discovery/measurement tool for cosmoshub state-sync availability.
+//   - probing/fetching peers for available snapshots (the default
+//     behavior, used by snapfetch);
+//   - serving snapshots from a local store back to other peers (opt-in
+//     via SetProvider, used by snapserve).
+//
+// Both roles can coexist on one reactor in principle, but malcom's two
+// CLI subcommands run them in isolation: fetch is probe-only, serve is
+// provider-only with probe disabled.
 package statesync
 
 import (
@@ -63,35 +68,84 @@ type Event struct {
 	Removed   bool
 }
 
-// Reactor probes peers for snapshots. AddPeer fires a SnapshotsRequest;
-// inbound SnapshotsResponse is forwarded on Out. ChunkRequest can be
-// dispatched explicitly via RequestChunk; ChunkResponse is forwarded on
-// OutChunks. The two channels are separate so a 16 MiB chunk burst
-// can't queue tiny control events behind it.
+// SnapshotProvider is the inbound-request handler for serve mode. It
+// owns whatever store backs the local snapshots — see internal/snapserve.
+//
+// ListSnapshots returns the catalogue we'll advertise on every inbound
+// SnapshotsRequest. Callers must not mutate the returned slice or any
+// element; the reactor copies the wire fields when building responses.
+//
+// LoadChunk returns the raw chunk bytes for (height, format, index).
+// found=false signals the chunk doesn't exist for that snapshot — the
+// reactor then sends a ChunkResponse with Missing=true and no payload.
+// A non-nil err means we couldn't read the chunk we should have had
+// (transient I/O, corruption); the reactor logs and treats it as
+// Missing on the wire so the requester moves on instead of waiting
+// for our timeout.
+type SnapshotProvider interface {
+	ListSnapshots() []Snapshot
+	LoadChunk(height uint64, format, index uint32) (data []byte, found bool, err error)
+}
+
+// Reactor probes peers for snapshots. AddPeer fires a SnapshotsRequest
+// (probe mode); inbound SnapshotsResponse is forwarded on Out.
+// ChunkRequest can be dispatched explicitly via RequestChunk;
+// ChunkResponse is forwarded on OutChunks. The two channels are
+// separate so a 16 MiB chunk burst can't queue tiny control events
+// behind it.
+//
+// In serve mode, SetProvider installs a SnapshotProvider and SetProbe
+// disables the AddPeer probe. Inbound SnapshotsRequest then triggers
+// one SnapshotsResponse per snapshot in the provider's catalogue; an
+// inbound ChunkRequest triggers a ChunkResponse with the chunk bytes
+// (or Missing=true).
 type Reactor struct {
 	p2p.BaseReactor
 	logger    log.Logger
 	Out       chan Event // Connected, Removed, Snapshot
 	OutChunks chan Event // Chunk
 
+	provider SnapshotProvider
+	probe    bool
+
 	bytesRecv  atomic.Int64
 	bytesSent  atomic.Int64
 	dropsCtrl  atomic.Int64
 	dropsChunk atomic.Int64
+
+	snapshotsServed atomic.Int64
+	chunksServed    atomic.Int64
+	chunksMissing   atomic.Int64
 }
 
 const outChunksCapacity = 8
 
+// NewReactor constructs a probe-mode reactor (the default for fetch).
+// SnapshotsRequest fires on every AddPeer; inbound responses route to
+// Out / OutChunks. To run in serve mode, also call SetProvider and
+// SetProbe(false).
 func NewReactor(logger log.Logger) *Reactor {
 	r := &Reactor{
 		logger:    logger,
 		Out:       make(chan Event, 256),
 		OutChunks: make(chan Event, outChunksCapacity),
+		probe:     true,
 	}
 	r.BaseReactor = *p2p.NewBaseReactor("statesync-probe", r)
 	r.BaseReactor.SetLogger(logger)
 	return r
 }
+
+// SetProvider installs a SnapshotProvider so the reactor responds to
+// inbound SnapshotsRequest / ChunkRequest from peers. Must be called
+// before sw.Start(). Pass nil to clear (probe-only).
+func (r *Reactor) SetProvider(p SnapshotProvider) { r.provider = p }
+
+// SetProbe controls whether AddPeer fires a SnapshotsRequest. Probe is
+// true by default (fetch mode); serve mode passes false so we don't
+// pester peers for their snapshots when we have nothing to do with
+// them.
+func (r *Reactor) SetProbe(probe bool) { r.probe = probe }
 
 func (r *Reactor) GetChannels() []*conn.ChannelDescriptor {
 	// Leave RecvBufferCapacity unset (defaults to 4 KiB in cometbft's
@@ -130,6 +184,9 @@ func (r *Reactor) AddPeer(peer p2p.Peer) {
 	default:
 		r.dropsCtrl.Add(1)
 		r.logger.Error("connect Out channel full; dropping", "peer", peerID)
+	}
+	if !r.probe {
+		return
 	}
 	req := &ssproto.SnapshotsRequest{}
 	if peer.Send(p2p.Envelope{ChannelID: SnapshotChannel, Message: req}) {
@@ -205,14 +262,84 @@ func (r *Reactor) Receive(env p2p.Envelope) {
 			r.logger.Error("chunk OutChunks channel full; dropping", "peer", peerID)
 		}
 
-	case *ssproto.SnapshotsRequest, *ssproto.ChunkRequest:
-		// We're a probe — we don't serve snapshots. Ignore inbound requests
-		// rather than answering with nothing (which is what cometbft does
-		// when ListSnapshots returns empty anyway).
+	case *ssproto.SnapshotsRequest:
+		if r.provider == nil {
+			// Probe-only build: cometbft does the same when its
+			// ListSnapshots ABCI call returns empty — silence rather than
+			// an empty response.
+			return
+		}
+		snaps := r.provider.ListSnapshots()
+		for i := range snaps {
+			s := &snaps[i]
+			resp := &ssproto.SnapshotsResponse{
+				Height:   s.Height,
+				Format:   s.Format,
+				Chunks:   s.Chunks,
+				Hash:     s.Hash,
+				Metadata: s.Metadata,
+			}
+			if env.Src.Send(p2p.Envelope{ChannelID: SnapshotChannel, Message: resp}) {
+				r.bytesSent.Add(int64(proto.Size(resp)))
+				r.snapshotsServed.Add(1)
+				r.logger.Debug("SnapshotsResponse sent",
+					"peer", peerID, "height", s.Height, "format", s.Format,
+					"chunks", s.Chunks)
+			} else {
+				r.logger.Error("SnapshotsResponse send queue full",
+					"peer", peerID, "height", s.Height, "format", s.Format)
+			}
+		}
+
+	case *ssproto.ChunkRequest:
+		if r.provider == nil {
+			return
+		}
+		data, found, err := r.provider.LoadChunk(m.Height, m.Format, m.Index)
+		if err != nil {
+			// Treat read errors as Missing on the wire so requesters
+			// move on instead of waiting for their per-chunk timeout.
+			// Operator gets the actual error in our logs.
+			r.logger.Error("LoadChunk failed; serving Missing",
+				"peer", peerID, "height", m.Height, "format", m.Format,
+				"index", m.Index, "err", err)
+			found = false
+			data = nil
+		}
+		resp := &ssproto.ChunkResponse{
+			Height:  m.Height,
+			Format:  m.Format,
+			Index:   m.Index,
+			Chunk:   data,
+			Missing: !found,
+		}
+		if env.Src.Send(p2p.Envelope{ChannelID: ChunkChannel, Message: resp}) {
+			r.bytesSent.Add(int64(proto.Size(resp)))
+			if found {
+				r.chunksServed.Add(1)
+			} else {
+				r.chunksMissing.Add(1)
+			}
+			r.logger.Debug("ChunkResponse sent",
+				"peer", peerID, "height", m.Height, "format", m.Format,
+				"index", m.Index, "bytes", len(data), "missing", !found)
+		} else {
+			r.logger.Error("ChunkResponse send queue full",
+				"peer", peerID, "height", m.Height, "format", m.Format,
+				"index", m.Index)
+		}
 
 	default:
 		r.logger.Debug("unexpected statesync msg", "peer", peerID, "type", m)
 	}
+}
+
+// Served returns counters for serve-mode bookkeeping: how many
+// SnapshotsResponse and ChunkResponse messages we've sent in reply to
+// inbound requests, plus chunks served as Missing (we don't have them
+// or read failed).
+func (r *Reactor) Served() (snapshots, chunks, missing int64) {
+	return r.snapshotsServed.Load(), r.chunksServed.Load(), r.chunksMissing.Load()
 }
 
 // Bytes returns recv/sent byte counters across both channels.
