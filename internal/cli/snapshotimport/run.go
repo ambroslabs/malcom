@@ -55,6 +55,7 @@ func Run(args []string) int {
 	flushSplitMB := fs.Int("flush-split-mb", -1, "cap on L0 SSTable size from memtable flushes; -1 = use [import].flush_split_mb (defaults to memtable_mb)")
 	compactDuringImport := fs.Bool("compact-during-import", false, "enable pebble auto-compactions during import (default off; trades wall time for tighter end-of-import LSM)")
 	compactWorkers := fs.Int("compact-workers", 0, "override [compact].max_concurrent_compactions for this run (only meaningful when -compact-during-import is set)")
+	noVerify := fs.Bool("no-verify", false, "skip the post-import AppHash check against the chain's configured rpcs. Default behaviour: after import completes, when the chain has rpcs, run the same check `malcom verify` performs and exit non-zero on mismatch.")
 	if err := fs.Parse(args); err != nil {
 		return 2
 	}
@@ -259,6 +260,13 @@ func Run(args []string) int {
 		"appdb", finalDB,
 		"appdb_bytes", dbBytes)
 
+	if rc := runPostImportVerify(log, outDir, *height, ch.RPCs, *noVerify); rc != 0 {
+		// Mismatch exits 7, RPC-unreachable returns 0 so the operator
+		// can still inspect the imported db while they sort out an
+		// RPC. See runPostImportVerify for the breakdown.
+		return rc
+	}
+
 	if *memProfile != "" {
 		f, err := os.Create(*memProfile)
 		if err != nil {
@@ -342,4 +350,3 @@ func dirSize(dir string) (int64, error) {
 	})
 	return total, err
 }
-

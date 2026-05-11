@@ -22,7 +22,13 @@ const (
 	ExitWalkFailed     = 4
 	ExitDownloadFailed = 5
 	ExitDiskFailed     = 6
-	ExitInterrupted    = 130
+	// ExitVerifyFailed — fetch + pipelined import succeeded, but the
+	// post-import AppHash check against a trusted RPC didn't agree
+	// with consensus. The imported db is left in place so the
+	// operator can inspect; re-fetching is the typical recovery.
+	// Only produced when -import is set and -no-verify isn't.
+	ExitVerifyFailed = 7
+	ExitInterrupted  = 130
 )
 
 // mapExitCode classifies a RunFetch error into the documented exit

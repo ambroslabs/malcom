@@ -32,6 +32,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/zrbecker/cosmos-p2p/internal/cli/verify"
 	"github.com/zrbecker/cosmos-p2p/internal/config"
 	malcomlog "github.com/zrbecker/cosmos-p2p/internal/log"
 	"github.com/zrbecker/cosmos-p2p/internal/logctx"
@@ -56,6 +57,7 @@ func Run(args []string) int {
 	importChunkMB := fs.Int("import-chunk-mb", 0, "(with -import) chunk-ring budget in MiB; 0 = default (512)")
 	importWaveParallel := fs.Bool("import-wave-parallel", false, "(with -import) within-store wave-parallel hashing")
 	importFastIngest := fs.Bool("import-fast-ingest", true, "(with -import) bulk-ingest the f/ fast-storage entries via per-store sstable.Writer")
+	noVerify := fs.Bool("no-verify", false, "(with -import) skip the post-import AppHash check against the chain's configured rpcs. Default behaviour: when -import is set and the chain has rpcs, run the same check `malcom verify` performs and exit non-zero on mismatch.")
 	if err := fs.Parse(args); err != nil {
 		return ExitConfig
 	}
@@ -285,8 +287,7 @@ func Run(args []string) int {
 				"items", stats.Items,
 				"stores", len(stats.Stores))
 		}
-		fetchLog.Info("WARNING: snapshot contents are not authenticated by p2p — run `malcom verify` against a trusted RPC before using this snapshot in production")
-		return ExitSuccess
+		return runPostImportVerify(fetchLog, pipeline.appdbOut, pipeline.appdbHeight, ch.RPCs, *noVerify)
 	}
 
 	if fetchErr != nil {
@@ -294,6 +295,61 @@ func Run(args []string) int {
 		return mapExitCode(fetchErr, interrupted.Load())
 	}
 	fetchLog.Info("WARNING: snapshot contents are not authenticated by p2p — run `malcom verify` against a trusted RPC before using this snapshot in production")
+	return ExitSuccess
+}
+
+// runPostImportVerify runs the same AppHash check `malcom verify`
+// performs against the pipelined-import output, returning the
+// appropriate exit code. Decoupled from inline so the import-side and
+// the no-import-skip paths share one place.
+//
+// Skip conditions and their reasoning:
+//   - noVerify flag set: explicit operator opt-out.
+//   - rpcs empty: the chain config has no rpcs configured, so we have
+//     no trust anchor to check against. Falls back to the historic
+//     "WARNING run malcom verify yourself" log line.
+//   - appdb empty: shouldn't happen in the import path, but if the
+//     pipeline never started (walk failure before OnDownloadReady)
+//     we have nothing to verify.
+func runPostImportVerify(log *slog.Logger, appdb string, height int64, rpcs []string, noVerify bool) int {
+	if appdb == "" {
+		log.Info("WARNING: snapshot contents are not authenticated by p2p — run `malcom verify` against a trusted RPC before using this snapshot in production")
+		return ExitSuccess
+	}
+	if noVerify {
+		log.Info("WARNING: -no-verify set; snapshot contents are not authenticated by p2p — run `malcom verify` against a trusted RPC before using this snapshot in production")
+		return ExitSuccess
+	}
+	if len(rpcs) == 0 {
+		log.Info("WARNING: chain config has no rpcs; snapshot contents are not authenticated by p2p — populate chains/<id>.toml rpcs or run `malcom verify -rpc <url>` against a trusted RPC before using this snapshot in production")
+		return ExitSuccess
+	}
+	verifyLog := log.With("module", "verify")
+	verifyLog.Info("verifying apphash against rpc", "appdb", appdb, "height", height, "rpcs", len(rpcs))
+	res, err := verify.CheckAppHash(appdb, height, rpcs, verifyLog)
+	switch {
+	case errors.Is(err, verify.ErrMismatch):
+		verifyLog.Error("MISMATCH — local apphash disagrees with consensus",
+			"height", res.Height,
+			"local", fmt.Sprintf("%X", res.LocalHash),
+			"consensus", fmt.Sprintf("%X", res.ConsensusHash),
+			"rpc", res.UsedRPC,
+			"action", "the imported db is left in place; re-fetch is the typical recovery")
+		return ExitVerifyFailed
+	case err != nil:
+		// No RPC was reachable or the check itself failed for an
+		// unrelated reason. Don't fail the pipeline just because the
+		// trust anchor wasn't reachable — surface a loud warning so
+		// the operator can re-run `malcom verify` themselves.
+		verifyLog.Warn("post-import verify did not complete; snapshot is not authenticated",
+			"err", err,
+			"hint", "run `malcom verify -appdb "+appdb+"` once an rpc is reachable")
+		return ExitSuccess
+	}
+	verifyLog.Info("MATCH — application.db is consensus-correct",
+		"height", res.Height,
+		"apphash", fmt.Sprintf("%X", res.LocalHash),
+		"rpc", res.UsedRPC)
 	return ExitSuccess
 }
 
