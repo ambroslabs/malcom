@@ -40,6 +40,12 @@ type pipelineState struct {
 	tailing    *snapshotimport.TailingChunkSource
 	importDone chan importResult
 	started    bool
+
+	// appdbOut + appdbHeight are populated by onDownloadReady so the
+	// caller can chain into post-import verify without re-deriving the
+	// path. Empty until OnDownloadReady fires.
+	appdbOut    string
+	appdbHeight int64
 }
 
 // pipelineImportTuning carries the knobs we expose for the
@@ -80,6 +86,8 @@ func (p *pipelineState) onDownloadReady(snapDir string, height uint64, totalChun
 
 	importHeight := int64(height)
 	outDir := fmt.Sprintf("%s/appdb_%s_%d", p.importOutDir, p.chain.ChainID, importHeight)
+	p.appdbOut = outDir
+	p.appdbHeight = importHeight
 	importLog.Info("pipeline: starting import",
 		"snapshot", snapDir,
 		"appdb", outDir,
