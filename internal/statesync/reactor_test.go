@@ -322,6 +322,275 @@ func TestServing_DrainMode_BeginShutdownIdempotent(t *testing.T) {
 	}
 }
 
+func TestServing_RateLimit_PerPeerBurstThenDrop(t *testing.T) {
+	// Per-peer bucket: burst=3, rate=0.0001/sec (effectively never
+	// refills during this test). After 3 requests the 4th is dropped
+	// silently — no ChunkResponse emitted, dropped_rate_peer
+	// counter ticks.
+	prov := newFakeProvider(Snapshot{Height: 1000, Format: 3, Chunks: 100})
+	for i := uint32(0); i < 10; i++ {
+		prov.chunks[chunkKey(1000, 3, i)] = []byte{0x42}
+	}
+	r := newServingReactor(prov)
+	r.SetChunkRateLimit(ChunkRateLimit{PerPeerRate: 0.0001, PerPeerBurst: 3})
+
+	peer := newRecordingPeer("p1")
+	for i := uint32(0); i < 5; i++ {
+		r.Receive(p2p.Envelope{
+			ChannelID: ChunkChannel,
+			Src:       peer,
+			Message:   &ssproto.ChunkRequest{Height: 1000, Format: 3, Index: i},
+		})
+	}
+
+	// First 3 served; 4th and 5th dropped silently.
+	resps := peer.chunkResponses()
+	if len(resps) != 3 {
+		t.Fatalf("want 3 ChunkResponses (burst=3); got %d", len(resps))
+	}
+	perDrops, globDrops := r.RateDropped()
+	if perDrops != 2 {
+		t.Fatalf("dropped_rate_peer = %d, want 2 (requests 4 and 5)", perDrops)
+	}
+	if globDrops != 0 {
+		t.Fatalf("dropped_rate_global = %d, want 0 (global bucket disabled)", globDrops)
+	}
+}
+
+func TestServing_RateLimit_PerPeerIsolation(t *testing.T) {
+	// Two peers, each with burst=2. Peer A exhausts; peer B's
+	// budget should be untouched — that's the whole point of per-
+	// peer buckets.
+	prov := newFakeProvider(Snapshot{Height: 1000, Format: 3, Chunks: 10})
+	for i := uint32(0); i < 10; i++ {
+		prov.chunks[chunkKey(1000, 3, i)] = []byte{1}
+	}
+	r := newServingReactor(prov)
+	r.SetChunkRateLimit(ChunkRateLimit{PerPeerRate: 0.0001, PerPeerBurst: 2})
+
+	pA := newRecordingPeer("A")
+	pB := newRecordingPeer("B")
+	// Drain A's budget plus one over.
+	for i := uint32(0); i < 3; i++ {
+		r.Receive(p2p.Envelope{
+			ChannelID: ChunkChannel,
+			Src:       pA,
+			Message:   &ssproto.ChunkRequest{Height: 1000, Format: 3, Index: i},
+		})
+	}
+	// B should get its full burst without interference.
+	for i := uint32(0); i < 2; i++ {
+		r.Receive(p2p.Envelope{
+			ChannelID: ChunkChannel,
+			Src:       pB,
+			Message:   &ssproto.ChunkRequest{Height: 1000, Format: 3, Index: i},
+		})
+	}
+	if got := len(pA.chunkResponses()); got != 2 {
+		t.Fatalf("peer A served %d, want 2 (burst)", got)
+	}
+	if got := len(pB.chunkResponses()); got != 2 {
+		t.Fatalf("peer B served %d, want 2 (independent burst); A's exhaustion bled through?", got)
+	}
+}
+
+func TestServing_RateLimit_GlobalCapsAcrossPeers(t *testing.T) {
+	// Global=2, per-peer disabled. Two different peers each making
+	// 2 requests: the global bucket allows only the first 2 in
+	// total. Important property: the limit is checked *before* the
+	// per-peer bucket, so the global one wins on contention.
+	prov := newFakeProvider(Snapshot{Height: 1000, Format: 3, Chunks: 10})
+	for i := uint32(0); i < 10; i++ {
+		prov.chunks[chunkKey(1000, 3, i)] = []byte{1}
+	}
+	r := newServingReactor(prov)
+	r.SetChunkRateLimit(ChunkRateLimit{GlobalRate: 0.0001, GlobalBurst: 2})
+
+	pA := newRecordingPeer("A")
+	pB := newRecordingPeer("B")
+	for _, p := range []*recordingPeer{pA, pB} {
+		for i := uint32(0); i < 2; i++ {
+			r.Receive(p2p.Envelope{
+				ChannelID: ChunkChannel,
+				Src:       p,
+				Message:   &ssproto.ChunkRequest{Height: 1000, Format: 3, Index: i},
+			})
+		}
+	}
+	totalServed := len(pA.chunkResponses()) + len(pB.chunkResponses())
+	if totalServed != 2 {
+		t.Fatalf("total served = %d, want 2 (global burst); per-peer slipped through?", totalServed)
+	}
+	perDrops, globDrops := r.RateDropped()
+	if globDrops != 2 {
+		t.Fatalf("dropped_rate_global = %d, want 2", globDrops)
+	}
+	if perDrops != 0 {
+		t.Fatalf("dropped_rate_peer = %d, want 0 (per-peer bucket disabled)", perDrops)
+	}
+}
+
+func TestServing_RateLimit_DisabledByDefault(t *testing.T) {
+	// Zero-value ChunkRateLimit (or never calling SetChunkRateLimit
+	// at all) means no rate limiting — the fetch-mode reactor
+	// MUST continue working without a SetChunkRateLimit call.
+	prov := newFakeProvider(Snapshot{Height: 1000, Format: 3, Chunks: 100})
+	for i := uint32(0); i < 50; i++ {
+		prov.chunks[chunkKey(1000, 3, i)] = []byte{1}
+	}
+	r := newServingReactor(prov) // no SetChunkRateLimit call
+
+	peer := newRecordingPeer("hot")
+	for i := uint32(0); i < 50; i++ {
+		r.Receive(p2p.Envelope{
+			ChannelID: ChunkChannel,
+			Src:       peer,
+			Message:   &ssproto.ChunkRequest{Height: 1000, Format: 3, Index: i},
+		})
+	}
+	if got := len(peer.chunkResponses()); got != 50 {
+		t.Fatalf("default (no rate limit) served %d, want 50", got)
+	}
+	perDrops, globDrops := r.RateDropped()
+	if perDrops != 0 || globDrops != 0 {
+		t.Fatalf("default should not produce any drops; got peer=%d global=%d", perDrops, globDrops)
+	}
+}
+
+func TestServing_DrainWinsOverRateLimit(t *testing.T) {
+	// When the reactor is both shutting down AND rate-limited, drain
+	// must win — a polite peer getting Missing=true refetches
+	// elsewhere immediately, whereas a rate-limited peer waits its
+	// own per-chunk timeout. Pin the order in code (drain check
+	// first) so a future refactor can't silently swap them.
+	prov := newFakeProvider(Snapshot{Height: 1000, Format: 3, Chunks: 1})
+	prov.chunks[chunkKey(1000, 3, 0)] = []byte{1}
+	r := newServingReactor(prov)
+	// Per-peer rate enabled with a tiny budget; we'd normally exhaust
+	// it on the very first request from this peer (burst=1, then
+	// 0.0001/s refill is effectively never). But drain wins.
+	r.SetChunkRateLimit(ChunkRateLimit{PerPeerRate: 0.0001, PerPeerBurst: 1})
+	r.BeginShutdown()
+
+	peer := newRecordingPeer("p")
+	// Two requests: in pure rate-limit mode the second would silent-
+	// drop; in pure drain mode both get Missing=true. Drain-wins
+	// expects both to come back as Missing=true.
+	for i := 0; i < 2; i++ {
+		r.Receive(p2p.Envelope{
+			ChannelID: ChunkChannel,
+			Src:       peer,
+			Message:   &ssproto.ChunkRequest{Height: 1000, Format: 3, Index: 0},
+		})
+	}
+	resps := peer.chunkResponses()
+	if len(resps) != 2 {
+		t.Fatalf("drain should produce a Missing response for both reqs; got %d", len(resps))
+	}
+	for i, r := range resps {
+		if !r.Missing {
+			t.Fatalf("response %d: want Missing=true (drain), got %+v", i, r)
+		}
+	}
+	if got := r.Drained(); got != 2 {
+		t.Fatalf("Drained() = %d, want 2 (both should hit the drain path)", got)
+	}
+	perDrops, globDrops := r.RateDropped()
+	if perDrops != 0 || globDrops != 0 {
+		t.Fatalf("rate-limit must NOT have fired during drain; got peer=%d global=%d",
+			perDrops, globDrops)
+	}
+}
+
+func TestServing_RateLimit_ExplicitZeroConfigIsDisabled(t *testing.T) {
+	// Pin: calling SetChunkRateLimit(ChunkRateLimit{}) is observably
+	// identical to never calling it. Same end state (no limiting), but
+	// a different code path through SetChunkRateLimit — make sure the
+	// "explicitly disabled" branch matches the "never set" branch.
+	prov := newFakeProvider(Snapshot{Height: 1000, Format: 3, Chunks: 50})
+	for i := uint32(0); i < 50; i++ {
+		prov.chunks[chunkKey(1000, 3, i)] = []byte{1}
+	}
+	r := newServingReactor(prov)
+	r.SetChunkRateLimit(ChunkRateLimit{}) // explicit-zero path
+
+	peer := newRecordingPeer("burst")
+	for i := uint32(0); i < 50; i++ {
+		r.Receive(p2p.Envelope{
+			ChannelID: ChunkChannel,
+			Src:       peer,
+			Message:   &ssproto.ChunkRequest{Height: 1000, Format: 3, Index: i},
+		})
+	}
+	if got := len(peer.chunkResponses()); got != 50 {
+		t.Fatalf("explicit-zero config should not rate-limit; served %d, want 50", got)
+	}
+	if pd, gd := r.RateDropped(); pd != 0 || gd != 0 {
+		t.Fatalf("explicit-zero config should record no drops; got peer=%d global=%d", pd, gd)
+	}
+}
+
+func TestServing_RateLimit_SecondSetCallIgnored(t *testing.T) {
+	// Single-call enforcement: a second SetChunkRateLimit must not
+	// mutate the existing limits (otherwise per-peer limiters created
+	// at the first rate would coexist with new peers at the second
+	// rate, an inconsistency that's easier to refuse than reconcile).
+	prov := newFakeProvider(Snapshot{Height: 1000, Format: 3, Chunks: 10})
+	for i := uint32(0); i < 10; i++ {
+		prov.chunks[chunkKey(1000, 3, i)] = []byte{1}
+	}
+	r := newServingReactor(prov)
+	r.SetChunkRateLimit(ChunkRateLimit{PerPeerRate: 0.0001, PerPeerBurst: 2})
+
+	// Second call attempts to disable rate limiting. Should be a
+	// no-op; existing limits stand.
+	r.SetChunkRateLimit(ChunkRateLimit{})
+
+	peer := newRecordingPeer("p")
+	for i := uint32(0); i < 5; i++ {
+		r.Receive(p2p.Envelope{
+			ChannelID: ChunkChannel,
+			Src:       peer,
+			Message:   &ssproto.ChunkRequest{Height: 1000, Format: 3, Index: i},
+		})
+	}
+	// First config was burst=2: 2 served, 3 dropped. If the second
+	// call had taken effect, all 5 would have been served.
+	if got := len(peer.chunkResponses()); got != 2 {
+		t.Fatalf("served %d, want 2 — second SetChunkRateLimit must not have replaced the first config", got)
+	}
+	if pd, _ := r.RateDropped(); pd != 3 {
+		t.Fatalf("dropped_rate_peer = %d, want 3 (3 over-burst requests)", pd)
+	}
+}
+
+func TestServing_RateLimit_RemovePeerEvictsLimiter(t *testing.T) {
+	// A long-running serve node sees thousands of peers come and
+	// go. Without eviction the sync.Map accumulates a limiter per
+	// historical peer.ID forever. Confirm RemovePeer clears it.
+	prov := newFakeProvider(Snapshot{Height: 1000, Format: 3, Chunks: 5})
+	prov.chunks[chunkKey(1000, 3, 0)] = []byte{1}
+	r := newServingReactor(prov)
+	r.SetChunkRateLimit(ChunkRateLimit{PerPeerRate: 4, PerPeerBurst: 8})
+
+	peer := newRecordingPeer("transient")
+	r.Receive(p2p.Envelope{
+		ChannelID: ChunkChannel,
+		Src:       peer,
+		Message:   &ssproto.ChunkRequest{Height: 1000, Format: 3, Index: 0},
+	})
+
+	// Limiter should exist after the first request.
+	if _, ok := r.peerLimiters.Load(peer.ID()); !ok {
+		t.Fatal("expected peer limiter to be created on first request")
+	}
+	// RemovePeer should evict it.
+	r.RemovePeer(peer, "test")
+	if _, ok := r.peerLimiters.Load(peer.ID()); ok {
+		t.Fatal("expected peer limiter to be evicted by RemovePeer")
+	}
+}
+
 func TestServing_NoProvider_RequestsSilent(t *testing.T) {
 	// Probe-only reactor (default): inbound requests must not panic and
 	// must not produce any wire responses.

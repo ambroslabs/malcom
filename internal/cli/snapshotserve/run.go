@@ -85,6 +85,10 @@ func Run(args []string) int {
 	rescanInterval := fs.Duration("rescan-interval", 0, "(with -snapshots) how often to rescan the root dir for new/removed snapshots. Default 30s; 0 disables periodic rescan (SIGHUP-only refresh).")
 
 	peerRedials := fs.Int("peer-redials", 0, "cap on consecutive disconnect/redial cycles before connect.Manager auto-bans a pinned peer for the run. 0 = unlimited (the serve default — a long-running daemon shouldn't permanently bench legitimate peers with intermittent connectivity). Pass a positive value to opt into the fetch-style cap.")
+	chunkRatePerPeer := fs.Float64("chunk-rate-per-peer", 4, "max sustained ChunkRequest per second from any one peer. 0 disables the per-peer bucket. See #85.")
+	chunkBurstPerPeer := fs.Int("chunk-burst-per-peer", 8, "max burst (token-bucket capacity) of ChunkRequest from any one peer.")
+	chunkRateGlobal := fs.Float64("chunk-rate-global", 16, "safety-net cap on total ChunkRequest per second across all peers (catches the many-peers-each-below-per-peer case). 0 disables.")
+	chunkBurstGlobal := fs.Int("chunk-burst-global", 32, "max burst (token-bucket capacity) of ChunkRequest across all peers.")
 	shutdownDrain := fs.Duration("shutdown-drain", 30*time.Second, "on SIGINT/SIGTERM, how long to fast-fail inbound ChunkRequest with Missing=true while in-flight ChunkResponse sends flush. 0 disables the drain (legacy behaviour: peers mid-transfer get torn off when the socket closes).")
 	persistInterval := fs.Duration("persist-interval", 5*time.Minute, "how often the addrbook + banlist are persisted to disk by a background goroutine. Without this, a crash/OOM/SIGKILL loses every PEX-learned peer since the last clean shutdown.")
 	verifyMode := fs.String("verify", "aggregate", "verify on startup: 'metadata' (cheap, no chunk reads), 'aggregate' (one read pass, checks SHA256 of concatenated chunks), or 'per-chunk' (one read pass, checks per-chunk hashes). Default 'aggregate'. In dir-watch mode, applied to every rescan.")
@@ -222,9 +226,13 @@ func Run(args []string) int {
 		// bench legitimate peers with intermittent connectivity over
 		// weeks of uptime. -peer-redials lets operators opt back into
 		// the fetch-style cap if they want it.
-		MaxRedials:      *peerRedials,
-		PersistInterval: *persistInterval,
-		ShutdownDrain:   *shutdownDrain,
+		MaxRedials:        *peerRedials,
+		PersistInterval:   *persistInterval,
+		ShutdownDrain:     *shutdownDrain,
+		ChunkRatePerPeer:  *chunkRatePerPeer,
+		ChunkBurstPerPeer: *chunkBurstPerPeer,
+		ChunkRateGlobal:   *chunkRateGlobal,
+		ChunkBurstGlobal:  *chunkBurstGlobal,
 	}
 
 	serveLog.Info("config", "path", cfg.Path())

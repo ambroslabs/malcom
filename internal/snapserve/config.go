@@ -112,6 +112,21 @@ type Config struct {
 	//
 	// Default 30s (set in applyDefaults). See #82.
 	ShutdownDrain time.Duration
+
+	// ChunkRatePerPeer / ChunkBurstPerPeer cap inbound ChunkRequest
+	// from any one peer.ID at a token-bucket rate. Defends against a
+	// single peer cycling through every chunk index as fast as the
+	// OS can read — cometbft's per-MConn SendRate bounds throughput
+	// but not request rate. See #85. 0 disables.
+	ChunkRatePerPeer  float64
+	ChunkBurstPerPeer int
+
+	// ChunkRateGlobal / ChunkBurstGlobal are the safety-net bucket
+	// applied *across all peers* (after each peer's bucket allows).
+	// Catches the case of many peers each below their per-peer cap
+	// but aggregating to more than we want to serve. 0 disables.
+	ChunkRateGlobal  float64
+	ChunkBurstGlobal int
 }
 
 func (c *Config) applyDefaults() {
