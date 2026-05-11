@@ -95,7 +95,7 @@ func TestLoadStore_HappyPath(t *testing.T) {
 		[]byte("hello world"),
 		[]byte("second chunk payload"),
 	})
-	store, err := LoadStore([]string{dir}, VerifyPerChunkHash, nil)
+	store, err := LoadStore([]string{dir}, "", VerifyPerChunkHash, nil)
 	if err != nil {
 		t.Fatalf("LoadStore: %v", err)
 	}
@@ -120,7 +120,7 @@ func TestLoadStore_MissingComplete(t *testing.T) {
 	if err := os.Remove(filepath.Join(dir, ".complete")); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := LoadStore([]string{dir}, VerifyMetadataOnly, nil); err == nil {
+	if _, err := LoadStore([]string{dir}, "", VerifyMetadataOnly, nil); err == nil {
 		t.Fatal("expected error for missing .complete")
 	}
 }
@@ -136,10 +136,10 @@ func TestLoadStore_TamperedChunkDetected(t *testing.T) {
 	); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := LoadStore([]string{dir}, VerifyAggregateHash, nil); err == nil {
+	if _, err := LoadStore([]string{dir}, "", VerifyAggregateHash, nil); err == nil {
 		t.Fatal("expected aggregate-hash verify to detect tamper")
 	}
-	if _, err := LoadStore([]string{dir}, VerifyPerChunkHash, nil); err == nil {
+	if _, err := LoadStore([]string{dir}, "", VerifyPerChunkHash, nil); err == nil {
 		t.Fatal("expected per-chunk verify to detect tamper")
 	}
 }
@@ -147,14 +147,14 @@ func TestLoadStore_TamperedChunkDetected(t *testing.T) {
 func TestLoadStore_DuplicateHeightFormatRejected(t *testing.T) {
 	dir1 := makeSnapshotDir(t, [][]byte{[]byte("a"), []byte("b")})
 	dir2 := makeSnapshotDir(t, [][]byte{[]byte("c")})
-	if _, err := LoadStore([]string{dir1, dir2}, VerifyMetadataOnly, nil); err == nil {
+	if _, err := LoadStore([]string{dir1, dir2}, "", VerifyMetadataOnly, nil); err == nil {
 		t.Fatal("expected duplicate (height,format) error")
 	}
 }
 
 func TestLoadChunk_OutOfRange(t *testing.T) {
 	dir := makeSnapshotDir(t, [][]byte{[]byte("only one")})
-	store, err := LoadStore([]string{dir}, VerifyPerChunkHash, nil)
+	store, err := LoadStore([]string{dir}, "", VerifyPerChunkHash, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -169,7 +169,7 @@ func TestLoadChunk_OutOfRange(t *testing.T) {
 
 func TestLoadChunk_UnknownSnapshot(t *testing.T) {
 	dir := makeSnapshotDir(t, [][]byte{[]byte("x")})
-	store, _ := LoadStore([]string{dir}, VerifyPerChunkHash, nil)
+	store, _ := LoadStore([]string{dir}, "", VerifyPerChunkHash, nil)
 	_, found, err := store.LoadChunk(99999, 3, 0)
 	if err != nil || found {
 		t.Fatalf("unknown (height,format) should be not-found, no error; got found=%v err=%v", found, err)

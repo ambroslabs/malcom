@@ -1,0 +1,71 @@
+[Unit]
+Description=malcom snapshot serve (%i)
+Documentation=https://github.com/ambroslabs/malcom
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+
+# The instance suffix (%i) is the chain id — `systemctl enable
+# malcom-snapshot-serve@cosmoshub-4` runs this with -chain cosmoshub-4.
+# The default snapshot pool lives under StateDirectory below; operators
+# who want to point at a larger volume (NVMe array, network FS, etc.)
+# should `systemctl edit malcom-snapshot-serve@<chain>` to override
+# ExecStart with their path.
+ExecStart=/usr/local/bin/malcom snapshot serve \
+  -chain %i \
+  -snapshots /var/lib/malcom/snapshots-pool \
+  -log text
+ExecReload=/bin/kill -HUP $MAINPID
+
+Restart=on-failure
+RestartSec=5s
+KillSignal=SIGTERM
+# Generous stop budget so a future graceful-drain shutdown
+# (issue #82) has time to finish in-flight chunk sends. Today's
+# sw.Stop cap is 1s, so this is forward-looking headroom.
+TimeoutStopSec=30s
+
+# Systemd-managed per-service directories. With DynamicUser=yes the
+# real on-disk location is /var/lib/private/malcom etc.; the service
+# sees /var/lib/malcom via a bind mount. malcom's own path resolution
+# layers $XDG_*_HOME/malcom on top, so:
+#   XDG_STATE_HOME=/var/lib  →  state at /var/lib/malcom/<chain>/...
+#   XDG_CONFIG_HOME=/etc      →  config at /etc/malcom/...
+#   XDG_CACHE_HOME=/var/cache →  cache at /var/cache/malcom/<chain>/...
+# Matches what StateDirectory=malcom / ConfigurationDirectory=malcom /
+# CacheDirectory=malcom create.
+StateDirectory=malcom
+ConfigurationDirectory=malcom
+CacheDirectory=malcom
+Environment=XDG_STATE_HOME=%S
+Environment=XDG_CONFIG_HOME=%E
+Environment=XDG_CACHE_HOME=%C
+
+# Ephemeral UID — no `useradd malcom` step. State persists across
+# restarts via systemd's /var/lib/private/ indirection.
+DynamicUser=yes
+
+# Hardening — see systemd.exec(5). Operators who hit a permission
+# wall can relax individual directives via `systemctl edit`.
+NoNewPrivileges=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectSystem=strict
+ProtectHome=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+SystemCallArchitectures=native
+
+[Install]
+WantedBy=multi-user.target
