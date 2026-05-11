@@ -276,8 +276,14 @@ func RunServe(ctx context.Context, c Config) error {
 		// is just a fixed window. cometbft's send rate cap is 10 MiB/s
 		// per peer, so 30s drains ~300 MiB per peer — comfortably
 		// above one chunk (10 MiB).
+		// Always put the reactor into drain mode — fast-failing new
+		// inbound ChunkRequest with Missing=true is cheap (one
+		// atomic.Store + no provider lookup) and helpful for peer
+		// UX regardless of how long we wait before closing sockets.
+		// The Sleep below is the only thing the operator can opt
+		// out of with -shutdown-drain 0.
+		ssR.BeginShutdown()
 		if c.ShutdownDrain > 0 {
-			ssR.BeginShutdown()
 			log.Info("draining in-flight chunks", "budget", c.ShutdownDrain)
 			time.Sleep(c.ShutdownDrain)
 			log.Info("drain window elapsed",

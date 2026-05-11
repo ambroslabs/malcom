@@ -138,12 +138,13 @@ func (c *Config) applyDefaults() {
 	}
 	// MaxRedials intentionally has no default — 0 means unlimited at
 	// the connect.Manager level, which is what serve wants. See #80.
-	if c.PersistInterval == 0 {
-		c.PersistInterval = 5 * time.Minute
-	}
-	if c.ShutdownDrain == 0 {
-		c.ShutdownDrain = 30 * time.Second
-	}
+	//
+	// PersistInterval and ShutdownDrain are deliberately *not*
+	// defaulted here: 0 means "off" for both (no periodic persist,
+	// no drain wait). The CLI supplies sensible non-zero defaults
+	// at the flag layer, so library callers passing 0 get 0 — which
+	// is what the -shutdown-drain 0 help text promises and what
+	// dev workflows asking for fast restart actually want.
 	if c.MaxOutboundPeers == 0 {
 		// Lower than fetch (64). A serve node doesn't need a wide
 		// outbound mesh — its job is to be reachable, and PEX
