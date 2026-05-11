@@ -1,6 +1,6 @@
 module github.com/zrbecker/cosmos-p2p
 
-go 1.23.4
+go 1.25.7
 
 require (
 	github.com/BurntSushi/toml v1.6.0
