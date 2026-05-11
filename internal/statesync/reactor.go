@@ -13,6 +13,7 @@
 package statesync
 
 import (
+	"sync"
 	"sync/atomic"
 
 	"github.com/cometbft/cometbft/libs/log"
@@ -20,6 +21,7 @@ import (
 	"github.com/cometbft/cometbft/p2p/conn"
 	ssproto "github.com/cometbft/cometbft/proto/tendermint/statesync"
 	"github.com/cosmos/gogoproto/proto"
+	"golang.org/x/time/rate"
 )
 
 const (
@@ -122,15 +124,55 @@ type Reactor struct {
 	// want to advertise during drain.
 	shuttingDown atomic.Bool
 
+	// Rate-limit state. peerLimiters is a per-peer.ID token bucket
+	// installed by SetChunkRateLimit; sync.Map's LoadOrStore handles
+	// the get-or-create race when two ChunkRequests for the same
+	// fresh peer race into the hot path. globalLim is a single
+	// reactor-wide bucket. Both are nil-equivalent (no globalLim,
+	// peerLimiters empty + chunkRatePerPeer/Burst zeroed) by default
+	// — the fetch-side reactor never calls SetChunkRateLimit, so
+	// neither bucket fires and Receive doesn't even cross the limiter
+	// branch.
+	globalLim         *rate.Limiter
+	peerLimiters      sync.Map
+	chunkRatePerPeer  rate.Limit
+	chunkBurstPerPeer int
+
 	bytesRecv  atomic.Int64
 	bytesSent  atomic.Int64
 	dropsCtrl  atomic.Int64
 	dropsChunk atomic.Int64
 
-	snapshotsServed atomic.Int64
-	chunksServed    atomic.Int64
-	chunksMissing   atomic.Int64
-	chunksDrained   atomic.Int64
+	snapshotsServed   atomic.Int64
+	chunksServed      atomic.Int64
+	chunksMissing     atomic.Int64
+	chunksDrained     atomic.Int64
+	droppedRatePeer   atomic.Int64
+	droppedRateGlobal atomic.Int64
+}
+
+// ChunkRateLimit configures the inbound ChunkRequest rate limiter.
+// Both buckets are independent and additive: a request must pass
+// both to be served. Set rates/bursts to 0 to disable the
+// corresponding bucket.
+//
+// Per-peer protects against a single peer hammering us with chunk
+// requests; global is the safety net against many peers each below
+// their per-peer cap but aggregating to more than we want to serve.
+// See issue #85 for the threat model.
+type ChunkRateLimit struct {
+	// PerPeerRate is the steady-state requests-per-second allowed
+	// from any one peer.ID. Zero disables the per-peer bucket.
+	PerPeerRate float64
+	// PerPeerBurst is the maximum burst (tokens at full bucket) per
+	// peer.ID. Must be ≥ 1 when PerPeerRate > 0.
+	PerPeerBurst int
+	// GlobalRate is the steady-state requests-per-second allowed
+	// across all peers. Zero disables the global bucket.
+	GlobalRate float64
+	// GlobalBurst is the maximum burst across all peers. Must be
+	// ≥ 1 when GlobalRate > 0.
+	GlobalBurst int
 }
 
 // providerSlot wraps SnapshotProvider so we can store it in an
@@ -187,6 +229,48 @@ func (r *Reactor) loadProvider() SnapshotProvider {
 // pester peers for their snapshots when we have nothing to do with
 // them.
 func (r *Reactor) SetProbe(probe bool) { r.probe = probe }
+
+// SetChunkRateLimit installs token-bucket limits on inbound
+// ChunkRequest. Must be called before sw.Start — rate parameters
+// aren't safe to mutate while Receive is hot (the per-peer limiter
+// map's entries cache the values at create time).
+//
+// A bucket with rate ≤ 0 or burst ≤ 0 is treated as disabled. The
+// zero-value ChunkRateLimit{} is equivalent to "no rate limiting" —
+// matches the default fetch-mode reactor behaviour (no SetChunkRateLimit
+// call, both buckets nil).
+func (r *Reactor) SetChunkRateLimit(c ChunkRateLimit) {
+	if c.PerPeerRate > 0 && c.PerPeerBurst > 0 {
+		r.chunkRatePerPeer = rate.Limit(c.PerPeerRate)
+		r.chunkBurstPerPeer = c.PerPeerBurst
+	} else {
+		r.chunkRatePerPeer = 0
+		r.chunkBurstPerPeer = 0
+	}
+	if c.GlobalRate > 0 && c.GlobalBurst > 0 {
+		r.globalLim = rate.NewLimiter(rate.Limit(c.GlobalRate), c.GlobalBurst)
+	} else {
+		r.globalLim = nil
+	}
+}
+
+// peerLimiter returns the per-peer.ID rate limiter, creating one on
+// first use. sync.Map.LoadOrStore makes the get-or-create atomic
+// under concurrent first-touch from the same peer (two goroutines
+// race to LoadOrStore; whichever stores first wins, the other's
+// freshly-allocated limiter is GC'd). Returns nil when per-peer
+// rate limiting is disabled.
+func (r *Reactor) peerLimiter(id p2p.ID) *rate.Limiter {
+	if r.chunkRatePerPeer <= 0 || r.chunkBurstPerPeer <= 0 {
+		return nil
+	}
+	if v, ok := r.peerLimiters.Load(id); ok {
+		return v.(*rate.Limiter)
+	}
+	fresh := rate.NewLimiter(r.chunkRatePerPeer, r.chunkBurstPerPeer)
+	actual, _ := r.peerLimiters.LoadOrStore(id, fresh)
+	return actual.(*rate.Limiter)
+}
 
 // BeginShutdown puts the reactor into drain mode: subsequent
 // ChunkRequest messages are fast-failed with Missing=true (counted in
@@ -253,6 +337,9 @@ func (r *Reactor) AddPeer(peer p2p.Peer) {
 
 // RemovePeer publishes a Removed event so consumers can clean up
 // per-peer state (drop in-flight assignments, drop firstSeen, etc.).
+// Also evicts any per-peer rate limiter installed for this ID so a
+// long-running server doesn't accumulate a limiter-per-historical-
+// peer in memory.
 func (r *Reactor) RemovePeer(peer p2p.Peer, reason interface{}) {
 	peerID := string(peer.ID())
 	select {
@@ -261,6 +348,7 @@ func (r *Reactor) RemovePeer(peer p2p.Peer, reason interface{}) {
 		r.dropsCtrl.Add(1)
 		r.logger.Error("disconnect Out channel full; dropping", "peer", peerID)
 	}
+	r.peerLimiters.Delete(peer.ID())
 }
 
 // RequestChunk dispatches a ChunkRequest for (height, format, index) to peer.
@@ -356,6 +444,12 @@ func (r *Reactor) Receive(env p2p.Envelope) {
 		// elsewhere. Tracked under chunksDrained (separate counter)
 		// so operators can spot "requests during drain" without it
 		// muddying the steady-state chunksMissing metric.
+		//
+		// Drain wins over rate-limit because drain is cooperative
+		// (Missing → peer refetches elsewhere immediately) while
+		// rate-limit is silent (peer waits its own per-chunk
+		// timeout). We'd rather signal "go elsewhere, we're done"
+		// to a polite peer than drop their request on the floor.
 		if r.shuttingDown.Load() {
 			resp := &ssproto.ChunkResponse{
 				Height:  m.Height,
@@ -372,6 +466,28 @@ func (r *Reactor) Receive(env p2p.Envelope) {
 			}
 			return
 		}
+
+		// Rate limit (#85). Two-bucket guard, global first (cheap —
+		// single shared limiter, no map lookup), then per-peer
+		// (sync.Map get-or-create). Denials drop the request
+		// *silently* — no Missing response — so the peer's own
+		// pipelining backoff sees the throttle as a timeout rather
+		// than a "try a different index". A Missing response would
+		// tell an abusive peer to immediately ask for a different
+		// chunk, defeating the bucket.
+		if r.globalLim != nil && !r.globalLim.Allow() {
+			r.droppedRateGlobal.Add(1)
+			r.logger.Debug("ChunkRequest dropped: global rate limit",
+				"peer", peerID, "height", m.Height, "format", m.Format, "index", m.Index)
+			return
+		}
+		if peerLim := r.peerLimiter(env.Src.ID()); peerLim != nil && !peerLim.Allow() {
+			r.droppedRatePeer.Add(1)
+			r.logger.Debug("ChunkRequest dropped: per-peer rate limit",
+				"peer", peerID, "height", m.Height, "format", m.Format, "index", m.Index)
+			return
+		}
+
 		data, found, err := prov.LoadChunk(m.Height, m.Format, m.Index)
 		if err != nil {
 			// Treat read errors as Missing on the wire so requesters
@@ -424,6 +540,16 @@ func (r *Reactor) Served() (snapshots, chunks, missing int64) {
 // from chunksMissing so steady-state misses (chunk index out of
 // range, read errors) don't conflate with drain-window activity.
 func (r *Reactor) Drained() int64 { return r.chunksDrained.Load() }
+
+// RateDropped returns the per-bucket count of inbound ChunkRequest
+// messages dropped silently because they exceeded the configured
+// rate limits (#85). Bucketed separately so an operator can tell
+// "a single peer is hammering us" (peer) from "we're saturated
+// overall" (global). Returns (0, 0) when rate limiting is disabled
+// (the fetch-mode reactor case).
+func (r *Reactor) RateDropped() (perPeer, global int64) {
+	return r.droppedRatePeer.Load(), r.droppedRateGlobal.Load()
+}
 
 // Bytes returns recv/sent byte counters across both channels.
 func (r *Reactor) Bytes() (recv, sent int64) {

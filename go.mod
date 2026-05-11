@@ -5,6 +5,7 @@ go 1.25.7
 require (
 	github.com/BurntSushi/toml v1.6.0
 	github.com/cometbft/cometbft v0.38.22
+	golang.org/x/time v0.3.0
 )
 
 require github.com/minio/highwayhash v1.0.4 // indirect

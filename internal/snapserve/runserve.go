@@ -169,6 +169,17 @@ func RunServe(ctx context.Context, c Config) error {
 	ssR := statesync.NewReactor(malcomlog.CmtShim(log.With("module", "statesync")))
 	ssR.SetProvider(initialStore)
 	ssR.SetProbe(false) // serve mode: don't pester peers for their snapshots
+	ssR.SetChunkRateLimit(statesync.ChunkRateLimit{
+		PerPeerRate:  c.ChunkRatePerPeer,
+		PerPeerBurst: c.ChunkBurstPerPeer,
+		GlobalRate:   c.ChunkRateGlobal,
+		GlobalBurst:  c.ChunkBurstGlobal,
+	})
+	log.Info("chunk-request rate limits",
+		"per_peer_rate", c.ChunkRatePerPeer,
+		"per_peer_burst", c.ChunkBurstPerPeer,
+		"global_rate", c.ChunkRateGlobal,
+		"global_burst", c.ChunkBurstGlobal)
 
 	book, err := addrbook.NewAddrBook(c.AddrBook, malcomlog.CmtShim(log.With("module", "addrbook")))
 	if err != nil {
@@ -335,6 +346,7 @@ func RunServe(ctx context.Context, c Config) error {
 		case <-stats.C:
 			snapshots, chunks, missing := ssR.Served()
 			recv, sent := ssR.Bytes()
+			dropPeer, dropGlobal := ssR.RateDropped()
 			out, in, dialing := sw.NumPeers()
 			log.Info("stats",
 				"peers_out", out, "peers_in", in, "dialing", dialing,
@@ -342,6 +354,8 @@ func RunServe(ctx context.Context, c Config) error {
 				"chunks_served", chunks,
 				"chunks_missing", missing,
 				"chunks_drained", ssR.Drained(),
+				"dropped_rate_peer", dropPeer,
+				"dropped_rate_global", dropGlobal,
 				"bytes_recv", recv,
 				"bytes_sent", sent)
 		}
