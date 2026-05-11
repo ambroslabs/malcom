@@ -72,6 +72,14 @@ func RunServe(ctx context.Context, c Config) error {
 		return err
 	}
 
+	// One-shot warning at startup if integrity verification is off.
+	// Lives here (not inside loadOne) so it doesn't fire per-snapshot
+	// per-rescan in dir-watch mode.
+	if c.VerifyMode == VerifyMetadataOnly {
+		log.Warn("metadata-only verify; chunk integrity not checked",
+			"hint", "set -verify=aggregate or -verify=per-chunk to re-hash on startup")
+	}
+
 	var (
 		initialStore *Store
 		catalog      *Catalog
@@ -226,16 +234,17 @@ func RunServe(ctx context.Context, c Config) error {
 	// construction) so we can capture ssR after sw.Start without
 	// hoisting Catalog handling above the p2p setup.
 	if catalog != nil {
-		catalog.cfg.OnStore = func(s *Store) {
+		// Wire the reactor hand-off via SetOnStore (atomic.Pointer
+		// underneath), so the loop goroutine and this setup goroutine
+		// never share a plain field. We've already done an initial
+		// Rescan synchronously above (so the reactor's initialStore
+		// is non-nil before sw.Start); the loop just runs the
+		// periodic + trigger cycle.
+		catalog.SetOnStore(func(s *Store) {
 			ssR.SetProvider(s)
 			log.Info("reactor catalogue swapped",
 				"snapshots", s.Len(), "summary", s.Describe())
-		}
-		// We've already done an initial Rescan synchronously above
-		// (so the reactor's initialStore is non-nil before sw.Start);
-		// the loop goroutine just runs the periodic + trigger cycle.
-		// Catalog.Start would re-run the initial Rescan, which is
-		// redundant — go straight to the loop.
+		})
 		go catalog.loop(ctx)
 		defer catalog.Stop()
 		if c.OnReloader != nil {

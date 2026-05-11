@@ -6,8 +6,10 @@ import (
 	"encoding/hex"
 	"log/slog"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -53,62 +55,81 @@ func (c *CatalogConfig) defaults() {
 // Catalog owns the dir-scan rescan loop. It periodically calls
 // LoadStoreFromRoot, compares the result to its last-known catalogue
 // fingerprint, and (when something changed) emits the new Store via
-// OnStore. Trigger() forces an immediate rescan from any goroutine —
-// hook it to SIGHUP at the CLI layer.
+// the OnStore hook set with SetOnStore. Trigger() forces an immediate
+// rescan from any goroutine — hook it to SIGHUP at the CLI layer.
 //
-// Concurrency: Current() and Trigger() are safe to call from any
-// goroutine. Start launches a single background goroutine; Stop ends
-// it.
+// Concurrency: Current(), Trigger(), Stop(), and SetOnStore() are all
+// safe to call from any goroutine. The loop runs as a single
+// background goroutine.
 type Catalog struct {
 	cfg CatalogConfig
 	log *slog.Logger
 
-	mu      sync.RWMutex
-	store   *Store
-	fingerp string // catalogue fingerprint for change detection
+	// store is the most recently emitted catalogue. Held in an
+	// atomic.Pointer so Current() reads are lock-free and align with
+	// statesync.Reactor's provider-swap pattern.
+	store atomic.Pointer[Store]
 
-	trigger chan struct{}
-	done    chan struct{}
+	// onStore is swapped lock-free so the CLI can wire the reactor
+	// hand-off after NewCatalog returns without racing the loop.
+	onStore atomic.Pointer[onStoreSlot]
+
+	// rescanMu serialises Rescan calls (so two concurrent triggers
+	// don't both walk the dir at once) and guards fingerp. Reads of
+	// store don't take this lock — they use the atomic.Pointer above.
+	rescanMu sync.Mutex
+	fingerp  string // catalogue fingerprint for change detection
+
+	trigger  chan struct{}
+	stopOnce sync.Once
+	done     chan struct{}
 }
 
+// onStoreSlot wraps the OnStore callback so atomic.Pointer can hold
+// it (atomic.Pointer needs a concrete type).
+type onStoreSlot struct{ fn func(*Store) }
+
 // NewCatalog constructs a Catalog. It does not start the rescan loop
-// — call Start, or call Rescan once manually if you don't want a
-// background goroutine.
+// — call Rescan once manually for the initial scan, then launch the
+// loop via the unexported loop method (RunServe pattern), or do both
+// in one shot with the typical scan + go pattern.
 func NewCatalog(cfg CatalogConfig) *Catalog {
 	cfg.defaults()
 	log := cfg.Logger
 	if log == nil {
 		log = slog.Default()
 	}
-	return &Catalog{
+	c := &Catalog{
 		cfg:     cfg,
 		log:     log,
 		trigger: make(chan struct{}, 1),
 		done:    make(chan struct{}),
 	}
-}
-
-// Start runs the rescan loop on a new goroutine. Returns after firing
-// an initial synchronous scan so the caller sees a populated Current()
-// (or a hard error from the root dir) before serving begins.
-func (c *Catalog) Start(ctx context.Context) error {
-	// Initial scan is synchronous and fatal-on-error: a missing
-	// rootDir is operator misconfig and we want the server to fail
-	// loudly rather than serving zero snapshots.
-	if err := c.Rescan(ctx); err != nil {
-		return err
+	if cfg.OnStore != nil {
+		c.onStore.Store(&onStoreSlot{fn: cfg.OnStore})
 	}
-	go c.loop(ctx)
-	return nil
+	return c
 }
 
-// Stop shuts down the rescan loop. Safe to call multiple times.
+// SetOnStore installs (or replaces) the callback invoked after every
+// successful, *changed* rescan. Safe to call before or after the loop
+// goroutine has started; pass nil to clear.
+//
+// The CLI uses this to wire the reactor hand-off after RunServe has
+// constructed both the catalog and the reactor — they have an init
+// ordering that NewCatalog alone can't satisfy.
+func (c *Catalog) SetOnStore(fn func(*Store)) {
+	if fn == nil {
+		c.onStore.Store(nil)
+		return
+	}
+	c.onStore.Store(&onStoreSlot{fn: fn})
+}
+
+// Stop shuts down the rescan loop. Safe to call multiple times and
+// from multiple goroutines — the close fires at most once.
 func (c *Catalog) Stop() {
-	select {
-	case <-c.done:
-	default:
-		close(c.done)
-	}
+	c.stopOnce.Do(func() { close(c.done) })
 }
 
 // Trigger requests an immediate rescan. Non-blocking — if a scan is
@@ -120,18 +141,17 @@ func (c *Catalog) Trigger() {
 	}
 }
 
-// Current returns the latest Store. Returns nil only before the
-// initial Rescan; once Start has returned successfully, Current is
+// Current returns the latest Store. Returns nil only before the first
+// Rescan completes; once Rescan has returned successfully, Current is
 // always non-nil (an empty rootDir yields an empty store, not nil).
 func (c *Catalog) Current() *Store {
-	c.mu.RLock()
-	defer c.mu.RUnlock()
-	return c.store
+	return c.store.Load()
 }
 
 // Rescan does one synchronous scan + diff + emit pass. Exposed for
 // tests and for the initial sync at startup. Concurrent Rescan calls
-// serialize through the same mutex; that's fine, scans are quick.
+// serialise through rescanMu; scans are quick (file I/O on a small
+// set of dirs).
 func (c *Catalog) Rescan(ctx context.Context) error {
 	t0 := time.Now()
 	store, err := LoadStoreFromRoot(c.cfg.RootDir, c.cfg.ChainID, c.cfg.VerifyMode, c.log)
@@ -140,19 +160,19 @@ func (c *Catalog) Rescan(ctx context.Context) error {
 	}
 	fp := storeFingerprint(store)
 
-	c.mu.Lock()
+	c.rescanMu.Lock()
 	changed := fp != c.fingerp
-	c.store = store
 	c.fingerp = fp
-	c.mu.Unlock()
+	c.rescanMu.Unlock()
+	c.store.Store(store)
 
 	if changed {
 		c.log.Info("catalog updated",
 			"snapshots", store.Len(),
 			"summary", store.Describe(),
 			"elapsed", time.Since(t0).Truncate(time.Millisecond))
-		if c.cfg.OnStore != nil {
-			c.cfg.OnStore(store)
+		if slot := c.onStore.Load(); slot != nil {
+			slot.fn(store)
 		}
 	} else {
 		c.log.Debug("catalog unchanged",
@@ -211,28 +231,13 @@ func storeFingerprint(s *Store) string {
 	for i, ls := range s.snapshots {
 		// Caller already verified hash matches metadata; hash is
 		// enough to identify the snapshot content uniquely.
-		keys[i] = ls.ChainID + "/" + uintToString(ls.Height) + "/" +
-			uintToString(uint64(ls.Format)) + "/" + uintToString(uint64(ls.Chunks)) +
-			"/" + hex.EncodeToString(ls.Hash)
+		keys[i] = ls.ChainID + "/" +
+			strconv.FormatUint(ls.Height, 10) + "/" +
+			strconv.FormatUint(uint64(ls.Format), 10) + "/" +
+			strconv.FormatUint(uint64(ls.Chunks), 10) + "/" +
+			hex.EncodeToString(ls.Hash)
 	}
 	sort.Strings(keys)
 	h := sha256.Sum256([]byte(strings.Join(keys, "|")))
 	return hex.EncodeToString(h[:8])
-}
-
-func uintToString(v uint64) string {
-	// Tiny zero-alloc itoa-ish helper for fingerprint hashing.
-	// strconv.FormatUint is fine too; this exists to avoid pulling
-	// strconv into the import list for one call site.
-	if v == 0 {
-		return "0"
-	}
-	var b [20]byte
-	pos := len(b)
-	for v > 0 {
-		pos--
-		b[pos] = byte('0' + v%10)
-		v /= 10
-	}
-	return string(b[pos:])
 }

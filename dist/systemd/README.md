@@ -18,14 +18,25 @@ sudo install -m 0755 ./build/malcom /usr/local/bin/malcom
 sudo install -m 0644 dist/systemd/malcom-snapshot-serve@.service \
   /etc/systemd/system/
 
-# 3. malcom config (one-time, run as yourself to seed defaults)
-sudo malcom init                          # writes /etc/malcom/config.toml
-sudo malcom add cosmoshub-4               # writes /etc/malcom/chains/cosmoshub-4.toml
+# 3. malcom config (one-time). The unit sets XDG_CONFIG_HOME=/etc, so
+#    init+add need the same env to write to the path the service will
+#    read from — without it, sudo's malcom writes to /root/.config/
+#    instead and the service can't find the chain.
+sudo XDG_CONFIG_HOME=/etc malcom init               # writes /etc/malcom/config.toml
+sudo XDG_CONFIG_HOME=/etc malcom add cosmoshub-4    # writes /etc/malcom/chains/cosmoshub-4.toml
 
 # 4. enable + start
 sudo systemctl daemon-reload
 sudo systemctl enable --now malcom-snapshot-serve@cosmoshub-4
 ```
+
+> **Why the explicit `XDG_CONFIG_HOME=/etc`?** systemd's
+> `ConfigurationDirectory=malcom` creates `/etc/malcom` for the
+> service, and the unit sets `XDG_CONFIG_HOME=/etc` so malcom reads
+> from there. But `sudo` runs `malcom init` / `add` under root's
+> environment, which has `XDG_CONFIG_HOME=$HOME/.config` (`/root/.config`
+> typically) — different path. Setting the env var on the command line
+> aligns the two.
 
 `systemctl status malcom-snapshot-serve@cosmoshub-4` shows the
 running instance; `journalctl -fu malcom-snapshot-serve@cosmoshub-4`

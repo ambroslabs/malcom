@@ -307,10 +307,12 @@ func loadOne(dir string, mode VerifyMode, logger *slog.Logger) (loadedSnapshot, 
 		if err := verifyChunks(dir, meta.Chunks, expectedHash, chunkHashes, mode); err != nil {
 			return zero, err
 		}
-	} else if logger != nil {
-		logger.Warn("metadata-only verify; chunk integrity not checked",
-			"dir", dir, "hint", "set -verify=aggregate or -verify=per-chunk to re-hash on startup")
 	}
+	// The metadata-only warning used to live here, firing once per
+	// snapshot per scan — fine in static mode (one scan ever), but in
+	// dir-watch mode that's N×rescan-rate per hour of identical log
+	// lines. The warning now lives at the catalog / RunServe layer
+	// where it fires once at startup.
 
 	return loadedSnapshot{
 		Dir:      dir,
