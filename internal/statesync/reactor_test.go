@@ -457,6 +457,113 @@ func TestServing_RateLimit_DisabledByDefault(t *testing.T) {
 	}
 }
 
+func TestServing_DrainWinsOverRateLimit(t *testing.T) {
+	// When the reactor is both shutting down AND rate-limited, drain
+	// must win — a polite peer getting Missing=true refetches
+	// elsewhere immediately, whereas a rate-limited peer waits its
+	// own per-chunk timeout. Pin the order in code (drain check
+	// first) so a future refactor can't silently swap them.
+	prov := newFakeProvider(Snapshot{Height: 1000, Format: 3, Chunks: 1})
+	prov.chunks[chunkKey(1000, 3, 0)] = []byte{1}
+	r := newServingReactor(prov)
+	// Per-peer rate enabled with a tiny budget; we'd normally exhaust
+	// it on the very first request from this peer (burst=1, then
+	// 0.0001/s refill is effectively never). But drain wins.
+	r.SetChunkRateLimit(ChunkRateLimit{PerPeerRate: 0.0001, PerPeerBurst: 1})
+	r.BeginShutdown()
+
+	peer := newRecordingPeer("p")
+	// Two requests: in pure rate-limit mode the second would silent-
+	// drop; in pure drain mode both get Missing=true. Drain-wins
+	// expects both to come back as Missing=true.
+	for i := 0; i < 2; i++ {
+		r.Receive(p2p.Envelope{
+			ChannelID: ChunkChannel,
+			Src:       peer,
+			Message:   &ssproto.ChunkRequest{Height: 1000, Format: 3, Index: 0},
+		})
+	}
+	resps := peer.chunkResponses()
+	if len(resps) != 2 {
+		t.Fatalf("drain should produce a Missing response for both reqs; got %d", len(resps))
+	}
+	for i, r := range resps {
+		if !r.Missing {
+			t.Fatalf("response %d: want Missing=true (drain), got %+v", i, r)
+		}
+	}
+	if got := r.Drained(); got != 2 {
+		t.Fatalf("Drained() = %d, want 2 (both should hit the drain path)", got)
+	}
+	perDrops, globDrops := r.RateDropped()
+	if perDrops != 0 || globDrops != 0 {
+		t.Fatalf("rate-limit must NOT have fired during drain; got peer=%d global=%d",
+			perDrops, globDrops)
+	}
+}
+
+func TestServing_RateLimit_ExplicitZeroConfigIsDisabled(t *testing.T) {
+	// Pin: calling SetChunkRateLimit(ChunkRateLimit{}) is observably
+	// identical to never calling it. Same end state (no limiting), but
+	// a different code path through SetChunkRateLimit — make sure the
+	// "explicitly disabled" branch matches the "never set" branch.
+	prov := newFakeProvider(Snapshot{Height: 1000, Format: 3, Chunks: 50})
+	for i := uint32(0); i < 50; i++ {
+		prov.chunks[chunkKey(1000, 3, i)] = []byte{1}
+	}
+	r := newServingReactor(prov)
+	r.SetChunkRateLimit(ChunkRateLimit{}) // explicit-zero path
+
+	peer := newRecordingPeer("burst")
+	for i := uint32(0); i < 50; i++ {
+		r.Receive(p2p.Envelope{
+			ChannelID: ChunkChannel,
+			Src:       peer,
+			Message:   &ssproto.ChunkRequest{Height: 1000, Format: 3, Index: i},
+		})
+	}
+	if got := len(peer.chunkResponses()); got != 50 {
+		t.Fatalf("explicit-zero config should not rate-limit; served %d, want 50", got)
+	}
+	if pd, gd := r.RateDropped(); pd != 0 || gd != 0 {
+		t.Fatalf("explicit-zero config should record no drops; got peer=%d global=%d", pd, gd)
+	}
+}
+
+func TestServing_RateLimit_SecondSetCallIgnored(t *testing.T) {
+	// Single-call enforcement: a second SetChunkRateLimit must not
+	// mutate the existing limits (otherwise per-peer limiters created
+	// at the first rate would coexist with new peers at the second
+	// rate, an inconsistency that's easier to refuse than reconcile).
+	prov := newFakeProvider(Snapshot{Height: 1000, Format: 3, Chunks: 10})
+	for i := uint32(0); i < 10; i++ {
+		prov.chunks[chunkKey(1000, 3, i)] = []byte{1}
+	}
+	r := newServingReactor(prov)
+	r.SetChunkRateLimit(ChunkRateLimit{PerPeerRate: 0.0001, PerPeerBurst: 2})
+
+	// Second call attempts to disable rate limiting. Should be a
+	// no-op; existing limits stand.
+	r.SetChunkRateLimit(ChunkRateLimit{})
+
+	peer := newRecordingPeer("p")
+	for i := uint32(0); i < 5; i++ {
+		r.Receive(p2p.Envelope{
+			ChannelID: ChunkChannel,
+			Src:       peer,
+			Message:   &ssproto.ChunkRequest{Height: 1000, Format: 3, Index: i},
+		})
+	}
+	// First config was burst=2: 2 served, 3 dropped. If the second
+	// call had taken effect, all 5 would have been served.
+	if got := len(peer.chunkResponses()); got != 2 {
+		t.Fatalf("served %d, want 2 — second SetChunkRateLimit must not have replaced the first config", got)
+	}
+	if pd, _ := r.RateDropped(); pd != 3 {
+		t.Fatalf("dropped_rate_peer = %d, want 3 (3 over-burst requests)", pd)
+	}
+}
+
 func TestServing_RateLimit_RemovePeerEvictsLimiter(t *testing.T) {
 	// A long-running serve node sees thousands of peers come and
 	// go. Without eviction the sync.Map accumulates a limiter per

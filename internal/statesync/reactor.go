@@ -138,6 +138,19 @@ type Reactor struct {
 	chunkRatePerPeer  rate.Limit
 	chunkBurstPerPeer int
 
+	// setRateCalled is the single-call guard for SetChunkRateLimit.
+	// The plain-field writes inside SetChunkRateLimit have no
+	// happens-before with the Receive goroutines if called after
+	// sw.Start, AND calling it twice would leave existing per-peer
+	// limiters with the old rate baked in while new peers get the
+	// new rate (inconsistent). Enforcing single-call semantics keeps
+	// the contract honest. The atomic.Bool is fine here because the
+	// race we're guarding against is "more than one caller invokes
+	// this method"; the *contents* of SetChunkRateLimit don't need
+	// to be lock-protected because the documented contract is
+	// "before sw.Start" (memory ordering via goroutine creation).
+	setRateCalled atomic.Bool
+
 	bytesRecv  atomic.Int64
 	bytesSent  atomic.Int64
 	dropsCtrl  atomic.Int64
@@ -231,26 +244,29 @@ func (r *Reactor) loadProvider() SnapshotProvider {
 func (r *Reactor) SetProbe(probe bool) { r.probe = probe }
 
 // SetChunkRateLimit installs token-bucket limits on inbound
-// ChunkRequest. Must be called before sw.Start — rate parameters
-// aren't safe to mutate while Receive is hot (the per-peer limiter
-// map's entries cache the values at create time).
+// ChunkRequest. Single-call: must be called at most once, before
+// sw.Start. A second call logs an error and returns without touching
+// state — there's no safe way to reconfigure rates mid-flight
+// because existing per-peer limiters in the sync.Map have the old
+// rate baked in.
 //
 // A bucket with rate ≤ 0 or burst ≤ 0 is treated as disabled. The
-// zero-value ChunkRateLimit{} is equivalent to "no rate limiting" —
-// matches the default fetch-mode reactor behaviour (no SetChunkRateLimit
-// call, both buckets nil).
+// zero-value ChunkRateLimit{} is equivalent to never calling this —
+// matches the default fetch-mode reactor behaviour (no
+// SetChunkRateLimit call, both buckets nil). Operators who explicitly
+// want "no rate limiting" can call it with a zero-value struct, or
+// just skip the call.
 func (r *Reactor) SetChunkRateLimit(c ChunkRateLimit) {
+	if !r.setRateCalled.CompareAndSwap(false, true) {
+		r.logger.Error("SetChunkRateLimit called more than once; ignoring (rate parameters must be set once, before sw.Start)")
+		return
+	}
 	if c.PerPeerRate > 0 && c.PerPeerBurst > 0 {
 		r.chunkRatePerPeer = rate.Limit(c.PerPeerRate)
 		r.chunkBurstPerPeer = c.PerPeerBurst
-	} else {
-		r.chunkRatePerPeer = 0
-		r.chunkBurstPerPeer = 0
 	}
 	if c.GlobalRate > 0 && c.GlobalBurst > 0 {
 		r.globalLim = rate.NewLimiter(rate.Limit(c.GlobalRate), c.GlobalBurst)
-	} else {
-		r.globalLim = nil
 	}
 }
 
