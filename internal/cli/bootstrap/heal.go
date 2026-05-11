@@ -20,20 +20,91 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 
 	"github.com/zrbecker/cosmos-p2p/internal/config"
 	malcomlog "github.com/zrbecker/cosmos-p2p/internal/log"
 	"github.com/zrbecker/cosmos-p2p/internal/registry"
 )
 
+// resolveHealHeight reconciles the marker file and the -height flag.
+// Pure (no logger, no os.Exit) so the height-resolution policy is
+// unit-testable without setting up the rest of the CLI surface.
+//
+// Returns:
+//   - resolved height, no error: caller proceeds to the heal
+//   - 0, error: caller prints err.Error() to stderr and exits 2.
+//
+// Policy:
+//   - marker present + flag zero        → use marker
+//   - marker present + flag matches     → use marker (equivalent)
+//   - marker present + flag differs     → error (operator confusion)
+//   - marker missing + flag set         → use flag (no marker is OK
+//     if the operator knows what they're doing; the bootstrap may
+//     pre-date the marker, or the file may have been lost)
+//   - marker missing + flag zero        → error with usage hint
+func resolveHealHeight(home string, flagHeight int64) (int64, error) {
+	markerHeight, markerErr := ReadHeightMarker(home)
+	switch {
+	case markerErr == nil:
+		if flagHeight != 0 && flagHeight != markerHeight {
+			return 0, fmt.Errorf(
+				"marker says height %d but -height %d was passed; "+
+					"resolve the discrepancy (or delete %s to force -height)",
+				markerHeight, flagHeight,
+				filepath.Join(home, BootstrapHeightMarker))
+		}
+		return markerHeight, nil
+	case flagHeight != 0:
+		return flagHeight, nil
+	default:
+		return 0, fmt.Errorf(
+			"no bootstrap-height marker and no -height flag: %v\n"+
+				"  fix: pass -height <H> where H is the original `malcom bootstrap` height",
+			markerErr)
+	}
+}
+
+// blockstoreLooksPopulated reports whether <dataDir>/blockstore.db
+// has been written to past initial pebble setup. A bricked home
+// looks like: state.db populated, blockstore.db missing OR present
+// with only the pebble init files (CURRENT, MANIFEST, OPTIONS, no
+// .sst). A healthy synced home has .sst files.
+//
+// Heuristic — not opening pebble — to avoid lock contention if
+// gaiad is still running. The operator pre-flight is supposed to
+// have stopped gaiad already; this check is defence-in-depth
+// against running `heal -yes` on a home the operator forgot is
+// actively syncing.
+//
+// Conservative direction: returns false on read errors (missing dir,
+// permission denied, etc.) so the recovery path stays open in the
+// expected bricked state. The caller is responsible for separately
+// validating the home is actually a chain home (config/genesis.json
+// present); we shouldn't be operating on /tmp/typo regardless of
+// what this returns.
+func blockstoreLooksPopulated(dataDir string) bool {
+	entries, err := os.ReadDir(filepath.Join(dataDir, "blockstore.db"))
+	if err != nil {
+		return false
+	}
+	for _, e := range entries {
+		if strings.HasSuffix(e.Name(), ".sst") {
+			return true
+		}
+	}
+	return false
+}
+
 // RunHeal is the entry point for `malcom heal`.
 func RunHeal(args []string) int {
 	fs := flag.NewFlagSet("malcom heal", flag.ContinueOnError)
 	home := fs.String("home", "", "chain home dir to heal (the panicking gaia home; required)")
-	chain := fs.String("chain", "", "chain id; only consulted for binary lookup. Default: read from <home>/.malcom-bootstrap-height's neighbouring config/genesis.json, or fall through to -binary.")
+	chain := fs.String("chain", "", "chain id; only consulted for chain-registry binary lookup. Default: rely on -binary or $PATH lookup of daemon_name.")
 	heightFlag := fs.Int64("height", 0, "bootstrap height override. Default: read from <home>/.malcom-bootstrap-height (written by `malcom bootstrap` since #95).")
 	binary := fs.String("binary", "", "path to chain binary; default = $PATH lookup of daemon_name from chain-registry")
-	yes := fs.Bool("yes", false, "skip the interactive confirmation. heal removes blockstore.db, state.db, and evidence.db under <home>/data/ before re-running `bootstrap-state`; without -yes the run is dry (prints the plan and exits with usage).")
+	yes := fs.Bool("yes", false, "skip the dry-run. heal removes blockstore.db, state.db, and evidence.db under <home>/data/ before re-running `bootstrap-state`; without -yes the run is dry (prints the plan and exits with usage).")
+	force := fs.Bool("force", false, "proceed even when <home>/data/blockstore.db has data (blocks already synced). Default behaviour refuses, to protect operators who run heal on a home that isn't actually bricked.")
 	logMode := fs.String("log", "", "log output: auto (default), pretty, text, json")
 	debug := fs.Bool("debug", false, "verbose logging")
 	if err := fs.Parse(args); err != nil {
@@ -45,36 +116,29 @@ func RunHeal(args []string) int {
 		return 2
 	}
 
+	// Sanity-check the path actually looks like a chain home before
+	// doing anything destructive. A typo in -home would otherwise
+	// proceed all the way through marker resolution and `gaiad
+	// bootstrap-state` invocation before failing with a less
+	// obvious error.
+	if _, err := os.Stat(filepath.Join(*home, "config", "genesis.json")); err != nil {
+		fmt.Fprintf(os.Stderr,
+			"home %s doesn't contain config/genesis.json — is this really a chain home? (%v)\n",
+			*home, err)
+		return 2
+	}
+
 	mode, ok := malcomlog.ParseMode(*logMode)
 	if !ok {
 		fmt.Fprintf(os.Stderr, "invalid -log %q (want auto/pretty/text/json)\n", *logMode)
 		return 2
 	}
 
-	// Resolve the height: marker file first, -height override second.
-	// Flag value if set must match the marker; a mismatch is more
-	// likely to be operator error (wrong -height for this home) than
-	// a deliberate override.
-	height := *heightFlag
-	markerHeight, markerErr := ReadHeightMarker(*home)
-	switch {
-	case markerErr == nil:
-		if height != 0 && height != markerHeight {
-			fmt.Fprintf(os.Stderr,
-				"marker says height %d but -height %d was passed; "+
-					"resolve the discrepancy (or delete %s to force -height)\n",
-				markerHeight, height, filepath.Join(*home, BootstrapHeightMarker))
-			return 2
-		}
-		height = markerHeight
-	case markerErr != nil && height == 0:
-		// No marker and no -height; we have no signal to pass to
-		// bootstrap-state. Print both possibilities so the operator
-		// can pick the right fix.
-		fmt.Fprintf(os.Stderr,
-			"no bootstrap-height marker and no -height flag: %v\n"+
-				"  fix: pass -height <H> where H is the original `malcom bootstrap` height\n",
-			markerErr)
+	// Resolve the height. Pure helper so the policy is unit-testable
+	// (see heal_test.go).
+	height, err := resolveHealHeight(*home, *heightFlag)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, err)
 		return 2
 	}
 
@@ -83,16 +147,14 @@ func RunHeal(args []string) int {
 	// home shouldn't be gated on having a usable malcom config).
 	var (
 		logTuning malcomlog.Tuning
-		ch        config.Chain
 		regInfo   *registry.ChainInfo
 	)
 	if *chain != "" {
 		if cfg, err := config.Load(); err == nil {
 			if resolved, err := cfg.Resolve(*chain); err == nil {
-				ch = resolved
-				logTuning = malcomlog.Tuning{Level: ch.Log.Level, Modules: ch.Log.Modules}
+				logTuning = malcomlog.Tuning{Level: resolved.Log.Level, Modules: resolved.Log.Modules}
 				if cacheDir, err := config.RegistryCacheDir(); err == nil {
-					if rinfo, err := registry.Lookup(cacheDir, ch.ChainID); err == nil {
+					if rinfo, err := registry.Lookup(cacheDir, resolved.ChainID); err == nil {
 						regInfo = rinfo
 					}
 				}
@@ -136,16 +198,28 @@ func RunHeal(args []string) int {
 		filepath.Join(dataDir, "evidence.db"),
 	}
 
-	// Detect the panic precondition for an informative log line
-	// before either dry-running or removing anything. The signature
-	// from the issue is `state (H) and store (0) height mismatch` —
-	// in filesystem terms, blockstore.db is empty/missing while
-	// state.db has been populated. We don't open the dbs here (that
-	// would risk read locks fighting a running gaiad); just confirm
-	// the dirs exist as a sanity check.
+	// Footgun guard: refuse to nuke a populated blockstore unless
+	// the operator opts in with -force. heal exists to recover a
+	// home where the first start failed *before* any block landed;
+	// running it against a home with synced blocks would silently
+	// discard them. This check is heuristic (fs-only, doesn't open
+	// pebble — see the comment on blockstoreLooksPopulated) but
+	// catches the common case where an operator runs heal "just to
+	// be safe" on a working home.
+	if blockstoreLooksPopulated(dataDir) && !*force {
+		log.Error("refusing to heal: blockstore.db contains .sst files (home appears healthy, not bricked)",
+			"path", filepath.Join(dataDir, "blockstore.db"),
+			"hint", "if you really mean to discard those blocks, re-run with -force")
+		return 1
+	}
+
+	// Informational: a missing dir isn't an error — bootstrap-state
+	// will recreate state.db / evidence.db, and a healthy bricked
+	// state often has no blockstore.db at all (cometbft hadn't got
+	// far enough to create one before crashing).
 	for _, p := range victims {
 		if _, err := os.Stat(p); err != nil {
-			log.Warn("victim dir not present; heal will create it from scratch via bootstrap-state",
+			log.Debug("victim dir not present; heal will create it from scratch via bootstrap-state",
 				"path", p, "err", err)
 		}
 	}
