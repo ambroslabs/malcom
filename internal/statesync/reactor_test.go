@@ -257,6 +257,71 @@ func TestServing_ChunkRequest_LoadErrorBecomesMissing(t *testing.T) {
 	}
 }
 
+func TestServing_DrainModeFastFailsChunkRequest(t *testing.T) {
+	// BeginShutdown makes ChunkRequest produce a Missing=true response
+	// *without* asking the provider — the provider's LoadChunk is the
+	// expensive path (file I/O on a 10 MiB chunk) and drain mode
+	// exists precisely to avoid paying that cost mid-shutdown.
+	prov := newFakeProvider(Snapshot{Height: 1000, Format: 3, Chunks: 2})
+	prov.chunks[chunkKey(1000, 3, 0)] = []byte("payload-0") // would normally be served
+	r := newServingReactor(prov)
+	r.BeginShutdown()
+	if !r.IsShuttingDown() {
+		t.Fatal("IsShuttingDown should reflect BeginShutdown")
+	}
+
+	peer := newRecordingPeer("requester")
+	r.Receive(p2p.Envelope{
+		ChannelID: ChunkChannel,
+		Src:       peer,
+		Message:   &ssproto.ChunkRequest{Height: 1000, Format: 3, Index: 0},
+	})
+
+	resps := peer.chunkResponses()
+	if len(resps) != 1 || !resps[0].Missing {
+		t.Fatalf("drain mode should fast-fail with Missing=true; got %+v", resps)
+	}
+	if len(resps[0].Chunk) != 0 {
+		t.Fatalf("drain response carried %d bytes; should be empty", len(resps[0].Chunk))
+	}
+	if got := r.Drained(); got != 1 {
+		t.Fatalf("Drained() = %d, want 1", got)
+	}
+	// The chunksServed counter must NOT advance during drain —
+	// otherwise we'd be conflating "served from disk" with "fast-
+	// failed for shutdown".
+	_, served, missing := r.Served()
+	if served != 0 {
+		t.Fatalf("chunks_served leaked through drain: %d", served)
+	}
+	if missing != 0 {
+		t.Fatalf("chunks_missing leaked through drain: %d (should land in Drained)", missing)
+	}
+}
+
+func TestServing_DrainMode_BeginShutdownIdempotent(t *testing.T) {
+	// Calling BeginShutdown twice must not double-count anything and
+	// must not break further drain responses.
+	prov := newFakeProvider(Snapshot{Height: 1000, Format: 3, Chunks: 2})
+	r := newServingReactor(prov)
+	r.BeginShutdown()
+	r.BeginShutdown()
+	r.BeginShutdown()
+	if !r.IsShuttingDown() {
+		t.Fatal("IsShuttingDown should still be true after repeat calls")
+	}
+
+	peer := newRecordingPeer("p")
+	r.Receive(p2p.Envelope{
+		ChannelID: ChunkChannel,
+		Src:       peer,
+		Message:   &ssproto.ChunkRequest{Height: 1000, Format: 3, Index: 0},
+	})
+	if got := r.Drained(); got != 1 {
+		t.Fatalf("Drained() = %d, want 1 (repeat BeginShutdown should not inflate)", got)
+	}
+}
+
 func TestServing_NoProvider_RequestsSilent(t *testing.T) {
 	// Probe-only reactor (default): inbound requests must not panic and
 	// must not produce any wire responses.

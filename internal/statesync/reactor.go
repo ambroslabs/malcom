@@ -113,6 +113,15 @@ type Reactor struct {
 	provider atomic.Pointer[providerSlot]
 	probe    bool
 
+	// shuttingDown signals the serve-side drain phase: once set, any
+	// inbound ChunkRequest is fast-failed with Missing=true so the
+	// requester refetches elsewhere instead of waiting for our
+	// per-chunk timeout. Set by BeginShutdown; the reactor doesn't
+	// clear it (a graceful drain is always followed by sw.Stop).
+	// SnapshotsRequest stays answered because operators may still
+	// want to advertise during drain.
+	shuttingDown atomic.Bool
+
 	bytesRecv  atomic.Int64
 	bytesSent  atomic.Int64
 	dropsCtrl  atomic.Int64
@@ -121,6 +130,7 @@ type Reactor struct {
 	snapshotsServed atomic.Int64
 	chunksServed    atomic.Int64
 	chunksMissing   atomic.Int64
+	chunksDrained   atomic.Int64
 }
 
 // providerSlot wraps SnapshotProvider so we can store it in an
@@ -177,6 +187,19 @@ func (r *Reactor) loadProvider() SnapshotProvider {
 // pester peers for their snapshots when we have nothing to do with
 // them.
 func (r *Reactor) SetProbe(probe bool) { r.probe = probe }
+
+// BeginShutdown puts the reactor into drain mode: subsequent
+// ChunkRequest messages are fast-failed with Missing=true (counted in
+// the chunksDrained metric, not chunksServed/chunksMissing) so peers
+// stop streaming bytes through us and refetch elsewhere. Idempotent.
+//
+// The caller is expected to then wait its drain window before
+// stopping the switch — see snapserve.RunServe's cleanup defer.
+func (r *Reactor) BeginShutdown() { r.shuttingDown.Store(true) }
+
+// IsShuttingDown reports whether BeginShutdown has been called. Used
+// by snapserve's stats logging during the drain window.
+func (r *Reactor) IsShuttingDown() bool { return r.shuttingDown.Load() }
 
 func (r *Reactor) GetChannels() []*conn.ChannelDescriptor {
 	// Leave RecvBufferCapacity unset (defaults to 4 KiB in cometbft's
@@ -328,6 +351,27 @@ func (r *Reactor) Receive(env p2p.Envelope) {
 		if prov == nil {
 			return
 		}
+		// Drain mode: fast-fail every inbound ChunkRequest so the
+		// peer's per-chunk timeout doesn't gate their refetch
+		// elsewhere. Tracked under chunksDrained (separate counter)
+		// so operators can spot "requests during drain" without it
+		// muddying the steady-state chunksMissing metric.
+		if r.shuttingDown.Load() {
+			resp := &ssproto.ChunkResponse{
+				Height:  m.Height,
+				Format:  m.Format,
+				Index:   m.Index,
+				Missing: true,
+			}
+			if env.Src.Send(p2p.Envelope{ChannelID: ChunkChannel, Message: resp}) {
+				r.bytesSent.Add(int64(proto.Size(resp)))
+				r.chunksDrained.Add(1)
+				r.logger.Debug("ChunkResponse drained (shutting down)",
+					"peer", peerID, "height", m.Height, "format", m.Format,
+					"index", m.Index)
+			}
+			return
+		}
 		data, found, err := prov.LoadChunk(m.Height, m.Format, m.Index)
 		if err != nil {
 			// Treat read errors as Missing on the wire so requesters
@@ -374,6 +418,12 @@ func (r *Reactor) Receive(env p2p.Envelope) {
 func (r *Reactor) Served() (snapshots, chunks, missing int64) {
 	return r.snapshotsServed.Load(), r.chunksServed.Load(), r.chunksMissing.Load()
 }
+
+// Drained returns the number of ChunkRequest messages fast-failed
+// with Missing=true because BeginShutdown had been called. Separate
+// from chunksMissing so steady-state misses (chunk index out of
+// range, read errors) don't conflate with drain-window activity.
+func (r *Reactor) Drained() int64 { return r.chunksDrained.Load() }
 
 // Bytes returns recv/sent byte counters across both channels.
 func (r *Reactor) Bytes() (recv, sent int64) {
