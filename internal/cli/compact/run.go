@@ -20,7 +20,7 @@ func Run(args []string) int {
 	fs := flag.NewFlagSet("malcom compact", flag.ContinueOnError)
 	dir := fs.String("dir", "", "path to pebble DB directory (required)")
 	workers := fs.Int("workers", 0, "override [compact].max_concurrent_compactions (default = config or 8)")
-	cacheMB := fs.Int("cache-mb", 0, "pebble block-cache size in MiB during the compact (default 8192). Larger = more bloom/index blocks resident, fewer disk reads on the L0→L1 pass when the DB has tens of thousands of L0 SSTables.")
+	cacheMB := fs.Int("cache-mb", 0, "override [compact].cache_mb — pebble block-cache size in MiB during the compact. 0 = use [compact].cache_mb from config; if that's also 0, compute a memory-proportional default from /proc/meminfo (1/8 of MemAvailable, clamped to [64, 1024] MiB).")
 	targetFileSizeMB := fs.Int("target-file-size-mb", -1, "override [compact].target_file_size_mb (per-level TargetFileSize in MiB; 0 = pebble defaults; e.g. 1024 = merge into a small number of large output files at the cost of wall time)")
 	logMode := fs.String("log", "", "log output: auto (default), pretty, text, json")
 	debug := fs.Bool("debug", false, "verbose logging")
@@ -47,14 +47,18 @@ func Run(args []string) int {
 		Level:  level,
 	}).With("module", "compact")
 
-	// Resolve max-concurrent-compactions and target-file-size-mb:
+	// Resolve max-concurrent-compactions, target-file-size-mb, and
+	// cache-mb:
 	//   1. CLI flag wins.
 	//   2. else, [compact] from global config (no chain selected —
 	//      `malcom compact` doesn't take -chain).
-	//   3. else, the pebbleutil default (8 / pebble defaults).
+	//   3. else: NumCPU for workers / pebble defaults for target-file-
+	//      size / memory-proportional heuristic for cache-mb (1/8 of
+	//      MemAvailable, clamped to [64, 1024] MiB — see #100).
 	maxCompact := *workers
 	targetFS := *targetFileSizeMB
-	if maxCompact <= 0 || targetFS < 0 {
+	cacheMBValue := *cacheMB
+	if maxCompact <= 0 || targetFS < 0 || cacheMBValue <= 0 {
 		if cfg, err := config.Load(); err == nil {
 			// applyCompactDefaults runs in Resolve, but the global
 			// config.Load doesn't apply per-chain defaults — apply
@@ -67,15 +71,36 @@ func Run(args []string) int {
 			if targetFS < 0 {
 				targetFS = ct.TargetFileSizeMB
 			}
+			if cacheMBValue <= 0 && ct.CacheMB > 0 {
+				cacheMBValue = ct.CacheMB
+			}
 		}
 	}
 	if targetFS < 0 {
 		targetFS = 0
 	}
+	if cacheMBValue <= 0 {
+		// Memory-proportional heuristic. On a missing /proc/meminfo
+		// (sandbox / non-Linux), fall back to a conservative 256 MiB
+		// — much smaller than the old 8192 default that OOM-killed
+		// 8 GiB hosts. Operators on truly constrained boxes should
+		// set [compact].cache_mb explicitly anyway.
+		if memMB, err := readMemAvailableMB(); err == nil {
+			cacheMBValue = defaultCompactCacheMB(memMB)
+			log.Info("cache-mb heuristic",
+				"mem_available_mb", memMB,
+				"cache_mb", cacheMBValue,
+				"hint", "set [compact].cache_mb to pin")
+		} else {
+			cacheMBValue = 256
+			log.Warn("could not read /proc/meminfo; using conservative cache-mb fallback",
+				"cache_mb", cacheMBValue, "err", err)
+		}
+	}
 
 	t0 := time.Now()
-	log.Info("starting", "dir", *dir, "max_concurrent_compactions", maxCompact, "cache_mb", *cacheMB, "target_file_size_mb", targetFS)
-	if err := pebbleutil.CleanupCompact(*dir, maxCompact, *cacheMB, targetFS, log); err != nil {
+	log.Info("starting", "dir", *dir, "max_concurrent_compactions", maxCompact, "cache_mb", cacheMBValue, "target_file_size_mb", targetFS)
+	if err := pebbleutil.CleanupCompact(*dir, maxCompact, cacheMBValue, targetFS, log); err != nil {
 		log.Error("compact failed", "err", err)
 		return 1
 	}

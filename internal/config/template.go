@@ -147,6 +147,16 @@ flush_split_mb        = 1024
 # files / 25m12s; 1024 = 6 files / 47m55s.
 # target_file_size_mb = 0
 
+# Pebble block-cache size in MiB during compact. Larger = more
+# bloom/index blocks resident, fewer disk reads on the L0→L1 pass
+# when the DB has tens of thousands of L0 SSTables — but pebble
+# grows the cache toward this cap and an 8192 default has been
+# observed to OOM-kill 8 GiB hosts. When unset (0), malcom reads
+# /proc/meminfo and picks 1/8 of MemAvailable, clamped to
+# [64, 1024] MiB. Pin a value here only when you've measured what
+# this workload actually wants on this host.
+# cache_mb = 0
+
 [bootstrap]
 trust_period   = "720h"   # 30d cometbft light-client trust window
 app_db_backend = "pebbledb"
