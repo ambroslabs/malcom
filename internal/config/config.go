@@ -204,14 +204,13 @@ type FetchTuning struct {
 	ProbeTimeout  duration `toml:"probe_timeout"`
 	MinPeers      int      `toml:"min_peers"`
 
-	PerPeer       int      `toml:"per_peer"`
-	ChunkTimeout  duration `toml:"chunk_timeout"`
-	MaxFetch      duration `toml:"max_fetch"`
+	PerPeer      int      `toml:"per_peer"`
+	ChunkTimeout duration `toml:"chunk_timeout"`
 	// PeerFails is the consecutive hash-mismatch strike budget before
 	// a peer is benched for the run. Missing/empty chunks don't count
 	// — they're routed to a per-peer/per-chunk decline set instead, so
 	// peers with partial snapshots can still serve what they have.
-	PeerFails     int      `toml:"peer_fails"`
+	PeerFails int `toml:"peer_fails"`
 	// PeerRedials caps the number of consecutive disconnect/redial
 	// cycles before a peer is permanently banned for the run. 0 =
 	// unlimited (legacy behaviour).
@@ -410,4 +409,3 @@ func IsGenesisURL(s string) bool { return isGenesisURL(s) }
 func isGenesisURL(s string) bool {
 	return strings.HasPrefix(s, "http://") || strings.HasPrefix(s, "https://")
 }
-

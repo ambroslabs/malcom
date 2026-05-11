@@ -165,22 +165,21 @@ func Run(args []string) int {
 	}
 
 	scfg := snapfetch.Config{
-		ChainID:           ch.ChainID,
-		NodeKeyPath:       ch.NodeKey,
-		Listen:            ch.Fetch.Listen,
-		Moniker:           ch.Fetch.Moniker,
-		AddrBook:          ch.AddrBook,
-		Banlist:           ch.Banlist,
-		Served:            ch.Served,
-		BootstrapPeers:    ch.Fetch.BootstrapPeers,
-		DiscoverFor:       ch.Fetch.Discover.Duration(),
-		DialParallel:      ch.Fetch.DialParallel,
-		MaxCandidates:     ch.Fetch.MaxCandidates,
-		ProbeTimeout:      ch.Fetch.ProbeTimeout.Duration(),
-		MinGoodPeers:      ch.Fetch.MinPeers,
-		PerPeerLimit:      ch.Fetch.PerPeer,
-		ChunkTimeout:      ch.Fetch.ChunkTimeout.Duration(),
-		MaxFetchTime:      ch.Fetch.MaxFetch.Duration(),
+		ChainID:                  ch.ChainID,
+		NodeKeyPath:              ch.NodeKey,
+		Listen:                   ch.Fetch.Listen,
+		Moniker:                  ch.Fetch.Moniker,
+		AddrBook:                 ch.AddrBook,
+		Banlist:                  ch.Banlist,
+		Served:                   ch.Served,
+		BootstrapPeers:           ch.Fetch.BootstrapPeers,
+		DiscoverFor:              ch.Fetch.Discover.Duration(),
+		DialParallel:             ch.Fetch.DialParallel,
+		MaxCandidates:            ch.Fetch.MaxCandidates,
+		ProbeTimeout:             ch.Fetch.ProbeTimeout.Duration(),
+		MinGoodPeers:             ch.Fetch.MinPeers,
+		PerPeerLimit:             ch.Fetch.PerPeer,
+		ChunkTimeout:             ch.Fetch.ChunkTimeout.Duration(),
 		PeerFailLimit:            ch.Fetch.PeerFails,
 		MaxRedials:               ch.Fetch.PeerRedials,
 		PeerRedialBackoff:        ch.Fetch.RedialBackoff.Duration(),
@@ -388,4 +387,3 @@ func fetchCurrentHeight(rpcs []string) (uint64, error) {
 	}
 	return 0, fmt.Errorf("all RPCs failed: %w", lastErr)
 }
-

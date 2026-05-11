@@ -16,15 +16,14 @@ import (
 // `malcom add <chain-id>`, which writes chains/<chain-id>.toml.
 func GlobalTemplate() string {
 	return `# Shared defaults. Per-chain overrides live in chains/<chain>.toml.
-# Chains are added with `+"`malcom add <chain-id>`"+`.
+# Chains are added with ` + "`malcom add <chain-id>`" + `.
 
 [fetch]
 # Per-chunk download tuning. The walking algorithm uses
 # per_height_timeout for snapshot selection; these knobs apply
 # during the actual chunk download.
 per_peer       = 2          # max in-flight chunks per peer
-chunk_timeout  = "45s"      # per-chunk request timeout
-max_fetch      = "60m"      # hard cap on full download — raise on slow links / flaky peer sets
+chunk_timeout  = "45s"      # per-chunk request timeout (a slow peer's chunks get re-asked of someone else)
 peer_fails     = 3          # hash-mismatch strikes before banning (missing chunks don't count — they go to the per-peer/per-chunk decline set)
 peer_redials   = 4          # disconnect/redial cycles before benching a flapping peer
 redial_backoff = "5s"
@@ -125,17 +124,17 @@ min_free_gb           = 20    # cosmoshub-4 import is ~14 GB after compact
 # is non-empty. Honored only when compact_during_import = true.
 flush_split_mb        = 1024
 
-# When false (default), `+"`malcom snapshot import`"+` writes the snapshot
+# When false (default), ` + "`malcom snapshot import`" + ` writes the snapshot
 # in bulk-load mode without running pebble compactions. The resulting
 # appdb has many small L0 SSTables; gaiad's pebble auto-compacts at
-# runtime, or run `+"`malcom compact -dir <appdb>`"+` separately. Set true
+# runtime, or run ` + "`malcom compact -dir <appdb>`" + ` separately. Set true
 # to compact incrementally during import (slower but tighter LSM at
 # end-of-import).
 # compact_during_import = false
 
 [compact]
-# Pebble compaction tuning. Used by `+"`malcom compact -dir <appdb>`"+` and
-# by `+"`malcom snapshot import`"+` when [import].compact_during_import is
+# Pebble compaction tuning. Used by ` + "`malcom compact -dir <appdb>`" + ` and
+# by ` + "`malcom snapshot import`" + ` when [import].compact_during_import is
 # true. Default = runtime.NumCPU(); compaction is largely I/O-bound
 # at cosmos-scale so going much higher rarely helps.
 # max_concurrent_compactions = 8
