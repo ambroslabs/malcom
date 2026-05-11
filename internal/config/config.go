@@ -86,6 +86,15 @@ type CompactTuning struct {
 	// 25m12s; 1024 = 6 files / 47m55s. Operators who want the leanest
 	// post-compact LSM can opt in here; everyone else gets fast wall.
 	TargetFileSizeMB int `toml:"target_file_size_mb"`
+
+	// CacheMB sizes the pebble block cache during the compact, in
+	// MiB. 0 means "let the CLI compute a default from
+	// /proc/meminfo" — see compact's defaultCompactCacheMB. The old
+	// hardcoded 8192 (still the library-level fallback in
+	// pebbleutil.CleanupCompact for direct API callers) OOM-killed
+	// 8 GB hosts because pebble grew the cache toward the cap; the
+	// CLI now picks a memory-proportional default instead. See #100.
+	CacheMB int `toml:"cache_mb"`
 }
 
 // LogTuning maps onto internal/log.Tuning. Edit config.toml to surface
