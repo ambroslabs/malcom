@@ -29,6 +29,18 @@ import (
 	"io"
 )
 
+// maxEnvelopeBytes caps the uvarint-decoded length of any
+// SnapshotItem envelope (and of an inner StoreItem name). Without
+// this, a uvarint off the wire is an unbounded uint64 — make([]byte,
+// n) on a forged length either wraps to a negative int (makeslice
+// "len out of range") or requests enough memory to trip the
+// allocator.
+//
+// Value matches cosmos-sdk's snapshot importer limit:
+// store/snapshots/manager.go: snapshotMaxItemSize = int(64e6). Any
+// snapshot cosmos-sdk accepts, we accept.
+const maxEnvelopeBytes = 64_000_000
+
 // itemType discriminates the four oneof variants of SnapshotItem.
 type itemType uint8
 
@@ -89,6 +101,9 @@ func (s *snapReader) Next() (*snapItem, error) {
 		if envLen == 0 {
 			// length-zero envelopes are technically valid; skip them
 			continue
+		}
+		if envLen > maxEnvelopeBytes {
+			return nil, fmt.Errorf("snapshot envelope %d bytes exceeds cap %d", envLen, maxEnvelopeBytes)
 		}
 		buf := make([]byte, envLen)
 		if _, err := io.ReadFull(s.br, buf); err != nil {
