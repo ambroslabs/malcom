@@ -9,8 +9,8 @@ import (
 	"fmt"
 	"os"
 
-	"github.com/zrbecker/cosmos-p2p/internal/helpers/addrbook"
-	"github.com/zrbecker/cosmos-p2p/internal/logctx"
+	"github.com/ambroslabs/malcom/internal/helpers/addrbook"
+	"github.com/ambroslabs/malcom/internal/logctx"
 )
 
 // parseChunkHashes decodes a cosmos-sdk format-3 snapshot Metadata blob:

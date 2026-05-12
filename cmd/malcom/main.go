@@ -19,17 +19,17 @@ import (
 	"fmt"
 	"os"
 
-	"github.com/zrbecker/cosmos-p2p/internal/cli/addcmd"
-	"github.com/zrbecker/cosmos-p2p/internal/cli/bootstrap"
-	"github.com/zrbecker/cosmos-p2p/internal/cli/cleancmd"
-	"github.com/zrbecker/cosmos-p2p/internal/cli/compact"
-	"github.com/zrbecker/cosmos-p2p/internal/cli/initcmd"
-	"github.com/zrbecker/cosmos-p2p/internal/cli/registrycmd"
-	"github.com/zrbecker/cosmos-p2p/internal/cli/snapshotfetch"
-	"github.com/zrbecker/cosmos-p2p/internal/cli/snapshotimport"
-	"github.com/zrbecker/cosmos-p2p/internal/cli/snapshotindex"
-	"github.com/zrbecker/cosmos-p2p/internal/cli/snapshotserve"
-	"github.com/zrbecker/cosmos-p2p/internal/cli/verify"
+	"github.com/ambroslabs/malcom/internal/cli/addcmd"
+	"github.com/ambroslabs/malcom/internal/cli/bootstrap"
+	"github.com/ambroslabs/malcom/internal/cli/cleancmd"
+	"github.com/ambroslabs/malcom/internal/cli/compact"
+	"github.com/ambroslabs/malcom/internal/cli/initcmd"
+	"github.com/ambroslabs/malcom/internal/cli/registrycmd"
+	"github.com/ambroslabs/malcom/internal/cli/snapshotfetch"
+	"github.com/ambroslabs/malcom/internal/cli/snapshotimport"
+	"github.com/ambroslabs/malcom/internal/cli/snapshotindex"
+	"github.com/ambroslabs/malcom/internal/cli/snapshotserve"
+	"github.com/ambroslabs/malcom/internal/cli/verify"
 )
 
 func main() {

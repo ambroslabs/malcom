@@ -7,7 +7,7 @@ import (
 	"fmt"
 	"strings"
 
-	"github.com/zrbecker/cosmos-p2p/internal/registry"
+	"github.com/ambroslabs/malcom/internal/registry"
 )
 
 // GlobalTemplate returns the body of the top-level config.toml: the

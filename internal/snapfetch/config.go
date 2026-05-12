@@ -5,7 +5,7 @@ import (
 	"fmt"
 	"time"
 
-	"github.com/zrbecker/cosmos-p2p/internal/statesync"
+	"github.com/ambroslabs/malcom/internal/statesync"
 )
 
 // Config holds all knobs for RunFetch. Field defaults are documented in

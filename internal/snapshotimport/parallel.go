@@ -47,7 +47,7 @@ import (
 
 	"github.com/cockroachdb/pebble"
 
-	malcomlog "github.com/zrbecker/cosmos-p2p/internal/log"
+	malcomlog "github.com/ambroslabs/malcom/internal/log"
 )
 
 // ParallelOptions extends Options with parallel-specific knobs.

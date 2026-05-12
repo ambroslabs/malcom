@@ -32,7 +32,7 @@ import (
 	"strconv"
 	"strings"
 
-	"github.com/zrbecker/cosmos-p2p/internal/humanbytes"
+	"github.com/ambroslabs/malcom/internal/humanbytes"
 )
 
 // Result is the structural summary of a parsed snapshot.

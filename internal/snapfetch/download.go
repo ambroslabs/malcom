@@ -17,10 +17,10 @@ import (
 
 	"github.com/cometbft/cometbft/p2p"
 
-	"github.com/zrbecker/cosmos-p2p/internal/connect"
-	"github.com/zrbecker/cosmos-p2p/internal/helpers/served"
-	"github.com/zrbecker/cosmos-p2p/internal/logctx"
-	"github.com/zrbecker/cosmos-p2p/internal/statesync"
+	"github.com/ambroslabs/malcom/internal/connect"
+	"github.com/ambroslabs/malcom/internal/helpers/served"
+	"github.com/ambroslabs/malcom/internal/logctx"
+	"github.com/ambroslabs/malcom/internal/statesync"
 )
 
 type peerStat struct {

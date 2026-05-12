@@ -11,7 +11,7 @@ import (
 	"github.com/cometbft/cometbft/p2p"
 	"github.com/cometbft/cometbft/p2p/conn"
 
-	"github.com/zrbecker/cosmos-p2p/internal/helpers/addrbook"
+	"github.com/ambroslabs/malcom/internal/helpers/addrbook"
 )
 
 // --- fakes ---

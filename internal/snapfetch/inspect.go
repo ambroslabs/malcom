@@ -9,8 +9,8 @@ import (
 
 	"log/slog"
 
-	"github.com/zrbecker/cosmos-p2p/internal/humanbytes"
-	"github.com/zrbecker/cosmos-p2p/internal/snapshotinspect"
+	"github.com/ambroslabs/malcom/internal/humanbytes"
+	"github.com/ambroslabs/malcom/internal/snapshotinspect"
 )
 
 // InspectAndEnrich runs the snapshotinspect package on a completed

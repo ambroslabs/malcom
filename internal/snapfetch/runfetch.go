@@ -11,7 +11,7 @@ import (
 	cfg "github.com/cometbft/cometbft/config"
 	"github.com/cometbft/cometbft/p2p/conn"
 
-	"github.com/zrbecker/cosmos-p2p/internal/logctx"
+	"github.com/ambroslabs/malcom/internal/logctx"
 )
 
 // RunFetch is the library entry point. It builds a p2p.Switch, walks

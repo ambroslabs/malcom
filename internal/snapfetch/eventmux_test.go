@@ -5,7 +5,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/zrbecker/cosmos-p2p/internal/statesync"
+	"github.com/ambroslabs/malcom/internal/statesync"
 )
 
 func TestEventMuxFanOutToAllSubscribers(t *testing.T) {

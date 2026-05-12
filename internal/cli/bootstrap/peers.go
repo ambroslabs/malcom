@@ -18,7 +18,7 @@ import (
 	"path/filepath"
 	"strings"
 
-	"github.com/zrbecker/cosmos-p2p/internal/helpers/served"
+	"github.com/ambroslabs/malcom/internal/helpers/served"
 )
 
 // defaultPersistentPeerCount is how many served-peer entries we forward

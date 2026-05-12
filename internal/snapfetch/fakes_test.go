@@ -11,8 +11,8 @@ import (
 	"github.com/cometbft/cometbft/p2p"
 	"github.com/cometbft/cometbft/p2p/conn"
 
-	"github.com/zrbecker/cosmos-p2p/internal/connect"
-	"github.com/zrbecker/cosmos-p2p/internal/statesync"
+	"github.com/ambroslabs/malcom/internal/connect"
+	"github.com/ambroslabs/malcom/internal/statesync"
 )
 
 // fakePeer satisfies p2p.Peer just enough for our tests.

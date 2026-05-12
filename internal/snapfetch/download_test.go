@@ -13,7 +13,7 @@ import (
 	"log/slog"
 	"github.com/cometbft/cometbft/p2p"
 
-	"github.com/zrbecker/cosmos-p2p/internal/statesync"
+	"github.com/ambroslabs/malcom/internal/statesync"
 )
 
 // scenarioBuilder constructs a chunkScheduler with single-chunk target

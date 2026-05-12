@@ -21,10 +21,10 @@ import (
 	"runtime/pprof"
 	"time"
 
-	"github.com/zrbecker/cosmos-p2p/internal/config"
-	malcomlog "github.com/zrbecker/cosmos-p2p/internal/log"
-	"github.com/zrbecker/cosmos-p2p/internal/snapshotdiff"
-	"github.com/zrbecker/cosmos-p2p/internal/snapshotimport"
+	"github.com/ambroslabs/malcom/internal/config"
+	malcomlog "github.com/ambroslabs/malcom/internal/log"
+	"github.com/ambroslabs/malcom/internal/snapshotdiff"
+	"github.com/ambroslabs/malcom/internal/snapshotimport"
 )
 
 type metaJSON struct {

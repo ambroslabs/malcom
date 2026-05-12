@@ -28,10 +28,10 @@ import (
 	"path/filepath"
 	"strings"
 
-	"github.com/zrbecker/cosmos-p2p/internal/config"
-	malcomlog "github.com/zrbecker/cosmos-p2p/internal/log"
-	"github.com/zrbecker/cosmos-p2p/internal/registry"
-	"github.com/zrbecker/cosmos-p2p/internal/snapshotimport"
+	"github.com/ambroslabs/malcom/internal/config"
+	malcomlog "github.com/ambroslabs/malcom/internal/log"
+	"github.com/ambroslabs/malcom/internal/registry"
+	"github.com/ambroslabs/malcom/internal/snapshotimport"
 )
 
 // Run is the malcom subcommand entry point. Returns the process exit

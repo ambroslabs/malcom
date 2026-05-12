@@ -18,7 +18,7 @@ import (
 	"github.com/cockroachdb/pebble"
 	"github.com/cometbft/cometbft/crypto/merkle"
 
-	malcomlog "github.com/zrbecker/cosmos-p2p/internal/log"
+	malcomlog "github.com/ambroslabs/malcom/internal/log"
 )
 
 // ErrMismatch is returned by CheckAppHash when the computed local

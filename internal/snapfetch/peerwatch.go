@@ -10,8 +10,8 @@ import (
 	"github.com/cometbft/cometbft/p2p"
 	pexcb "github.com/cometbft/cometbft/p2p/pex"
 
-	"github.com/zrbecker/cosmos-p2p/internal/logctx"
-	"github.com/zrbecker/cosmos-p2p/internal/statesync"
+	"github.com/ambroslabs/malcom/internal/logctx"
+	"github.com/ambroslabs/malcom/internal/statesync"
 )
 
 // peerWatch is the long-lived churn loop spanning walk + download. It
