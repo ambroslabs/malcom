@@ -5,7 +5,6 @@ import (
 	"compress/zlib"
 	"crypto/sha256"
 	"encoding/binary"
-	"encoding/hex"
 	"fmt"
 	"io"
 	"os"
@@ -529,7 +528,7 @@ func encBytesField(field int, b []byte) []byte {
 // encVarintField encodes a varint as proto field N wire-type 0.
 func encVarintField(field int, v uint64) []byte {
 	out := make([]byte, 0, 1+binary.MaxVarintLen64)
-	out = append(out, byte((field<<3)|0))
+	out = append(out, byte(field<<3))
 	var lb [binary.MaxVarintLen64]byte
 	n := binary.PutUvarint(lb[:], v)
 	out = append(out, lb[:n]...)
@@ -693,41 +692,6 @@ func (s *storeReader) readNextItemInStoreRaw(expectStore string, fn func(rec []b
 		s.curStore = ""
 		return true, nil
 	default:
-		s.consumeItem()
-		return false, nil
-	}
-}
-
-// readNextItemInStore reads one IAVL item from the current store and calls
-// fn with its (key, value). When the store ends (next StoreItem or EOF or
-// extension), returns done=true.
-func (s *storeReader) readNextItemInStore(expectStore string, fn func(k, v []byte)) (done bool, err error) {
-	if s.curStore != expectStore {
-		// Caller didn't position us correctly — done.
-		return true, nil
-	}
-	tag, body, end, err := s.peekItem()
-	if err != nil {
-		return false, err
-	}
-	if end {
-		s.curStore = ""
-		return true, nil
-	}
-	switch tag {
-	case 2: // IAVL
-		k, v := parseIAVLKeyValue(body)
-		fn(k, v)
-		s.consumeItem()
-		return false, nil
-	case 1: // next StoreItem — current store is done
-		s.curStore = ""
-		return true, nil
-	case 3, 4: // extensions — stores are over
-		s.curStore = ""
-		return true, nil
-	default:
-		// Unknown — skip
 		s.consumeItem()
 		return false, nil
 	}
@@ -978,12 +942,3 @@ func HumanBytes(n uint64) string {
 	}
 }
 
-// shortHex truncates a hex string for log display.
-func shortHex(h string) string {
-	if len(h) > 16 {
-		return h[:16] + "…"
-	}
-	return h
-}
-
-var _ = hex.EncodeToString // keep import in case we expand later

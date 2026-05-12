@@ -160,8 +160,3 @@ func readLenPrefixed(r io.Reader) ([]byte, error) {
 	return out, nil
 }
 
-// uvarintSize returns how many bytes an unsigned varint takes.
-func uvarintSize(x uint64) int {
-	var b [10]byte
-	return binary.PutUvarint(b[:], x)
-}

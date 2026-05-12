@@ -126,25 +126,6 @@ func (w *peerWatch) banPeer(peer p2p.Peer, reason string) {
 	w.mu.Unlock()
 }
 
-// markBannedByID is the disconnected-peer counterpart to banPeer.
-// Used by download() when MaxRedials is hit — the peer isn't
-// currently connected so we can't StopPeerGracefully, but we still
-// want to addrbook-MarkBad and flag in `banned` so tryRedial stops.
-func (w *peerWatch) markBannedByID(id p2p.ID, addr string, reason string) {
-	w.log.Debug("benching peer (no connection)", "peer", string(id), "reason", reason)
-	if w.book != nil && addr != "" {
-		if na, err := p2p.NewNetAddressString(addr); err == nil {
-			w.book.MarkBad(na, w.banDuration)
-		}
-	}
-	if w.mgr != nil {
-		w.mgr.Ban(id, reason)
-	}
-	w.mu.Lock()
-	w.banned[id] = true
-	w.mu.Unlock()
-}
-
 // onConnect handles a Connected event by recording firstSeen. The
 // channel filter is applied on the next tick, not here, so PEX-only
 // seeds get a window to reply to AutoReactor's PexRequest before we

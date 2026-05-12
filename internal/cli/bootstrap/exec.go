@@ -12,7 +12,6 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
-	"os"
 	"os/exec"
 	"strings"
 )
@@ -125,15 +124,3 @@ func (t *tailBuf) String() string {
 	return strings.TrimSpace(string(t.buf))
 }
 
-// resolveAbs is a small helper used by callers that want a logged
-// absolute path. Falls back to the input on os.Getwd failures.
-func resolveAbs(p string) string {
-	abs, err := os.Getwd()
-	if err != nil || p == "" {
-		return p
-	}
-	if strings.HasPrefix(p, "/") {
-		return p
-	}
-	return abs + "/" + p
-}

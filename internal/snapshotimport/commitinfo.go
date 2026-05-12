@@ -94,7 +94,7 @@ func encodeCommitID(version int64, hash []byte) []byte {
 func appendUvarintField(dst []byte, field int, v uint64) []byte {
 	var b [binary.MaxVarintLen64]byte
 	n := binary.PutUvarint(b[:], v)
-	dst = append(dst, byte(field<<3)|0)
+	dst = append(dst, byte(field<<3))
 	dst = append(dst, b[:n]...)
 	return dst
 }

@@ -71,14 +71,14 @@ func run(snapshotDir, logMode string, debug bool) error {
 	// Print the per-store table to stdout — separate from the
 	// structured event log so it's pipeable / greppable.
 	tw := tabwriter.NewWriter(os.Stdout, 0, 0, 2, ' ', 0)
-	fmt.Fprintln(tw, "STORE\tITEMS\tIAVL_BYTES\tDECOMP_START\tDECOMP_END\tSPAN")
+	_, _ = fmt.Fprintln(tw, "STORE\tITEMS\tIAVL_BYTES\tDECOMP_START\tDECOMP_END\tSPAN")
 	for _, s := range idx.Stores {
 		span := s.DecompressedEnd - s.DecompressedStart
-		fmt.Fprintf(tw, "%s\t%d\t%s\t%d\t%d\t%s\n",
+		_, _ = fmt.Fprintf(tw, "%s\t%d\t%s\t%d\t%d\t%s\n",
 			s.Name, s.ItemCount, humanBytes(uint64(s.IAVLBytes)),
 			s.DecompressedStart, s.DecompressedEnd, humanBytes(uint64(span)))
 	}
-	tw.Flush()
+	_ = tw.Flush()
 	fmt.Println()
 	fmt.Printf("total: stores=%d  items=%d  bytes=%s  build=%s  rate=%.1f MiB/s\n",
 		len(idx.Stores), idx.TotalItems, humanBytes(uint64(idx.TotalBytes)),

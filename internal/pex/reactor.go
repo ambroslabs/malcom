@@ -100,9 +100,7 @@ func (r *Reactor) AddPeer(peer p2p.Peer) {
 
 func (r *Reactor) Receive(env p2p.Envelope) {
 	r.mu.Lock()
-	if pm, ok := env.Message.(proto.Message); ok {
-		r.bytesRecv += int64(proto.Size(pm))
-	}
+	r.bytesRecv += int64(proto.Size(env.Message))
 	r.mu.Unlock()
 
 	switch m := env.Message.(type) {

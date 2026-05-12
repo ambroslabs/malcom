@@ -206,7 +206,7 @@ func Import(opts Options) (*Stats, error) {
 		_ = db.Close()
 		return nil, fmt.Errorf("mkdir ingest tmp: %w", err)
 	}
-	defer os.RemoveAll(ingestTmpDir)
+	defer func() { _ = os.RemoveAll(ingestTmpDir) }()
 
 	// ─── run the streaming import ────────────────────────────────────
 	streamStart := time.Now()

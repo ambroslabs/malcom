@@ -1,0 +1,41 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    name: test + lint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          # setup-go's built-in cache covers ~/.cache/go-build and the
+          # module cache (~/go/pkg/mod), keyed off go.sum.
+          cache: true
+
+      - name: go vet
+        run: go vet ./...
+
+      - name: Install staticcheck
+        run: go install honnef.co/go/tools/cmd/staticcheck@latest
+
+      - name: staticcheck
+        run: staticcheck ./...
+
+      - name: golangci-lint
+        # @v7 installs golangci-lint v2.x, which is built with Go 1.25
+        # and can lint our module. @v6 ships v1.64.x, built with Go
+        # 1.24 — it refuses to load on a Go 1.25 module.
+        uses: golangci/golangci-lint-action@v7
+        with:
+          version: latest
+
+      - name: go test -race
+        run: go test -race ./...
