@@ -79,8 +79,25 @@ type snapReader struct {
 	br *bufio.Reader
 }
 
+// snapReaderBufSize is intentionally small. binary.ReadUvarint pulls
+// bytes through bufio.Reader one byte at a time — each call to its
+// underlying Read returns up to bufSize bytes regardless of the
+// snapReader's logical consumption. If the underlying reader is a
+// chunkRingReader (the pipelined-import path), that overshoot
+// advances the reader's eviction-pinning cursor past the bytes the
+// caller will actually need. Keeping the buffer small bounds the
+// overshoot to a handful of bytes, well below the ring's chunkSize,
+// so a reader peeking the next store's header at a store boundary
+// can't cause `evictLocked` to drop the chunk containing the next
+// store's envStart. See #124.
+//
+// Envelope bodies are read via io.ReadFull(s.br, buf) where
+// len(buf) >= bufSize triggers bufio's direct-read fast path
+// (skips the buffer entirely), so there's no per-item cost.
+const snapReaderBufSize = 64
+
 func newSnapReader(r io.Reader) *snapReader {
-	return &snapReader{br: bufio.NewReaderSize(r, 1<<20)}
+	return &snapReader{br: bufio.NewReaderSize(r, snapReaderBufSize)}
 }
 
 // Next returns the next SnapshotItem or io.EOF when the stream ends.

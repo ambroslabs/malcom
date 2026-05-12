@@ -191,18 +191,30 @@ func (r *chunkRing) Close(err error) {
 	r.mu.Unlock()
 }
 
-// NewReader creates a reader starting at the given offset. The
-// offset must be >= ring.head (the bytes haven't been evicted yet).
-// endLimit is the exclusive end byte; -1 means "until ring is
-// closed past this reader's cursor." SetEnd lets stage 1 finalize
-// endLimit later when the store's boundary becomes known.
-func (r *chunkRing) NewReader(start, endLimit int64) *chunkRingReader {
-	rd := &chunkRingReader{ring: r, pos: start, endLimit: endLimit}
+// NewReader creates a reader starting at the given offset. start
+// must be >= ring.head (the bytes haven't been evicted yet);
+// callers that hit ErrStartEvicted got beaten to the punch by an
+// eviction triggered while they were preparing the call — see #124
+// for the race the precondition catches. endLimit is the exclusive
+// end byte; -1 means "until ring is closed past this reader's
+// cursor." SetEnd lets stage 1 finalize endLimit later when the
+// store's boundary becomes known.
+func (r *chunkRing) NewReader(start, endLimit int64) (*chunkRingReader, error) {
 	r.mu.Lock()
+	defer r.mu.Unlock()
+	if start < r.head {
+		return nil, fmt.Errorf("%w: start %d below ring head %d", ErrStartEvicted, start, r.head)
+	}
+	rd := &chunkRingReader{ring: r, pos: start, endLimit: endLimit}
 	r.readers = append(r.readers, rd)
-	r.mu.Unlock()
-	return rd
+	return rd, nil
 }
+
+// ErrStartEvicted is returned by NewReader when start < head. The
+// chunk containing start has already been recycled, so a reader
+// born here would silently see "pos below ring head" on its first
+// Read. Better to surface the failure at construction.
+var ErrStartEvicted = errors.New("chunkRing: start offset already evicted")
 
 // chunkRingReader tracks one reader's cursor into the ring. The
 // reader's pos pins eviction so the ring can't drop bytes the
