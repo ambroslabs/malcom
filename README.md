@@ -1,9 +1,10 @@
 # malcom
 
-A single-binary CLI for bootstrapping a `gaiad` node from a state-sync
-snapshot. Talks the cometbft state-sync P2P protocol directly to fetch
-a snapshot, decodes it into `application.db` + extensions without going
-through gaiad, then assembles a runnable home directory.
+A single-binary CLI for bootstrapping a cosmos-sdk node from a
+state-sync snapshot. Talks the cometbft state-sync P2P protocol
+directly to fetch a snapshot, decodes it into `application.db` +
+extensions without going through the chain daemon, then assembles a
+runnable home directory.
 
 ## Subcommands
 
@@ -11,11 +12,12 @@ through gaiad, then assembles a runnable home directory.
 malcom init               seed XDG dirs + shared config.toml
 malcom add <chain-id>     register a chain (config + node key + per-chain dirs)
 malcom registry refresh   re-fetch the cached chain-registry snapshot
-malcom clean              back up (or -clobber) the XDG malcom dirs
+malcom clean              back up (or --clobber) the XDG malcom dirs
 malcom snapshot fetch     download a state-sync snapshot
 malcom snapshot import    snapshot dir → application.db + extensions/
 malcom snapshot serve     advertise a local snapshot over state-sync P2P
-malcom bootstrap          assemble a runnable gaiad home directory
+malcom bootstrap          assemble a runnable chain home directory
+malcom bootstrap heal     recover a chain home bricked by a failed first start
 malcom verify             check the imported AppHash against a cometbft RPC
 malcom compact            full-keyspace pebble compaction
 ```
@@ -31,7 +33,7 @@ go build -o build/malcom ./cmd/malcom
 ## Config
 
 malcom follows the XDG Base Directory Specification. There is no
-`-config <path>` flag — to isolate a tree, override
+`--config <path>` flag — to isolate a tree, override
 `XDG_CONFIG_HOME` (and friends).
 
 ```
@@ -49,15 +51,15 @@ additional chain.
 
 ```
 malcom init
-malcom snapshot fetch  -chain cosmoshub-4 -out /data/snapshots
-malcom snapshot import -chain cosmoshub-4 \
-    -snapshot /data/snapshots/snapshot_cosmoshub-4_<H> \
-    -out      /data/appdb -height <H>
-malcom bootstrap       -chain cosmoshub-4 \
-    -appdb /data/appdb/appdb_cosmoshub-4_<H> \
-    -out   /data/gaia   -height <H>
-malcom verify          -chain cosmoshub-4 \
-    -appdb /data/appdb/appdb_cosmoshub-4_<H> -height <H>
+malcom snapshot fetch  --chain cosmoshub-4 --out /data/snapshots
+malcom snapshot import --chain cosmoshub-4 \
+    --snapshot /data/snapshots/snapshot_cosmoshub-4_<H> \
+    --out      /data/appdb --height <H>
+malcom bootstrap       --chain cosmoshub-4 \
+    --appdb /data/appdb/appdb_cosmoshub-4_<H> \
+    --out   /data/chain  --height <H>
+malcom verify          --chain cosmoshub-4 \
+    --appdb /data/appdb/appdb_cosmoshub-4_<H> --height <H>
 ```
 
 ## Running `snapshot serve` under systemd

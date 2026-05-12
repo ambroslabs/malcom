@@ -20,7 +20,7 @@ import (
 // findBinary returns the absolute path to the chain binary.
 //
 // Resolution order:
-//  1. -binary flag (if non-empty), verified executable.
+//  1. --binary flag (if non-empty), verified executable.
 //  2. exec.LookPath(daemonName) — uses the operator's $PATH.
 //
 // daemonName is whatever the chain-registry's chain.json declares

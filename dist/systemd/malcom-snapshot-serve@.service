@@ -8,15 +8,15 @@ Wants=network-online.target
 Type=simple
 
 # The instance suffix (%i) is the chain id — `systemctl enable
-# malcom-snapshot-serve@cosmoshub-4` runs this with -chain cosmoshub-4.
+# malcom-snapshot-serve@cosmoshub-4` runs this with --chain cosmoshub-4.
 # The default snapshot pool lives under StateDirectory below; operators
 # who want to point at a larger volume (NVMe array, network FS, etc.)
 # should `systemctl edit malcom-snapshot-serve@<chain>` to override
 # ExecStart with their path.
 ExecStart=/usr/local/bin/malcom snapshot serve \
-  -chain %i \
-  -snapshots /var/lib/malcom/snapshots-pool \
-  -log text
+  --chain %i \
+  --snapshots /var/lib/malcom/snapshots-pool \
+  --log text
 ExecReload=/bin/kill -HUP $MAINPID
 
 Restart=on-failure

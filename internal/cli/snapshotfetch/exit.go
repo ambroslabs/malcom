@@ -26,7 +26,7 @@ const (
 	// post-import AppHash check against a trusted RPC didn't agree
 	// with consensus. The imported db is left in place so the
 	// operator can inspect; re-fetching is the typical recovery.
-	// Only produced when -import is set and -no-verify isn't.
+	// Only produced when --import is set and --no-verify isn't.
 	ExitVerifyFailed = 7
 	ExitInterrupted  = 130
 )

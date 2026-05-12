@@ -69,7 +69,7 @@ func (r Result) Match() bool { return bytes.Equal(r.LocalHash, r.ConsensusHash) 
 // surface unwrapped.
 //
 // Producer-agnostic: the appdb can come from `malcom snapshot import`
-// or from a pipelined `malcom snapshot fetch -import` — both produce
+// or from a pipelined `malcom snapshot fetch --import` — both produce
 // the same on-disk shape.
 func CheckAppHash(appdbParent string, height int64, rpcs []string, log *slog.Logger) (Result, error) {
 	var zero Result
@@ -287,7 +287,8 @@ func fetchAppHash(rpcBase string, height int64) (string, error) {
 }
 
 // computeAppHash reproduces cosmos-sdk's CommitInfo.Hash() — the
-// MultiStore AppHash that gaiad would compute and ICS-23-prove against.
+// MultiStore AppHash that a cosmos-sdk daemon would compute and
+// ICS-23-prove against.
 //
 //  1. For each (store_name, store_root_hash):
 //     leaf_input = uvarint(len(name)) || name

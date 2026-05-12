@@ -259,8 +259,8 @@ func (s *storeImporter) topHeights() []int8 {
 // finalize closes out a store: re-stamps the root with nonce=1 and
 // returns the store's root hash. If the actual root's version is less
 // than the snapshot height, also writes a redirect under
-// (snapshotHeight, 1) → (rootVersion, 1) so gaiad's LoadVersion(height)
-// can find the root.
+// (snapshotHeight, 1) → (rootVersion, 1) so the daemon's
+// LoadVersion(height) can find the root.
 //
 // Returns the merkle root hash of the store, suitable for inclusion
 // in the global commit-info. For a store whose IAVL tree had zero
@@ -276,7 +276,7 @@ func (s *storeImporter) finalize(set func(key, value []byte) error) ([]byte, err
 		return s.finalizePar(set)
 	}
 	if len(s.stack) == 0 {
-		// Empty store — write an empty root marker (gaiad reads this
+		// Empty store — write an empty root marker (the daemon reads this
 		// via nodeDBKey(snapshotHeight, 1) and tolerates an empty value).
 		s.keyScratch = nodeDBKeyInto(s.keyScratch[:0], s.storePrefix, s.height, 1)
 		if err := set(s.keyScratch, nil); err != nil {
@@ -354,7 +354,7 @@ func (s *storeImporter) finalize(set func(key, value []byte) error) ([]byte, err
 // writeStorageVersionMarker writes the per-store metadataDB
 // `storage_version` key that signals to the chain runtime that this
 // store's IAVL is already on the fast-storage layout. Without it,
-// gaiad-style daemons fall into the "Upgrading IAVL storage for
+// cosmos-sdk daemons fall into the "Upgrading IAVL storage for
 // faster queries + execution on live state" startup pass — fast for
 // empty stores but still adds latency, and on populated stores can
 // take many minutes.
@@ -380,7 +380,8 @@ func (s *storeImporter) writeStorageVersionMarker(set func(key, value []byte) er
 //
 // extDir, if non-empty, receives extracted SnapshotExtensionPayload
 // items at <extDir>/<extName>/payload-<i>-format<F>.bin, mirroring the
-// layout cosmos-bootstrap-gaia consumes. Pass "" to skip extensions.
+// layout the cosmos-bootstrap reference tool consumes. Pass "" to skip
+// extensions.
 //
 // stats accumulates Items / Extensions / ExtensionPayloads inline so
 // callers can report progress without re-walking the stream.

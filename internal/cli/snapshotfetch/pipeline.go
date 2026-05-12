@@ -1,4 +1,4 @@
-// Pipeline orchestration for `malcom snapshot fetch -import`. The
+// Pipeline orchestration for `malcom snapshot fetch --import`. The
 // orchestrator wires snapfetch's OnDownloadReady + OnChunkReady
 // callbacks to a TailingChunkSource, which the parallel importer
 // consumes as its decompressed-stream source. Fetch keeps
@@ -27,7 +27,7 @@ import (
 )
 
 // pipelineState owns the import goroutine + tailing source for a
-// single `fetch -import` run.
+// single `fetch --import` run.
 type pipelineState struct {
 	chain          config.Chain
 	importOutDir   string
@@ -69,7 +69,7 @@ type importResult struct {
 // onDownloadReady is wired to snapfetch.Config.OnDownloadReady. It
 // stands up the tailing source + import goroutine after fetch has
 // chosen an offer and prepared the snapshot dir. height is the
-// offer's actual height — which can be ≥ -target-height because
+// offer's actual height — which can be ≥ --target-height because
 // walk's match is range-based, not exact.
 func (p *pipelineState) onDownloadReady(snapDir string, height uint64, totalChunks uint32) error {
 	p.mu.Lock()

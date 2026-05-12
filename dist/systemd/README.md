@@ -40,7 +40,7 @@ sudo systemctl enable --now malcom-snapshot-serve@cosmoshub-4
 
 `systemctl status malcom-snapshot-serve@cosmoshub-4` shows the
 running instance; `journalctl -fu malcom-snapshot-serve@cosmoshub-4`
-tails its logs (the unit pipes malcom's `-log text` to journal so
+tails its logs (the unit pipes malcom's `--log text` to journal so
 slog's key=value lines stay greppable).
 
 To serve more chains, repeat the `enable --now` line with a different
@@ -56,7 +56,7 @@ banlist under `/var/lib/malcom/<chain>/`.
 
 ## Snapshot pool
 
-The unit's default points `-snapshots` at `/var/lib/malcom/snapshots-pool`.
+The unit's default points `--snapshots` at `/var/lib/malcom/snapshots-pool`.
 Because `DynamicUser=yes` is in effect, that path is bind-mounted from
 `/var/lib/private/malcom/snapshots-pool` on the host. To drop a
 finished fetch into the pool:
@@ -91,9 +91,9 @@ In the editor that opens, add:
 [Service]
 ExecStart=
 ExecStart=/usr/local/bin/malcom snapshot serve \
-  -chain %i \
-  -snapshots /data/snapshots \
-  -log text
+  --chain %i \
+  --snapshots /data/snapshots \
+  --log text
 ReadWritePaths=/data/snapshots
 ```
 
@@ -119,7 +119,7 @@ not need) would require an explicit `ReadWritePaths=` entry as shown.
 | New snapshot landed in the pool                     | `systemctl reload` (SIGHUP → catalog rescan)    |
 | Snapshot removed from the pool                      | `systemctl reload` (or wait for periodic rescan) |
 | Tweaked `/etc/malcom/chains/<id>.toml`              | `systemctl restart` (config is loaded at start) |
-| Switched to a different `-snapshots` path           | `systemctl restart` (ExecStart changed)         |
+| Switched to a different `--snapshots` path          | `systemctl restart` (ExecStart changed)         |
 | New malcom binary                                   | `systemctl restart`                             |
 
 ## Hardening notes

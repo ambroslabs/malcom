@@ -9,7 +9,7 @@
 // downstream reads these files, gunzips them, sha256s the inflated
 // bytes, and places them at the path wasmvm expects.
 //
-// Output layout matches what cosmos-bootstrap-gaia consumes:
+// Output layout matches what the cosmos-bootstrap reference tool consumes:
 //
 //	<extDir>/<extName>/payload-<index>-format<F>.bin
 

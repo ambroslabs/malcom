@@ -15,7 +15,7 @@ type Config struct {
 	ChainID     string
 	NodeKeyPath string
 	Listen      string // default "tcp://0.0.0.0:0"
-	Moniker     string // default "cosmos-p2p-snapserve"
+	Moniker     string // default "malcom-snapserve"
 	AddrBook    string // path to cometbft PEX-managed addrbook (required)
 	Banlist     string // path to cross-run banlist (required)
 
@@ -134,7 +134,7 @@ func (c *Config) applyDefaults() {
 		c.Listen = "tcp://0.0.0.0:0"
 	}
 	if c.Moniker == "" {
-		c.Moniker = "cosmos-p2p-snapserve"
+		c.Moniker = "malcom-snapserve"
 	}
 	if c.AddrBookBanDuration == 0 {
 		c.AddrBookBanDuration = time.Hour

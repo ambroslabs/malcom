@@ -12,14 +12,13 @@
 // own config.toml/app.toml/client.toml via `init`, and malcom only
 // patches a small set of fields after the fact.
 //
-// Output: <-out>/home_<chain>_<height>/{config,data}/. Default -out
+// Output: <--out>/home_<chain>_<height>/{config,data}/. Default --out
 // is the current working directory.
 package bootstrap
 
 import (
 	"context"
 	"encoding/json"
-	"flag"
 	"fmt"
 	"io"
 	"log/slog"
@@ -28,92 +27,123 @@ import (
 	"path/filepath"
 	"strings"
 
+	"github.com/spf13/cobra"
+
+	"github.com/ambroslabs/malcom/internal/cli/cliexit"
 	"github.com/ambroslabs/malcom/internal/config"
 	malcomlog "github.com/ambroslabs/malcom/internal/log"
 	"github.com/ambroslabs/malcom/internal/registry"
 	"github.com/ambroslabs/malcom/internal/snapshotimport"
 )
 
-// Run is the malcom subcommand entry point. Returns the process exit
-// code (0 on success).
-func Run(args []string) int {
-	fs := flag.NewFlagSet("malcom bootstrap", flag.ContinueOnError)
-	chain := fs.String("chain", "", "chain id (override; required if appdb meta.json is missing or omits chain_id)")
-	appdb := fs.String("appdb", "", "directory containing application.db/ and extensions/ (output of `malcom snapshot import`)")
-	height := fs.Int64("height", 0, "height override (required if appdb meta.json is missing or omits height)")
-	out := fs.String("out", ".", "parent dir for the chain home (subdir home_<chain>_<height>/ created inside)")
-	binary := fs.String("binary", "", "path to chain binary; default = $PATH lookup of daemon_name from chain-registry")
-	appStrategy := fs.String("app-strategy", "copy", "how to place application.db: copy|move (move is rename(2), same-fs only)")
-	moniker := fs.String("moniker", "", "moniker passed to <chain-exe> init (default = [chains.<id>.bootstrap].moniker, then 'malcom-bootstrap')")
-	minGasPrices := fs.String("minimum-gas-prices", "", "value for app.toml minimum-gas-prices (default = chain-registry fees.fee_tokens[0]); cosmos-sdk daemons refuse to start without one")
-	forwardPeers := fs.Bool("forward-peers", true, "write fetch's served peers into config.toml's persistent_peers")
-	doCopyAddrbook := fs.Bool("copy-addrbook", true, "copy fetch's addrbook into the chain home's config/addrbook.json")
-	skipInit := fs.Bool("skip-init", false, "skip <chain-exe> init (assumes the operator pre-init'd -out)")
-	overwrite := fs.Bool("overwrite", false, "wipe the chain home before bootstrapping (mutually exclusive with -skip-init)")
-	trustHeight := fs.Int64("trust-height", 0, "trust height for light client (defaults to -height)")
-	trustHashHex := fs.String("trust-hash", "", "trust block hash (hex) at -trust-height; auto-fetched from the chain's first RPC if empty")
-	logMode := fs.String("log", "", "log output: auto (default), pretty, text, json")
-	debug := fs.Bool("debug", false, "verbose logging")
-	if err := fs.Parse(args); err != nil {
-		return 2
-	}
-	extraInitArgs := fs.Args() // anything after `--` becomes extra `<chain-exe> init` args
+type bootstrapFlags struct {
+	chain          string
+	appdb          string
+	height         int64
+	out            string
+	binary         string
+	appStrategy    string
+	moniker        string
+	minGasPrices   string
+	forwardPeers   bool
+	doCopyAddrbook bool
+	skipInit       bool
+	overwrite      bool
+	trustHeight    int64
+	trustHashHex   string
+	logMode        string
+	debug          bool
+}
 
-	mode, ok := malcomlog.ParseMode(*logMode)
+// NewCmd returns the `malcom bootstrap` cobra command. Subcommands
+// like `bootstrap heal` are wired in by the caller via AddCommand.
+func NewCmd() *cobra.Command {
+	f := &bootstrapFlags{}
+	cmd := &cobra.Command{
+		Use:   "bootstrap",
+		Short: "assemble a runnable chain home directory",
+		Long:  "Assemble a runnable chain home directory from an imported application.db, a chain binary, and a cometbft RPC.",
+		Args:  cobra.ArbitraryArgs,
+		RunE: func(cmd *cobra.Command, args []string) error {
+			// Anything after the flags becomes extra `<chain-exe> init` args.
+			return run(f, args)
+		},
+	}
+	cmd.Flags().StringVar(&f.chain, "chain", "", "chain id (override; required if appdb meta.json is missing or omits chain_id)")
+	cmd.Flags().StringVar(&f.appdb, "appdb", "", "directory containing application.db/ and extensions/ (output of 'malcom snapshot import')")
+	cmd.Flags().Int64Var(&f.height, "height", 0, "height override (required if appdb meta.json is missing or omits height)")
+	cmd.Flags().StringVar(&f.out, "out", ".", "parent dir for the chain home (subdir home_<chain>_<height>/ created inside)")
+	cmd.Flags().StringVar(&f.binary, "binary", "", "path to chain binary; default = $PATH lookup of daemon_name from chain-registry")
+	cmd.Flags().StringVar(&f.appStrategy, "app-strategy", "copy", "how to place application.db: copy|move (move is rename(2), same-fs only)")
+	cmd.Flags().StringVar(&f.moniker, "moniker", "", "moniker passed to <chain-exe> init (default = [chains.<id>.bootstrap].moniker, then 'malcom-bootstrap')")
+	cmd.Flags().StringVar(&f.minGasPrices, "minimum-gas-prices", "", "value for app.toml minimum-gas-prices (default = chain-registry fees.fee_tokens[0]); cosmos-sdk daemons refuse to start without one")
+	cmd.Flags().BoolVar(&f.forwardPeers, "forward-peers", true, "write fetch's served peers into config.toml's persistent_peers")
+	cmd.Flags().BoolVar(&f.doCopyAddrbook, "copy-addrbook", true, "copy fetch's addrbook into the chain home's config/addrbook.json")
+	cmd.Flags().BoolVar(&f.skipInit, "skip-init", false, "skip <chain-exe> init (assumes the operator pre-init'd --out)")
+	cmd.Flags().BoolVar(&f.overwrite, "overwrite", false, "wipe the chain home before bootstrapping (mutually exclusive with --skip-init)")
+	cmd.Flags().Int64Var(&f.trustHeight, "trust-height", 0, "trust height for light client (defaults to --height)")
+	cmd.Flags().StringVar(&f.trustHashHex, "trust-hash", "", "trust block hash (hex) at --trust-height; auto-fetched from the chain's first RPC if empty")
+	cmd.Flags().StringVar(&f.logMode, "log", "", "log output: auto (default), pretty, text, json")
+	cmd.Flags().BoolVar(&f.debug, "debug", false, "verbose logging")
+	return cmd
+}
+
+func run(f *bootstrapFlags, extraInitArgs []string) error {
+	mode, ok := malcomlog.ParseMode(f.logMode)
 	if !ok {
-		fmt.Fprintf(os.Stderr, "invalid -log %q (want auto/pretty/text/json)\n", *logMode)
-		return 2
+		fmt.Fprintf(os.Stderr, "invalid --log %q (want auto/pretty/text/json)\n", f.logMode)
+		return &cliexit.Error{Code: 2}
 	}
 
-	if *appdb == "" {
-		fmt.Fprintln(os.Stderr, "required: -appdb <dir>")
-		return 2
+	if f.appdb == "" {
+		fmt.Fprintln(os.Stderr, "required: --appdb <dir>")
+		return &cliexit.Error{Code: 2}
 	}
-	if *skipInit && *overwrite {
-		fmt.Fprintln(os.Stderr, "-skip-init and -overwrite are mutually exclusive")
-		return 2
+	if f.skipInit && f.overwrite {
+		fmt.Fprintln(os.Stderr, "--skip-init and --overwrite are mutually exclusive")
+		return &cliexit.Error{Code: 2}
 	}
-	strategy, err := ParseAppStrategy(*appStrategy)
+	strategy, err := ParseAppStrategy(f.appStrategy)
 	if err != nil {
 		fmt.Fprintln(os.Stderr, err)
-		return 2
+		return &cliexit.Error{Code: 2}
 	}
 
 	// Read appdb meta.json. chain_id, height, and db_backend are
 	// drawn from there so the operator doesn't have to repeat them;
 	// flags are required overrides only when meta.json is missing.
-	appdbMeta, metaErr := snapshotimport.ReadAppDBMeta(*appdb)
+	appdbMeta, metaErr := snapshotimport.ReadAppDBMeta(f.appdb)
 	switch {
 	case metaErr != nil && !os.IsNotExist(metaErr):
 		fmt.Fprintf(os.Stderr, "read appdb meta: %v\n", metaErr)
-		return 1
+		return &cliexit.Error{Code: 1}
 	case metaErr != nil:
-		if *chain == "" || *height == 0 {
-			fmt.Fprintf(os.Stderr, "no meta.json in %s; pass -chain and -height to override\n", *appdb)
-			return 2
+		if f.chain == "" || f.height == 0 {
+			fmt.Fprintf(os.Stderr, "no meta.json in %s; pass --chain and --height to override\n", f.appdb)
+			return &cliexit.Error{Code: 2}
 		}
 	default:
-		if appdbMeta.ChainID != "" && *chain != "" && appdbMeta.ChainID != *chain {
-			fmt.Fprintf(os.Stderr, "meta.json chain_id %q does not match -chain %q\n", appdbMeta.ChainID, *chain)
-			return 1
+		if appdbMeta.ChainID != "" && f.chain != "" && appdbMeta.ChainID != f.chain {
+			fmt.Fprintf(os.Stderr, "meta.json chain_id %q does not match --chain %q\n", appdbMeta.ChainID, f.chain)
+			return &cliexit.Error{Code: 1}
 		}
-		if appdbMeta.Height != 0 && *height != 0 && appdbMeta.Height != *height {
-			fmt.Fprintf(os.Stderr, "meta.json height %d does not match -height %d\n", appdbMeta.Height, *height)
-			return 1
+		if appdbMeta.Height != 0 && f.height != 0 && appdbMeta.Height != f.height {
+			fmt.Fprintf(os.Stderr, "meta.json height %d does not match --height %d\n", appdbMeta.Height, f.height)
+			return &cliexit.Error{Code: 1}
 		}
-		if *chain == "" {
+		if f.chain == "" {
 			if appdbMeta.ChainID == "" {
-				fmt.Fprintln(os.Stderr, "meta.json has no chain_id; pass -chain to override")
-				return 2
+				fmt.Fprintln(os.Stderr, "meta.json has no chain_id; pass --chain to override")
+				return &cliexit.Error{Code: 2}
 			}
-			*chain = appdbMeta.ChainID
+			f.chain = appdbMeta.ChainID
 		}
-		if *height == 0 {
+		if f.height == 0 {
 			if appdbMeta.Height == 0 {
-				fmt.Fprintln(os.Stderr, "meta.json has no height; pass -height to override")
-				return 2
+				fmt.Fprintln(os.Stderr, "meta.json has no height; pass --height to override")
+				return &cliexit.Error{Code: 2}
 			}
-			*height = appdbMeta.Height
+			f.height = appdbMeta.Height
 		}
 	}
 
@@ -127,27 +157,27 @@ func Run(args []string) int {
 	cfgFile, err := config.Load()
 	if err != nil {
 		fmt.Fprintln(os.Stderr, err)
-		return 1
+		return &cliexit.Error{Code: 1}
 	}
-	ch, err := cfgFile.Resolve(*chain)
+	ch, err := cfgFile.Resolve(f.chain)
 	if err != nil {
 		fmt.Fprintln(os.Stderr, err)
-		return 1
+		return &cliexit.Error{Code: 1}
 	}
 
 	logOpts, err := malcomlog.BuildOptions(malcomlog.Tuning{
 		Level:   ch.Log.Level,
 		Modules: ch.Log.Modules,
-	}, mode, *debug, os.Stderr)
+	}, mode, f.debug, os.Stderr)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "log config: %v\n", err)
-		return 2
+		return &cliexit.Error{Code: 2}
 	}
 	log := malcomlog.New(logOpts).With("module", "bootstrap")
 
 	// chain-registry lookup gives us daemon_name (PATH fallback) and
 	// recommended_version (informational). Missing registry entry is
-	// fine when the operator passes -binary explicitly.
+	// fine when the operator passes --binary explicitly.
 	var regInfo *registry.ChainInfo
 	if cacheDir, err := config.RegistryCacheDir(); err == nil {
 		if r, err := registry.Lookup(cacheDir, ch.ChainID); err == nil {
@@ -160,10 +190,10 @@ func Run(args []string) int {
 	if regInfo != nil {
 		daemonName = regInfo.DaemonName
 	}
-	binPath, err := findBinary(*binary, daemonName)
+	binPath, err := findBinary(f.binary, daemonName)
 	if err != nil {
 		log.Error("locate chain binary", "err", err)
-		return 1
+		return &cliexit.Error{Code: 1}
 	}
 
 	// RPCs are needed for the trust-hash lookup and for the
@@ -171,7 +201,7 @@ func Run(args []string) int {
 	// missing — later steps will fail anyway.
 	if len(ch.RPCs) == 0 {
 		log.Error("chains.<id>.rpcs is empty", "chain", ch.ChainID, "config", cfgFile.Path())
-		return 1
+		return &cliexit.Error{Code: 1}
 	}
 	rpcs := append([]string(nil), ch.RPCs...)
 	if len(rpcs) == 1 {
@@ -180,10 +210,10 @@ func Run(args []string) int {
 		log.Warn("only 1 RPC URL configured; duplicating for cometbft light-client (requires >=2)")
 	}
 
-	if *trustHeight == 0 {
-		*trustHeight = *height
+	if f.trustHeight == 0 {
+		f.trustHeight = f.height
 	}
-	chosenMoniker := *moniker
+	chosenMoniker := f.moniker
 	if chosenMoniker == "" {
 		chosenMoniker = ch.Bootstrap.Moniker
 	}
@@ -191,14 +221,14 @@ func Run(args []string) int {
 		chosenMoniker = "malcom-bootstrap"
 	}
 
-	outRoot := filepath.Join(*out, fmt.Sprintf("home_%s_%d", ch.ChainID, *height))
+	outRoot := filepath.Join(f.out, fmt.Sprintf("home_%s_%d", ch.ChainID, f.height))
 	configDir := filepath.Join(outRoot, "config")
 	dataDir := filepath.Join(outRoot, "data")
 
 	log.Info("starting",
 		"config", cfgFile.Path(),
 		"chain", ch.ChainID,
-		"height", *height,
+		"height", f.height,
 		"out", outRoot,
 		"binary", binPath,
 		"app_strategy", string(strategy),
@@ -207,35 +237,35 @@ func Run(args []string) int {
 		log.Info("chain-registry recommended version", "version", regInfo.RecommendedVersion)
 	}
 
-	if *overwrite {
+	if f.overwrite {
 		log.Info("overwrite: wiping out dir", "dir", outRoot)
 		if err := os.RemoveAll(outRoot); err != nil {
 			log.Error("remove out dir", "err", err)
-			return 1
+			return &cliexit.Error{Code: 1}
 		}
 	}
 
 	ctx := context.Background()
 
 	// 1. <binary> init <moniker> --chain-id <id> --home <outRoot> [extras]
-	if !*skipInit {
+	if !f.skipInit {
 		if _, err := os.Stat(filepath.Join(configDir, "config.toml")); err == nil {
-			log.Error("chain home already initialized; pass -skip-init or -overwrite", "dir", outRoot)
-			return 1
+			log.Error("chain home already initialized; pass --skip-init or --overwrite", "dir", outRoot)
+			return &cliexit.Error{Code: 1}
 		}
 		if err := os.MkdirAll(outRoot, 0o755); err != nil {
 			log.Error("mkdir out failed", "err", err)
-			return 1
+			return &cliexit.Error{Code: 1}
 		}
 		initArgs := append([]string{"init", chosenMoniker, "--chain-id", ch.ChainID, "--home", outRoot}, extraInitArgs...)
 		if err := runDaemon(ctx, log, binPath, initArgs...); err != nil {
 			log.Error("daemon init failed", "err", err)
-			return 1
+			return &cliexit.Error{Code: 1}
 		}
 	} else {
 		if _, err := os.Stat(filepath.Join(configDir, "config.toml")); err != nil {
-			log.Error("-skip-init set but config.toml missing", "path", filepath.Join(configDir, "config.toml"))
-			return 1
+			log.Error("--skip-init set but config.toml missing", "path", filepath.Join(configDir, "config.toml"))
+			return &cliexit.Error{Code: 1}
 		}
 		log.Info("skip-init: using existing chain home", "dir", outRoot)
 	}
@@ -243,20 +273,20 @@ func Run(args []string) int {
 	// 2. Overlay real genesis.json from chain config (or chain-registry).
 	if err := overlayGenesis(ch, regInfo, configDir, log); err != nil {
 		log.Error("overlay genesis", "err", err)
-		return 1
+		return &cliexit.Error{Code: 1}
 	}
 
 	// 3. Resolve trust hash (auto-fetch from RPC if not provided).
-	if *trustHashHex == "" {
-		log.Info("fetching trust hash", "rpc", rpcs[0], "height", *trustHeight)
-		bh, err := fetchBlockHash(rpcs[0], *trustHeight)
+	if f.trustHashHex == "" {
+		log.Info("fetching trust hash", "rpc", rpcs[0], "height", f.trustHeight)
+		bh, err := fetchBlockHash(rpcs[0], f.trustHeight)
 		if err != nil {
 			log.Error("fetch trust hash failed", "err", err)
-			return 1
+			return &cliexit.Error{Code: 1}
 		}
-		*trustHashHex = bh
+		f.trustHashHex = bh
 	}
-	log.Info("trust", "height", *trustHeight, "hash", *trustHashHex)
+	log.Info("trust", "height", f.trustHeight, "hash", f.trustHashHex)
 
 	// 4. Patch app.toml + config.toml with the values bootstrap-state
 	//    and the runtime daemon will read.
@@ -264,45 +294,45 @@ func Run(args []string) int {
 	cfgTOML := filepath.Join(configDir, "config.toml")
 	if err := setTOMLString(appTOML, "", "app-db-backend", dbBackend); err != nil {
 		log.Error("patch app.toml app-db-backend", "err", err)
-		return 1
+		return &cliexit.Error{Code: 1}
 	}
 	log.Info("app.toml patched", "app-db-backend", dbBackend)
 
-	chosenMinGasPrices := *minGasPrices
+	chosenMinGasPrices := f.minGasPrices
 	if chosenMinGasPrices == "" && regInfo != nil {
 		chosenMinGasPrices = regInfo.MinGasPrice
 	}
 	if chosenMinGasPrices != "" {
 		if err := setTOMLString(appTOML, "", "minimum-gas-prices", chosenMinGasPrices); err != nil {
 			log.Error("patch app.toml minimum-gas-prices", "err", err)
-			return 1
+			return &cliexit.Error{Code: 1}
 		}
 		log.Info("app.toml minimum-gas-prices patched", "value", chosenMinGasPrices)
 	} else {
 		log.Warn("no minimum-gas-prices source — daemon will refuse to start until you set it",
-			"hint", "pass -minimum-gas-prices, or set it in app.toml after bootstrap")
+			"hint", "pass --minimum-gas-prices, or set it in app.toml after bootstrap")
 	}
 
 	trustPeriod := ch.Bootstrap.TrustPeriod.Duration().String()
 	rpcServersCSV := strings.Join(rpcs, ",")
 	if err := setTOMLString(cfgTOML, "statesync", "rpc_servers", rpcServersCSV); err != nil {
 		log.Error("patch config.toml statesync.rpc_servers", "err", err)
-		return 1
+		return &cliexit.Error{Code: 1}
 	}
-	if err := setTOMLInt64(cfgTOML, "statesync", "trust_height", *trustHeight); err != nil {
+	if err := setTOMLInt64(cfgTOML, "statesync", "trust_height", f.trustHeight); err != nil {
 		log.Error("patch config.toml statesync.trust_height", "err", err)
-		return 1
+		return &cliexit.Error{Code: 1}
 	}
-	if err := setTOMLString(cfgTOML, "statesync", "trust_hash", *trustHashHex); err != nil {
+	if err := setTOMLString(cfgTOML, "statesync", "trust_hash", f.trustHashHex); err != nil {
 		log.Error("patch config.toml statesync.trust_hash", "err", err)
-		return 1
+		return &cliexit.Error{Code: 1}
 	}
 	if err := setTOMLString(cfgTOML, "statesync", "trust_period", trustPeriod); err != nil {
 		log.Error("patch config.toml statesync.trust_period", "err", err)
-		return 1
+		return &cliexit.Error{Code: 1}
 	}
 	log.Info("config.toml [statesync] patched",
-		"rpc_servers", rpcServersCSV, "trust_height", *trustHeight, "trust_period", trustPeriod)
+		"rpc_servers", rpcServersCSV, "trust_height", f.trustHeight, "trust_period", trustPeriod)
 
 	// 5. Forward fetch-validated served peers + the chain config's
 	//    bootstrap_peers (chain-registry's seeds + persistent_peers,
@@ -311,7 +341,7 @@ func Run(args []string) int {
 	//    serve us during fetch; the registry list backfills with
 	//    well-known stable peers in case served entries are pruned or
 	//    don't run blocksync.
-	if *forwardPeers {
+	if f.forwardPeers {
 		served, err := readServedPeers(ch.Served, defaultPersistentPeerCount)
 		if err != nil {
 			log.Warn("read served peers (continuing without)", "err", err, "path", ch.Served)
@@ -323,7 +353,7 @@ func Run(args []string) int {
 			joined := joinPersistentPeers(merged)
 			if err := setTOMLString(cfgTOML, "p2p", "persistent_peers", joined); err != nil {
 				log.Error("patch config.toml p2p.persistent_peers", "err", err)
-				return 1
+				return &cliexit.Error{Code: 1}
 			}
 			log.Info("config.toml [p2p].persistent_peers patched",
 				"served", len(served),
@@ -333,31 +363,31 @@ func Run(args []string) int {
 	}
 
 	// 6. Copy fetch's addrbook into <home>/config/addrbook.json if asked.
-	if *doCopyAddrbook {
+	if f.doCopyAddrbook {
 		if err := copyAddrbook(ch.AddrBook, outRoot, log); err != nil {
 			log.Error("copy addrbook", "err", err)
-			return 1
+			return &cliexit.Error{Code: 1}
 		}
 	}
 
 	// 7. Place application.db.
-	srcAppDB := filepath.Join(*appdb, "application.db")
+	srcAppDB := filepath.Join(f.appdb, "application.db")
 	dstAppDB := filepath.Join(dataDir, "application.db")
 	if err := os.MkdirAll(dataDir, 0o755); err != nil {
 		log.Error("mkdir data", "err", err)
-		return 1
+		return &cliexit.Error{Code: 1}
 	}
 	if err := placeAppDB(srcAppDB, dstAppDB, strategy, log); err != nil {
 		log.Error("place application.db", "err", err)
-		return 1
+		return &cliexit.Error{Code: 1}
 	}
 
 	// 8. Place wasm extension payloads (if any).
-	srcExt := filepath.Join(*appdb, "extensions")
+	srcExt := filepath.Join(f.appdb, "extensions")
 	if _, err := os.Stat(srcExt); err == nil {
 		if err := placeWasmPayloads(srcExt, outRoot, ch.ChainID, log); err != nil {
 			log.Error("place wasm payloads", "err", err)
-			return 1
+			return &cliexit.Error{Code: 1}
 		}
 	}
 
@@ -366,29 +396,29 @@ func Run(args []string) int {
 	sub, err := probeStatesyncSubcommand(ctx, binPath)
 	if err != nil {
 		log.Error("probe bootstrap-state subcommand", "err", err)
-		return 1
+		return &cliexit.Error{Code: 1}
 	}
 	log.Info("bootstrap-state subcommand probed", "path", sub)
 
-	bsArgs := []string{sub, "bootstrap-state", "--home", outRoot, "--height", fmt.Sprintf("%d", *height)}
+	bsArgs := []string{sub, "bootstrap-state", "--home", outRoot, "--height", fmt.Sprintf("%d", f.height)}
 	if err := runDaemon(ctx, log, binPath, bsArgs...); err != nil {
 		log.Error("bootstrap-state failed", "err", err)
-		return 1
+		return &cliexit.Error{Code: 1}
 	}
 
-	// Record the bootstrap height in the home so `malcom heal` can
-	// re-apply it after a failed first start consumes cometbft's
+	// Record the bootstrap height in the home so `malcom bootstrap heal`
+	// can re-apply it after a failed first start consumes cometbft's
 	// OfflineStateSyncHeight signal. See #95 and markerfile.go.
 	// Best-effort: a failure to write the marker doesn't fail the
 	// bootstrap (the home is otherwise valid), but the operator gets
-	// a loud warning so they know recovery will need -height.
-	if err := WriteHeightMarker(outRoot, *height); err != nil {
-		log.Warn("write bootstrap-height marker failed; `malcom heal` will require -height",
+	// a loud warning so they know recovery will need --height.
+	if err := WriteHeightMarker(outRoot, f.height); err != nil {
+		log.Warn("write bootstrap-height marker failed; `malcom bootstrap heal` will require --height",
 			"err", err, "marker", BootstrapHeightMarker)
 	} else {
 		log.Info("bootstrap-height marker written",
 			"path", filepath.Join(outRoot, BootstrapHeightMarker),
-			"height", *height)
+			"height", f.height)
 	}
 
 	log.Info("done",
@@ -397,9 +427,9 @@ func Run(args []string) int {
 		"appdb", dstAppDB,
 		"state_db", filepath.Join(dataDir, "state.db"),
 		"blockstore_db", filepath.Join(dataDir, "blockstore.db"),
-		"height", *height,
+		"height", f.height,
 		"start_command", fmt.Sprintf("%s start --home %s", binPath, outRoot))
-	return 0
+	return nil
 }
 
 // overlayGenesis copies the chain's real genesis.json into <configDir>.

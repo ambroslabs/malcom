@@ -14,7 +14,7 @@ type Config struct {
 	ChainID        string
 	NodeKeyPath    string
 	Listen         string // default "tcp://0.0.0.0:0"
-	Moniker        string // default "cosmos-p2p-snapfetch"
+	Moniker        string // default "malcom-snapfetch"
 	AddrBook       string // path to cometbft PEX-managed addrbook (required)
 	Banlist        string // path to cross-run banlist (required)
 	Served         string // path to cross-run served-peers list (required)
@@ -167,7 +167,7 @@ func (c *Config) applyDefaults() {
 		c.Listen = "tcp://0.0.0.0:0"
 	}
 	if c.Moniker == "" {
-		c.Moniker = "cosmos-p2p-snapfetch"
+		c.Moniker = "malcom-snapfetch"
 	}
 	if c.DiscoverFor == 0 {
 		c.DiscoverFor = 25 * time.Second

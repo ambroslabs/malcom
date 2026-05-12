@@ -1,6 +1,6 @@
 // Package cleancmd is the `malcom clean` subcommand: wipe malcom's
 // state across $XDG_{CONFIG,STATE,CACHE}_HOME/malcom/. Default backs
-// up each existing dir to <dir>.bak.<UTC-ts>; -clobber removes them
+// up each existing dir to <dir>.bak.<UTC-ts>; --clobber removes them
 // outright.
 //
 // Useful during config-schema iteration: re-test from a clean slate
@@ -10,7 +10,6 @@ package cleancmd
 
 import (
 	"errors"
-	"flag"
 	"fmt"
 	iofs "io/fs"
 	"log/slog"
@@ -18,23 +17,38 @@ import (
 	"path/filepath"
 	"time"
 
+	"github.com/spf13/cobra"
+
+	"github.com/ambroslabs/malcom/internal/cli/cliexit"
 	"github.com/ambroslabs/malcom/internal/config"
 	malcomlog "github.com/ambroslabs/malcom/internal/log"
 )
 
-// Run is the malcom subcommand entry point.
-func Run(args []string) int {
-	fs := flag.NewFlagSet("malcom clean", flag.ContinueOnError)
-	clobber := fs.Bool("clobber", false, "delete instead of backing up to <dir>.bak.<ts>")
-	logMode := fs.String("log", "", "log output: auto (default), pretty, text, json")
-	if err := fs.Parse(args); err != nil {
-		return 2
+// NewCmd returns the `malcom clean` cobra command.
+func NewCmd() *cobra.Command {
+	var (
+		clobber bool
+		logMode string
+	)
+	cmd := &cobra.Command{
+		Use:   "clean",
+		Short: "back up (or --clobber) the XDG malcom dirs",
+		Long:  "Wipe malcom's state across $XDG_{CONFIG,STATE,CACHE}_HOME/malcom/. Default backs up each existing dir to <dir>.bak.<UTC-ts>; --clobber removes them outright.",
+		Args:  cobra.NoArgs,
+		RunE: func(cmd *cobra.Command, _ []string) error {
+			return run(clobber, logMode)
+		},
 	}
+	cmd.Flags().BoolVar(&clobber, "clobber", false, "delete instead of backing up to <dir>.bak.<ts>")
+	cmd.Flags().StringVar(&logMode, "log", "", "log output: auto (default), pretty, text, json")
+	return cmd
+}
 
-	mode, ok := malcomlog.ParseMode(*logMode)
+func run(clobber bool, logMode string) error {
+	mode, ok := malcomlog.ParseMode(logMode)
 	if !ok {
-		fmt.Fprintf(os.Stderr, "invalid -log %q (want auto/pretty/text/json)\n", *logMode)
-		return 2
+		fmt.Fprintf(os.Stderr, "invalid --log %q (want auto/pretty/text/json)\n", logMode)
+		return &cliexit.Error{Code: 2}
 	}
 	log := malcomlog.New(malcomlog.Options{
 		Writer: os.Stderr, Mode: mode, Level: slog.LevelInfo,
@@ -43,19 +57,19 @@ func Run(args []string) int {
 	cfgPath, err := config.DefaultConfigPath()
 	if err != nil {
 		log.Error("resolve config path", "err", err)
-		return 1
+		return &cliexit.Error{Code: 1}
 	}
 	configRoot := filepath.Dir(cfgPath)
 
 	stateDir, err := config.StateDir()
 	if err != nil {
 		log.Error("resolve state dir", "err", err)
-		return 1
+		return &cliexit.Error{Code: 1}
 	}
 	cacheDir, err := config.CacheDir()
 	if err != nil {
 		log.Error("resolve cache dir", "err", err)
-		return 1
+		return &cliexit.Error{Code: 1}
 	}
 
 	targets := []string{configRoot, stateDir, cacheDir}
@@ -81,7 +95,7 @@ func Run(args []string) int {
 		}
 		nothing = false
 
-		if *clobber {
+		if clobber {
 			if err := os.RemoveAll(p); err != nil {
 				log.Error("remove failed", "path", p, "err", err)
 				rc = 1
@@ -103,7 +117,10 @@ func Run(args []string) int {
 	if nothing && rc == 0 {
 		log.Info("nothing to clean")
 	}
-	return rc
+	if rc != 0 {
+		return &cliexit.Error{Code: rc}
+	}
+	return nil
 }
 
 // uniqueBackupName returns "<p>.bak.<ts>" — or "<p>.bak.<ts>-N" if

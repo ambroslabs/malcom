@@ -66,7 +66,7 @@ type Chain struct {
 //
 // Default import behaviour is to write the snapshot in bulk-load mode
 // with auto-compactions disabled, then close the DB. The user runs
-// `malcom compact` separately, or lets gaiad's pebble auto-compact
+// `malcom compact` separately, or lets the daemon's pebble auto-compact
 // at runtime. So these knobs typically only matter for the standalone
 // compact job.
 type CompactTuning struct {
@@ -247,13 +247,13 @@ type ImportTuning struct {
 	// FlushSplitMB caps L0 SSTable size produced by memtable flushes.
 	// 0 = pebble default (4 MiB). Setting equal to memtable_mb yields
 	// ~1 SSTable per flush, which dramatically reduces L0 file count
-	// when CompactDuringImport is false (gaiad sees ~50 L0 files
+	// when CompactDuringImport is false (the daemon sees ~50 L0 files
 	// instead of thousands and auto-compacts more efficiently).
 	FlushSplitMB int `toml:"flush_split_mb"`
 
 	// CompactDuringImport enables pebble's auto-compactions while
 	// the import streams. Default false (bulk-load mode): compactions
-	// are deferred to a manual `malcom compact` pass or to gaiad's
+	// are deferred to a manual `malcom compact` pass or to the daemon's
 	// runtime auto-compactions. Setting true trades import wall time
 	// for less peak disk usage and a tighter LSM at end of import.
 	CompactDuringImport bool `toml:"compact_during_import"`

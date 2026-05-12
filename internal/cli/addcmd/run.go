@@ -10,7 +10,7 @@
 //	$XDG_CACHE_HOME/malcom/<id>/                 ephemeral cache (block snapshots, etc.)
 //	$XDG_DATA_HOME/malcom/<id>/                  data dir (genesis lands here lazily)
 //
-// Unless -offline is passed, add resolves the chain id against the
+// Unless --offline is passed, add resolves the chain id against the
 // cached cosmos chain-registry snapshot under
 // $XDG_CACHE_HOME/malcom/chain-registry/. The cache auto-syncs on
 // first add and whenever it's older than registry.DefaultIndexMaxAge.
@@ -19,14 +19,13 @@
 // mis-attributed config. Genesis is NOT downloaded here — bootstrap
 // fetches it lazily so add stays fast.
 //
-// Subsequent runs are a no-op: existing files are kept. -force
+// Subsequent runs are a no-op: existing files are kept. --force
 // overwrites chains/<id>.toml (the node key is never overwritten).
 package addcmd
 
 import (
 	"context"
 	"errors"
-	"flag"
 	"fmt"
 	"log/slog"
 	"os"
@@ -36,6 +35,9 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/spf13/cobra"
+
+	"github.com/ambroslabs/malcom/internal/cli/cliexit"
 	"github.com/ambroslabs/malcom/internal/config"
 	"github.com/ambroslabs/malcom/internal/helpers/nodekey"
 	malcomlog "github.com/ambroslabs/malcom/internal/log"
@@ -48,31 +50,41 @@ import (
 // osmosis-1, neutron-1, gravity-bridge-3, ...) all fit this shape.
 var chainIDPattern = regexp.MustCompile(`^[a-z0-9][a-z0-9._-]*$`)
 
-// Run is the malcom subcommand entry point.
-func Run(args []string) int {
-	fs := flag.NewFlagSet("malcom add", flag.ContinueOnError)
-	force := fs.Bool("force", false, "overwrite existing chains/<id>.toml (node key is never overwritten)")
-	offline := fs.Bool("offline", false, "skip cosmos chain-registry fetch; write a blank chain template")
-	logMode := fs.String("log", "", "log output: auto (default), pretty, text, json")
-	if err := fs.Parse(args); err != nil {
-		return 2
+// NewCmd returns the `malcom add` cobra command.
+func NewCmd() *cobra.Command {
+	var (
+		force   bool
+		offline bool
+		logMode string
+	)
+	cmd := &cobra.Command{
+		Use:   "add <chain-id>",
+		Short: "register a chain (chain config + node key + per-chain dirs)",
+		Long:  "Register a chain into a previously-initialised malcom tree. Unless --offline is passed, looks up the chain id in the cached cosmos chain-registry snapshot.",
+		Args: func(cmd *cobra.Command, args []string) error {
+			if len(args) != 1 || args[0] == "" {
+				return fmt.Errorf("requires exactly one <chain-id> argument")
+			}
+			if !chainIDPattern.MatchString(args[0]) {
+				return fmt.Errorf("invalid chain id %q: must match %s", args[0], chainIDPattern)
+			}
+			return nil
+		},
+		RunE: func(cmd *cobra.Command, args []string) error {
+			return run(args[0], force, offline, logMode)
+		},
 	}
-	rest := fs.Args()
-	if len(rest) != 1 || rest[0] == "" {
-		fmt.Fprintln(os.Stderr, "usage: malcom add [-force] [-offline] <chain-id>")
-		fmt.Fprintln(os.Stderr, "note: flags must precede <chain-id> (e.g. `malcom add -offline cosmoshub-4`)")
-		return 2
-	}
-	chain := rest[0]
-	if !chainIDPattern.MatchString(chain) {
-		fmt.Fprintf(os.Stderr, "invalid chain id %q: must match %s\n", chain, chainIDPattern)
-		return 2
-	}
+	cmd.Flags().BoolVar(&force, "force", false, "overwrite existing chains/<id>.toml (node key is never overwritten)")
+	cmd.Flags().BoolVar(&offline, "offline", false, "skip cosmos chain-registry fetch; write a blank chain template")
+	cmd.Flags().StringVar(&logMode, "log", "", "log output: auto (default), pretty, text, json")
+	return cmd
+}
 
-	mode, ok := malcomlog.ParseMode(*logMode)
+func run(chain string, force, offline bool, logMode string) error {
+	mode, ok := malcomlog.ParseMode(logMode)
 	if !ok {
-		fmt.Fprintf(os.Stderr, "invalid -log %q (want auto/pretty/text/json)\n", *logMode)
-		return 2
+		fmt.Fprintf(os.Stderr, "invalid --log %q (want auto/pretty/text/json)\n", logMode)
+		return &cliexit.Error{Code: 2}
 	}
 	log := malcomlog.New(malcomlog.Options{
 		Writer: os.Stderr, Mode: mode, Level: slog.LevelInfo,
@@ -81,32 +93,32 @@ func Run(args []string) int {
 	cfgPath, err := config.DefaultConfigPath()
 	if err != nil {
 		log.Error("resolve config path", "err", err)
-		return 1
+		return &cliexit.Error{Code: 1}
 	}
 	if _, err := os.Stat(cfgPath); err != nil {
 		if os.IsNotExist(err) {
 			log.Error("no malcom config — run `malcom init` first", "path", cfgPath)
-			return 1
+			return &cliexit.Error{Code: 1}
 		}
 		log.Error("stat config", "path", cfgPath, "err", err)
-		return 1
+		return &cliexit.Error{Code: 1}
 	}
 	chainsDir := filepath.Join(filepath.Dir(cfgPath), "chains")
 
 	stateDir, err := config.StateDir()
 	if err != nil {
 		log.Error("resolve state dir", "err", err)
-		return 1
+		return &cliexit.Error{Code: 1}
 	}
 	cacheDir, err := config.CacheDir()
 	if err != nil {
 		log.Error("resolve cache dir", "err", err)
-		return 1
+		return &cliexit.Error{Code: 1}
 	}
 	dataDir, err := config.DataDir()
 	if err != nil {
 		log.Error("resolve data dir", "err", err)
-		return 1
+		return &cliexit.Error{Code: 1}
 	}
 
 	chainStateDir := filepath.Join(stateDir, chain)
@@ -118,21 +130,21 @@ func Run(args []string) int {
 	for _, d := range []string{chainsDir, chainStateDir, chainCacheDir, chainDataDir} {
 		if err := os.MkdirAll(d, 0o755); err != nil {
 			log.Error("mkdir failed", "dir", d, "err", err)
-			return 1
+			return &cliexit.Error{Code: 1}
 		}
 	}
 
 	var info *registry.ChainInfo
-	if !*offline {
+	if !offline {
 		regCacheDir, err := config.RegistryCacheDir()
 		if err != nil {
 			log.Error("resolve registry cache dir", "err", err)
-			return 1
+			return &cliexit.Error{Code: 1}
 		}
 		i, lerr := lookupChain(regCacheDir, chain, log)
 		if lerr != nil {
 			log.Error("registry lookup failed", "err", lerr)
-			return 1
+			return &cliexit.Error{Code: 1}
 		}
 		info = i
 		log.Info("registry lookup",
@@ -142,15 +154,15 @@ func Run(args []string) int {
 
 	defaultGenesis := registry.HardcodedGenesisURLs[chain]
 	body := config.ChainTemplate(chain, info, defaultGenesis)
-	written, err := writeIfMissing(chainCfgPath, body, *force)
+	written, err := writeIfMissing(chainCfgPath, body, force)
 	if err != nil {
 		log.Error("write chain config failed", "path", chainCfgPath, "err", err)
-		return 1
+		return &cliexit.Error{Code: 1}
 	}
 	switch {
 	case !written:
-		log.Info("chain config exists, keeping (pass -force to overwrite)", "path", chainCfgPath)
-	case *force:
+		log.Info("chain config exists, keeping (pass --force to overwrite)", "path", chainCfgPath)
+	case force:
 		log.Info("chain config written (forced)", "path", chainCfgPath)
 	default:
 		log.Info("chain config written", "path", chainCfgPath)
@@ -161,7 +173,7 @@ func Run(args []string) int {
 	} else {
 		if _, err := nodekey.LoadOrGen(nodeKeyPath); err != nil {
 			log.Error("generate node key failed", "err", err)
-			return 1
+			return &cliexit.Error{Code: 1}
 		}
 		log.Info("generated node key", "path", nodeKeyPath)
 	}
@@ -172,7 +184,7 @@ func Run(args []string) int {
 		"state", chainStateDir,
 		"cache", chainCacheDir,
 		"data", chainDataDir)
-	return 0
+	return nil
 }
 
 // writeIfMissing writes body to path. If the file exists and force is
@@ -214,7 +226,7 @@ func lookupChain(cacheDir, chain string, log *slog.Logger) (*registry.ChainInfo,
 		return nil, fmt.Errorf(
 			"chain id %q is not in the cached chain-registry index\n"+
 				"  - if upstream added it recently, run `malcom registry refresh`\n"+
-				"  - if you don't want a registry lookup, re-run with -offline (you'll need to fill in chains/%s.toml by hand)",
+				"  - if you don't want a registry lookup, re-run with --offline (you'll need to fill in chains/%s.toml by hand)",
 			chain, chain)
 	}
 	return nil, fmt.Errorf("registry lookup: %w", err)
