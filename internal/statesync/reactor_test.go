@@ -4,6 +4,7 @@ import (
 	"net"
 	"sync"
 	"testing"
+	"time"
 
 	cmtlog "github.com/cometbft/cometbft/libs/log"
 	"github.com/cometbft/cometbft/p2p"
@@ -565,9 +566,13 @@ func TestServing_RateLimit_SecondSetCallIgnored(t *testing.T) {
 }
 
 func TestServing_RateLimit_RemovePeerEvictsLimiter(t *testing.T) {
-	// A long-running serve node sees thousands of peers come and
-	// go. Without eviction the sync.Map accumulates a limiter per
-	// historical peer.ID forever. Confirm RemovePeer clears it.
+	// A long-running serve node sees thousands of peers come and go.
+	// Limiters must eventually be evicted (so the sync.Map doesn't
+	// accumulate one per historical peer.ID forever), but NOT
+	// immediately on RemovePeer — that would let a same-NodeID
+	// reconnect refresh its burst budget (#108 C4). The fix defers
+	// eviction by 2× the bucket refill time, by which point the
+	// limiter holds no rate-limit state worth preserving.
 	prov := newFakeProvider(Snapshot{Height: 1000, Format: 3, Chunks: 5})
 	prov.chunks[chunkKey(1000, 3, 0)] = []byte{1}
 	r := newServingReactor(prov)
@@ -579,15 +584,28 @@ func TestServing_RateLimit_RemovePeerEvictsLimiter(t *testing.T) {
 		Src:       peer,
 		Message:   &ssproto.ChunkRequest{Height: 1000, Format: 3, Index: 0},
 	})
-
-	// Limiter should exist after the first request.
 	if _, ok := r.peerLimiters.Load(peer.ID()); !ok {
 		t.Fatal("expected peer limiter to be created on first request")
 	}
-	// RemovePeer should evict it.
+
+	// RemovePeer tombstones the entry instead of deleting it. The
+	// same-NodeID reconnect path relies on this — see
+	// TestServing_RateLimit_PerPeerBucketSurvivesReconnect.
 	r.RemovePeer(peer, "test")
+	if _, ok := r.peerLimiters.Load(peer.ID()); !ok {
+		t.Fatal("entry must persist past RemovePeer (else same-ID reconnect would refresh the bucket; #108 C4)")
+	}
+
+	// Fast-forward the tombstone past the TTL and exercise the
+	// auto-sweep that RemovePeer runs whenever the tombstoned set
+	// grows. Using a fresh unrelated peer here just to drive the
+	// sweep — the assertion is about the original entry's eviction.
+	v, _ := r.peerLimiters.Load(peer.ID())
+	v.(*peerLimiterEntry).removedAt.Store(time.Now().Add(-time.Hour).UnixNano())
+	other := newRecordingPeer("other")
+	r.RemovePeer(other, "test")
 	if _, ok := r.peerLimiters.Load(peer.ID()); ok {
-		t.Fatal("expected peer limiter to be evicted by RemovePeer")
+		t.Fatal("entry should be swept once tombstone is past TTL; auto-sweep from RemovePeer didn't fire")
 	}
 }
 
