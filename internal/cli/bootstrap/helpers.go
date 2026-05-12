@@ -37,9 +37,10 @@ func copyFile(src, dst string) error {
 // cloneTree mirrors srcDir to dstDir as an independent on-disk copy.
 // Hardlinks are intentionally avoided — pebble's LOCK file aliases
 // across hardlinks, which entangles the source dir's lifetime with
-// gaiad's runtime, and a daemon at runtime would obsolete files via
-// unlink (only decrementing link count) — leaving the source alive in
-// practice but with files owned by gaiad's runtime. cloneTree gives
+// the chain daemon's runtime, and a daemon at runtime would obsolete
+// files via unlink (only decrementing link count) — leaving the
+// source alive in practice but with files owned by the daemon's
+// runtime. cloneTree gives
 // the operator an independent dst they can move/delete without
 // disturbing src.
 func cloneTree(srcDir, dstDir string) error {

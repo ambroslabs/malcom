@@ -4,7 +4,7 @@
 // `Node.writeBytes`, the `nodeKeyFormat` / `fastKeyFormat` /
 // `metadataKeyFormat` key layouts in `nodedb.go`, and `fastnode.WriteBytes`.
 // We reproduce the byte-level encoding here so that the resulting pebble
-// database can be opened by an unmodified gaiad.
+// database can be opened by an unmodified cosmos-sdk daemon.
 //
 // Not exhaustive: we encode v1-format nodes (no legacy 32-byte child node
 // keys) since snapshots always emit v1.
@@ -264,7 +264,7 @@ func encodeFastNodeInto(buf []byte, version int64, value []byte) []byte {
 
 // ─── per-store metadata ──────────────────────────────────────────────────
 
-// fastStorageVersionValue is what gaiad expects in the per-store metadata
+// fastStorageVersionValue is what the daemon expects in the per-store metadata
 // to consider fast-storage already-built. The full value written is
 // "1.1.0-<latestVersion>" — iavl parses on '-'.
 const fastStorageVersionValue = "1.1.0"

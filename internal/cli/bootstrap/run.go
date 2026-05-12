@@ -61,7 +61,7 @@ func NewCmd() *cobra.Command {
 	f := &bootstrapFlags{}
 	cmd := &cobra.Command{
 		Use:   "bootstrap",
-		Short: "assemble a runnable gaiad home directory",
+		Short: "assemble a runnable chain home directory",
 		Long:  "Assemble a runnable chain home directory from an imported application.db, a chain binary, and a cometbft RPC.",
 		Args:  cobra.ArbitraryArgs,
 		RunE: func(cmd *cobra.Command, args []string) error {

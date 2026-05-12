@@ -5,13 +5,13 @@
 // importer (importer.go + iavlenc.go + commitinfo.go), and optionally
 // extracts SnapshotExtensionPayload items to <opts.OutDir>/extensions/.
 //
-// The output layout matches what gaiad expects:
+// The output layout matches what cosmos-sdk daemons expect:
 //
-//	<OutDir>/application.db/   pebble dir gaiad reads (db_backend = "pebbledb")
+//	<OutDir>/application.db/   pebble dir the daemon reads (db_backend = "pebbledb")
 //	<OutDir>/extensions/<n>/   wasm bytecode (cosmwasm + 08-light-client)
 //
 // Use cosmos-p2p-toolkit's `malcom bootstrap` step downstream to
-// assemble these into a runnable gaiad home directory.
+// assemble these into a runnable chain home directory.
 package snapshotimport
 
 import (
@@ -64,7 +64,7 @@ type Options struct {
 
 	// CompactDuringImport enables pebble's auto-compactions while the
 	// import streams. Default false (bulk-load mode): compactions are
-	// deferred to a manual `malcom compact` pass or to gaiad's
+	// deferred to a manual `malcom compact` pass or to the daemon's
 	// runtime auto-compactions. Setting true trades import wall time
 	// for less peak disk usage and a tighter LSM at end of import.
 	CompactDuringImport bool
@@ -72,7 +72,7 @@ type Options struct {
 	// FlushSplitMB caps L0 SSTable size from memtable flushes. 0 =
 	// pebble default (4 MiB). Setting equal to MemtableMB produces
 	// ~1 SSTable per memtable flush; with CompactDuringImport off
-	// this dramatically reduces the L0 file count gaiad sees on
+	// this dramatically reduces the L0 file count the daemon sees on
 	// first open.
 	FlushSplitMB int
 
@@ -170,9 +170,9 @@ func Import(opts Options) (*Stats, error) {
 		MaxConcurrentCompactions:    func() int { return maxCompact },
 		Logger:                      pebbleLog,
 		// L0 SSTables produced during bulk-load are throwaway — the
-		// post-import compact (`malcom compact`) or gaiad's runtime
-		// auto-compactions rewrite them into a snappy-compressed L6
-		// set. Skipping L0 compression saves ~10% of the stream's
+		// post-import compact (`malcom compact`) or the daemon's
+		// runtime auto-compactions rewrite them into a snappy-compressed
+		// L6 set. Skipping L0 compression saves ~10% of the stream's
 		// CPU budget. TargetFileSize=MaxInt64 disables pebble's
 		// per-flush file-size splitter (default 2 MiB) — see
 		// parallel.go for the full reasoning.
@@ -221,7 +221,7 @@ func Import(opts Options) (*Stats, error) {
 
 	// Flush any remaining memtable data so the closed DB is durable
 	// without us running an explicit compact. The user runs `malcom
-	// compact -dir <appdb>` afterward (or lets gaiad's pebble
+	// compact -dir <appdb>` afterward (or lets the daemon's pebble
 	// auto-compact at runtime) to consolidate the LSM. Skipping the
 	// upfront compact saves ~2m wall on cosmoshub-4 — that work
 	// isn't gone, just deferred.

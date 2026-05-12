@@ -1,14 +1,14 @@
 // Hand-rolled encoder for cosmos-sdk's `CommitInfo` and `latest_version`
-// records. These are the two database entries gaiad reads at startup to
-// know where state-sync left things; without them, gaiad reports a fresh
-// chain and re-runs initial state-sync.
+// records. These are the two database entries a cosmos-sdk daemon reads
+// at startup to know where state-sync left things; without them, the
+// daemon reports a fresh chain and re-runs initial state-sync.
 //
 // Wire format (cosmos-sdk store/types/commit_info.proto):
 //
 //	message CommitInfo {
 //	    int64 version = 1;
 //	    repeated StoreInfo store_infos = 2;
-//	    // (timestamp field omitted — gaiad's load path tolerates absence)
+//	    // (timestamp field omitted — the daemon's load path tolerates absence)
 //	}
 //	message StoreInfo {
 //	    string name = 1;
@@ -65,12 +65,12 @@ func commitInfoKey(version int64) []byte {
 	return []byte(fmt.Sprintf("s/%d", version))
 }
 
-// latestVersionKey is the fixed pebble key gaiad reads to discover
+// latestVersionKey is the fixed pebble key the daemon reads to discover
 // the most recent committed version.
 var latestVersionKey = []byte("s/latest")
 
 // latestVersionBytes returns the protobuf-encoded latest-version record:
-// a single int64 field 1 (so gaiad's existing decoder can read it).
+// a single int64 field 1 (so the daemon's existing decoder can read it).
 func latestVersionBytes(version int64) []byte {
 	return appendUvarintField(nil, 1, uint64(version))
 }

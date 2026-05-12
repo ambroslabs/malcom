@@ -1,6 +1,6 @@
 // application.db placement strategies. The output of `malcom snapshot
 // import` is a complete pebble dir; bootstrap only needs to land it at
-// `<gaia-home>/data/application.db`. The strategy knob lets the
+// `<chain-home>/data/application.db`. The strategy knob lets the
 // operator pick between safety (copy) and speed (move).
 //
 // Default `copy` keeps the source pristine — useful when malcom's
@@ -10,7 +10,7 @@
 //
 // In-place detection: if the user's appdb dir is *already* the
 // destination's data dir (typical when the operator imported straight
-// into the gaia home), we no-op. Detected via dev+inode equality so
+// into the chain home), we no-op. Detected via dev+inode equality so
 // path differences (relative vs. absolute, symlink vs. real) don't
 // trigger an unnecessary copy.
 
@@ -25,7 +25,7 @@ import (
 )
 
 // AppStrategy picks how application.db gets from the appdb dir to the
-// gaia home's data dir. Values are documented strings so the CLI flag
+// chain home's data dir. Values are documented strings so the CLI flag
 // can validate them up front.
 type AppStrategy string
 

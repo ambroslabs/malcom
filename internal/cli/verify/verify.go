@@ -287,7 +287,8 @@ func fetchAppHash(rpcBase string, height int64) (string, error) {
 }
 
 // computeAppHash reproduces cosmos-sdk's CommitInfo.Hash() — the
-// MultiStore AppHash that gaiad would compute and ICS-23-prove against.
+// MultiStore AppHash that a cosmos-sdk daemon would compute and
+// ICS-23-prove against.
 //
 //  1. For each (store_name, store_root_hash):
 //     leaf_input = uvarint(len(name)) || name

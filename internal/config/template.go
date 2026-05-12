@@ -134,7 +134,7 @@ flush_split_mb        = 1024
 
 # When false (default), ` + "`malcom snapshot import`" + ` writes the snapshot
 # in bulk-load mode without running pebble compactions. The resulting
-# appdb has many small L0 SSTables; gaiad's pebble auto-compacts at
+# appdb has many small L0 SSTables; the daemon's pebble auto-compacts at
 # runtime, or run ` + "`malcom compact -dir <appdb>`" + ` separately. Set true
 # to compact incrementally during import (slower but tighter LSM at
 # end-of-import).
@@ -169,7 +169,7 @@ flush_split_mb        = 1024
 trust_period   = "720h"   # 30d cometbft light-client trust window
 app_db_backend = "pebbledb"
 cmt_db_backend = "goleveldb"
-place_wasm     = true     # extract wasm payloads to the gaia home's expected paths
+place_wasm     = true     # extract wasm payloads to the chain home's expected paths
 write_configs  = true     # emit minimal app.toml/config.toml/client.toml
 moniker        = "bootstrap-node"
 

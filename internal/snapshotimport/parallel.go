@@ -217,7 +217,7 @@ func ImportParallel(opts ParallelOptions) (*Stats, error) {
 	}
 	if !opts.CompactDuringImport {
 		// Bulk-load: skip auto compactions during the stream. The user
-		// or gaiad runs compactions afterward.
+		// or the chain daemon runs compactions afterward.
 		popts.DisableAutomaticCompactions = true
 		popts.L0CompactionThreshold = 1024
 		popts.L0StopWritesThreshold = 4096
@@ -356,7 +356,7 @@ func ImportParallel(opts ParallelOptions) (*Stats, error) {
 
 	// Flush any remaining memtable data so the closed DB is durable.
 	// We don't run an explicit compact — the user runs
-	// `malcom compact -dir <appdb>` after, or lets gaiad's pebble
+	// `malcom compact -dir <appdb>` after, or lets the daemon's pebble
 	// auto-compact at runtime. Skipping the upfront compact saves
 	// ~2m wall on cosmoshub-4.
 	if err := db.Flush(); err != nil {

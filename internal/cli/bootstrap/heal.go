@@ -74,10 +74,10 @@ func resolveHealHeight(home string, flagHeight int64) (int64, error) {
 // .sst). A healthy synced home has .sst files.
 //
 // Heuristic — not opening pebble — to avoid lock contention if
-// gaiad is still running. The operator pre-flight is supposed to
-// have stopped gaiad already; this check is defence-in-depth
-// against running `heal --yes` on a home the operator forgot is
-// actively syncing.
+// the chain daemon is still running. The operator pre-flight is
+// supposed to have stopped it already; this check is defence-in-
+// depth against running `heal --yes` on a home the operator
+// forgot is actively syncing.
 //
 // Conservative direction: returns false on read errors (missing dir,
 // permission denied, etc.) so the recovery path stays open in the
@@ -121,7 +121,7 @@ func NewHealCmd() *cobra.Command {
 			return runHeal(f)
 		},
 	}
-	cmd.Flags().StringVar(&f.home, "home", "", "chain home dir to heal (the panicking gaia home; required)")
+	cmd.Flags().StringVar(&f.home, "home", "", "chain home dir to heal (the panicking chain home; required)")
 	cmd.Flags().StringVar(&f.chain, "chain", "", "chain id; only consulted for chain-registry binary lookup. Default: rely on --binary or $PATH lookup of daemon_name.")
 	cmd.Flags().Int64Var(&f.heightFlag, "height", 0, "bootstrap height override. Default: read from <home>/.malcom-bootstrap-height (written by 'malcom bootstrap' since #95).")
 	cmd.Flags().StringVar(&f.binary, "binary", "", "path to chain binary; default = $PATH lookup of daemon_name from chain-registry")
@@ -140,9 +140,9 @@ func runHeal(f *healFlags) error {
 
 	// Sanity-check the path actually looks like a chain home before
 	// doing anything destructive. A typo in --home would otherwise
-	// proceed all the way through marker resolution and `gaiad
-	// bootstrap-state` invocation before failing with a less
-	// obvious error.
+	// proceed all the way through marker resolution and the
+	// `<binary> bootstrap-state` invocation before failing with a
+	// less obvious error.
 	if _, err := os.Stat(filepath.Join(f.home, "config", "genesis.json")); err != nil {
 		fmt.Fprintf(os.Stderr,
 			"home %s doesn't contain config/genesis.json — is this really a chain home? (%v)\n",
@@ -255,7 +255,7 @@ func runHeal(f *healFlags) error {
 	if !f.yes {
 		log.Info("dry-run (no --yes); rerun with --yes to execute")
 		log.Info("operator pre-flight checklist",
-			"step_1", "stop gaiad / systemctl stop <unit>",
+			"step_1", "stop the chain daemon / systemctl stop <unit>",
 			"step_2", "verify no other process holds locks on the above paths",
 			"step_3", "rerun this command with --yes")
 		return nil
@@ -268,7 +268,7 @@ func runHeal(f *healFlags) error {
 	// fail and we surface that to the operator.
 	for _, p := range victims {
 		if err := os.RemoveAll(p); err != nil {
-			log.Error("remove failed; stop gaiad first then retry", "path", p, "err", err)
+			log.Error("remove failed; stop the chain daemon first then retry", "path", p, "err", err)
 			return &cliexit.Error{Code: 1}
 		}
 		log.Info("removed", "path", p)
@@ -289,7 +289,7 @@ func runHeal(f *healFlags) error {
 		log.Warn("refresh bootstrap-height marker failed", "err", err)
 	}
 
-	log.Info("healed — start gaiad now",
+	log.Info("healed — start the chain daemon now",
 		"home", f.home,
 		"height", height,
 		"start_command", fmt.Sprintf("%s start --home %s", binPath, f.home))

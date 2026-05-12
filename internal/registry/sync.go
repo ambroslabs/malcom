@@ -243,8 +243,8 @@ func isChainJSONPath(rel string) bool {
 
 // isKeepablePath rejects paths under metadata directories (any
 // segment starting with "_") — these hold IBC metadata, the chain
-// template, _non-cosmos chains, etc., none of which gaiad/cometbft
-// can bootstrap.
+// template, _non-cosmos chains, etc., none of which the cosmos-sdk/
+// cometbft stack can bootstrap.
 func isKeepablePath(rel string) bool {
 	for _, seg := range strings.Split(rel, "/") {
 		if strings.HasPrefix(seg, "_") {

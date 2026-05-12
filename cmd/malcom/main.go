@@ -1,4 +1,4 @@
-// malcom is the cosmos-p2p-toolkit CLI for managing the gaiad
+// malcom is the cosmos-p2p-toolkit CLI for managing the cosmos-sdk
 // snapshot→bootstrap workflow:
 //
 //	malcom init                   seed XDG dirs + shared config.toml
@@ -7,7 +7,7 @@
 //	malcom snapshot fetch         download a state-sync snapshot
 //	malcom snapshot import        snapshot dir → application.db + extensions/
 //	malcom snapshot serve         advertise a local snapshot over state-sync P2P
-//	malcom bootstrap              assemble a runnable gaiad home dir
+//	malcom bootstrap              assemble a runnable chain home dir
 //	malcom bootstrap heal         recover a chain home bricked by a failed first start
 //	malcom verify                 check the imported AppHash against a cometbft RPC
 //	malcom compact                full-keyspace pebble compaction (post-import slack)
@@ -57,8 +57,8 @@ func main() {
 func newRoot() *cobra.Command {
 	root := &cobra.Command{
 		Use:           "malcom",
-		Short:         "gaiad bootstrap toolkit",
-		Long:          "malcom is the cosmos-p2p-toolkit CLI for managing the gaiad snapshot→bootstrap workflow.",
+		Short:         "cosmos-sdk chain bootstrap toolkit",
+		Long:          "malcom is the cosmos-p2p-toolkit CLI for managing the cosmos-sdk snapshot→bootstrap workflow.",
 		SilenceUsage:  true,
 		SilenceErrors: true,
 	}

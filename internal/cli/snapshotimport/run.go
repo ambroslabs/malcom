@@ -1,5 +1,5 @@
 // Package snapshotimport is the `malcom snapshot import` subcommand:
-// take a downloaded snapshot directory and produce gaiad-compatible
+// take a downloaded snapshot directory and produce cosmos-sdk-compatible
 // artefacts.
 //
 // Output: <--out>/appdb_<chain>_<height>/{application.db,extensions}/.
@@ -64,7 +64,7 @@ func NewCmd() *cobra.Command {
 	cmd := &cobra.Command{
 		Use:   "import",
 		Short: "convert a snapshot dir into application.db + extensions/",
-		Long:  "Take a downloaded snapshot directory and produce gaiad-compatible artefacts (application.db + extensions).",
+		Long:  "Take a downloaded snapshot directory and produce cosmos-sdk-compatible artefacts (application.db + extensions).",
 		Args:  cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, _ []string) error {
 			return run(f)
