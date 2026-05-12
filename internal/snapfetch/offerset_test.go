@@ -3,7 +3,7 @@ package snapfetch
 import (
 	"testing"
 
-	"github.com/zrbecker/cosmos-p2p/internal/statesync"
+	"github.com/ambroslabs/malcom/internal/statesync"
 )
 
 func mkSnap(h uint64, format uint32, hash string) *statesync.Snapshot {

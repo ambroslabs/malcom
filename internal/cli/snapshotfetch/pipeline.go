@@ -22,8 +22,8 @@ import (
 	"log/slog"
 	"sync"
 
-	"github.com/zrbecker/cosmos-p2p/internal/config"
-	"github.com/zrbecker/cosmos-p2p/internal/snapshotimport"
+	"github.com/ambroslabs/malcom/internal/config"
+	"github.com/ambroslabs/malcom/internal/snapshotimport"
 )
 
 // pipelineState owns the import goroutine + tailing source for a

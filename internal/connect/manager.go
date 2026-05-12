@@ -42,8 +42,8 @@ import (
 	"github.com/cometbft/cometbft/p2p"
 	pexcb "github.com/cometbft/cometbft/p2p/pex"
 
-	"github.com/zrbecker/cosmos-p2p/internal/helpers/addrbook"
-	"github.com/zrbecker/cosmos-p2p/internal/logctx"
+	"github.com/ambroslabs/malcom/internal/helpers/addrbook"
+	"github.com/ambroslabs/malcom/internal/logctx"
 )
 
 // Banlist is the optional cross-run banlist sink. The manager calls

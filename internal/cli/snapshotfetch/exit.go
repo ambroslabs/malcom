@@ -4,7 +4,7 @@ import (
 	"context"
 	"errors"
 
-	"github.com/zrbecker/cosmos-p2p/internal/snapfetch"
+	"github.com/ambroslabs/malcom/internal/snapfetch"
 )
 
 // Exit codes returned by Run. Documented as a stable contract so

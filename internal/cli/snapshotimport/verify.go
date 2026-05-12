@@ -5,7 +5,7 @@ import (
 	"fmt"
 	"log/slog"
 
-	"github.com/zrbecker/cosmos-p2p/internal/cli/verify"
+	"github.com/ambroslabs/malcom/internal/cli/verify"
 )
 
 // ExitVerifyFailed is returned when the post-import AppHash check

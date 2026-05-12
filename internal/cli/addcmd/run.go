@@ -36,10 +36,10 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/zrbecker/cosmos-p2p/internal/config"
-	"github.com/zrbecker/cosmos-p2p/internal/helpers/nodekey"
-	malcomlog "github.com/zrbecker/cosmos-p2p/internal/log"
-	"github.com/zrbecker/cosmos-p2p/internal/registry"
+	"github.com/ambroslabs/malcom/internal/config"
+	"github.com/ambroslabs/malcom/internal/helpers/nodekey"
+	malcomlog "github.com/ambroslabs/malcom/internal/log"
+	"github.com/ambroslabs/malcom/internal/registry"
 )
 
 // chainIDPattern bounds the accepted shape of a <chain-id> argument so

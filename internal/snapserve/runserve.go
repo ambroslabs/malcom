@@ -12,14 +12,14 @@ import (
 	"github.com/cometbft/cometbft/p2p/conn"
 	"github.com/cometbft/cometbft/version"
 
-	"github.com/zrbecker/cosmos-p2p/internal/connect"
-	"github.com/zrbecker/cosmos-p2p/internal/helpers/addrbook"
-	"github.com/zrbecker/cosmos-p2p/internal/helpers/banlist"
-	"github.com/zrbecker/cosmos-p2p/internal/helpers/nodekey"
-	malcomlog "github.com/zrbecker/cosmos-p2p/internal/log"
-	"github.com/zrbecker/cosmos-p2p/internal/logctx"
-	localpex "github.com/zrbecker/cosmos-p2p/internal/pex"
-	"github.com/zrbecker/cosmos-p2p/internal/statesync"
+	"github.com/ambroslabs/malcom/internal/connect"
+	"github.com/ambroslabs/malcom/internal/helpers/addrbook"
+	"github.com/ambroslabs/malcom/internal/helpers/banlist"
+	"github.com/ambroslabs/malcom/internal/helpers/nodekey"
+	malcomlog "github.com/ambroslabs/malcom/internal/log"
+	"github.com/ambroslabs/malcom/internal/logctx"
+	localpex "github.com/ambroslabs/malcom/internal/pex"
+	"github.com/ambroslabs/malcom/internal/statesync"
 )
 
 // ErrNoPeers signals that BootstrapPeers was empty AND the addrbook

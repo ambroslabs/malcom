@@ -1,4 +1,4 @@
-module github.com/zrbecker/cosmos-p2p
+module github.com/ambroslabs/malcom
 
 go 1.25.7
 

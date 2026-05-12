@@ -4,7 +4,7 @@ import (
 	"context"
 	"sync"
 
-	"github.com/zrbecker/cosmos-p2p/internal/statesync"
+	"github.com/ambroslabs/malcom/internal/statesync"
 )
 
 // eventMux fans the reactor's Out and OutChunks channels out to multiple

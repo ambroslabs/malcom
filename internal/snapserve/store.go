@@ -14,8 +14,8 @@ import (
 	"sort"
 	"time"
 
-	"github.com/zrbecker/cosmos-p2p/internal/snapshotinspect"
-	"github.com/zrbecker/cosmos-p2p/internal/statesync"
+	"github.com/ambroslabs/malcom/internal/snapshotinspect"
+	"github.com/ambroslabs/malcom/internal/statesync"
 )
 
 // loadedSnapshot is one snapshot dir prepared for serving: catalogue

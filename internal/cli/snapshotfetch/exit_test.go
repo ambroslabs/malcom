@@ -6,7 +6,7 @@ import (
 	"fmt"
 	"testing"
 
-	"github.com/zrbecker/cosmos-p2p/internal/snapfetch"
+	"github.com/ambroslabs/malcom/internal/snapfetch"
 )
 
 func TestMapExitCode(t *testing.T) {

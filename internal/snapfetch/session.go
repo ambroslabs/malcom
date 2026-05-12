@@ -19,16 +19,16 @@ import (
 	pexcb "github.com/cometbft/cometbft/p2p/pex"
 	"github.com/cometbft/cometbft/version"
 
-	"github.com/zrbecker/cosmos-p2p/internal/connect"
-	"github.com/zrbecker/cosmos-p2p/internal/helpers/addrbook"
-	"github.com/zrbecker/cosmos-p2p/internal/helpers/banlist"
-	"github.com/zrbecker/cosmos-p2p/internal/helpers/nodekey"
-	"github.com/zrbecker/cosmos-p2p/internal/helpers/served"
-	"github.com/zrbecker/cosmos-p2p/internal/humanbytes"
-	malcomlog "github.com/zrbecker/cosmos-p2p/internal/log"
-	"github.com/zrbecker/cosmos-p2p/internal/logctx"
-	localpex "github.com/zrbecker/cosmos-p2p/internal/pex"
-	"github.com/zrbecker/cosmos-p2p/internal/statesync"
+	"github.com/ambroslabs/malcom/internal/connect"
+	"github.com/ambroslabs/malcom/internal/helpers/addrbook"
+	"github.com/ambroslabs/malcom/internal/helpers/banlist"
+	"github.com/ambroslabs/malcom/internal/helpers/nodekey"
+	"github.com/ambroslabs/malcom/internal/helpers/served"
+	"github.com/ambroslabs/malcom/internal/humanbytes"
+	malcomlog "github.com/ambroslabs/malcom/internal/log"
+	"github.com/ambroslabs/malcom/internal/logctx"
+	localpex "github.com/ambroslabs/malcom/internal/pex"
+	"github.com/ambroslabs/malcom/internal/statesync"
 )
 
 // fetchSession bundles the long-lived state for one RunFetch call:
