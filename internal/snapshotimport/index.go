@@ -114,6 +114,9 @@ func BuildIndex(snapshotDir string, log *slog.Logger) (*SnapshotIndex, error) {
 		if envLen == 0 {
 			return nil, fmt.Errorf("zero-length envelope at offset %d", envStart)
 		}
+		if envLen > maxEnvelopeBytes {
+			return nil, fmt.Errorf("snapshot envelope %d bytes exceeds cap %d at offset %d", envLen, maxEnvelopeBytes, envStart)
+		}
 		// Peek the first byte of the item to know its type. The wire
 		// tag is (field<<3)|2 for length-delimited; we only branch on
 		// the field number.
@@ -354,6 +357,9 @@ func (s *indexScanner) readStoreName(envLen uint64) (string, error) {
 	nameLen, ok, err := s.readUvarint()
 	if err != nil || !ok {
 		return "", fmt.Errorf("read name length: %v", err)
+	}
+	if nameLen > maxEnvelopeBytes {
+		return "", fmt.Errorf("store name %d bytes exceeds cap %d", nameLen, maxEnvelopeBytes)
 	}
 	if int64(nameLen) > envEnd-s.pos {
 		return "", fmt.Errorf("name length %d exceeds envelope remainder", nameLen)
