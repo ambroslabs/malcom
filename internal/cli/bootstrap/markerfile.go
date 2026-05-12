@@ -7,6 +7,8 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+
+	"github.com/ambroslabs/malcom/internal/durable"
 )
 
 // BootstrapHeightMarker is the filename written under the chain home
@@ -35,13 +37,9 @@ var ErrNoMarker = errors.New("no .malcom-bootstrap-height marker in home")
 // twice with the same height is a no-op rename of identical bytes.
 func WriteHeightMarker(home string, height int64) error {
 	path := filepath.Join(home, BootstrapHeightMarker)
-	tmp := path + ".tmp"
-	if err := os.WriteFile(tmp, []byte(strconv.FormatInt(height, 10)+"\n"), 0o644); err != nil {
+	body := []byte(strconv.FormatInt(height, 10) + "\n")
+	if err := durable.WriteFile(path, body, 0o644); err != nil {
 		return fmt.Errorf("write marker: %w", err)
-	}
-	if err := os.Rename(tmp, path); err != nil {
-		_ = os.Remove(tmp)
-		return fmt.Errorf("rename marker: %w", err)
 	}
 	return nil
 }

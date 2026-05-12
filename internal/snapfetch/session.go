@@ -20,6 +20,7 @@ import (
 	"github.com/cometbft/cometbft/version"
 
 	"github.com/ambroslabs/malcom/internal/connect"
+	"github.com/ambroslabs/malcom/internal/durable"
 	"github.com/ambroslabs/malcom/internal/helpers/addrbook"
 	"github.com/ambroslabs/malcom/internal/helpers/banlist"
 	"github.com/ambroslabs/malcom/internal/helpers/nodekey"
@@ -356,7 +357,7 @@ func (s *fetchSession) prepareSnapshotDir(outRoot string, offer *snapshotOffer) 
 	}
 	// Make outRoot's directory entry for snapDir durable, so post-reboot
 	// `ls outRoot` agrees with the durable contents inside snapDir.
-	if err := fsyncDir(outRoot); err != nil {
+	if err := durable.FsyncDir(outRoot); err != nil {
 		return "", nil, fmt.Errorf("%w: fsync outRoot: %w", ErrDiskFailed, err)
 	}
 	// Reuse a matching metadata.bin from a prior partial fetch: if the
@@ -366,7 +367,7 @@ func (s *fetchSession) prepareSnapshotDir(outRoot string, offer *snapshotOffer) 
 	// the atomic rewrite path.
 	mdPath := filepath.Join(snapDir, "metadata.bin")
 	if existing, err := os.ReadFile(mdPath); err != nil || !bytes.Equal(existing, offer.Metadata) {
-		if err := writeFileAtomic(mdPath, offer.Metadata, 0o644); err != nil {
+		if err := durable.WriteFile(mdPath, offer.Metadata, 0o644); err != nil {
 			return "", nil, fmt.Errorf("%w: write metadata.bin: %w", ErrDiskFailed, err)
 		}
 	}
@@ -462,13 +463,13 @@ func (s *fetchSession) writeMeta(snapDir string, offer *snapshotOffer, good []p2
 	// Make every prior rename in snapDir (chunks, metadata.bin, meta.json)
 	// durable before .complete lands, so a crash can never leave the
 	// sentinel present alongside a torn predecessor.
-	if err := fsyncDir(snapDir); err != nil {
+	if err := durable.FsyncDir(snapDir); err != nil {
 		return fmt.Errorf("%w: fsync snapshot dir: %w", ErrDiskFailed, err)
 	}
-	if err := writeFileAtomic(filepath.Join(snapDir, ".complete"), nil, 0o644); err != nil {
+	if err := durable.WriteFile(filepath.Join(snapDir, ".complete"), nil, 0o644); err != nil {
 		return fmt.Errorf("%w: mark complete: %w", ErrDiskFailed, err)
 	}
-	if err := fsyncDir(snapDir); err != nil {
+	if err := durable.FsyncDir(snapDir); err != nil {
 		return fmt.Errorf("%w: fsync snapshot dir after .complete: %w", ErrDiskFailed, err)
 	}
 	s.log.Info("snapshot saved", "dir", snapDir)

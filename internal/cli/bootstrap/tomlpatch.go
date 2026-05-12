@@ -15,6 +15,8 @@ import (
 	"fmt"
 	"os"
 	"strings"
+
+	"github.com/ambroslabs/malcom/internal/durable"
 )
 
 // setTOMLString sets <section>.<key> = "value" in the file at path.
@@ -89,13 +91,8 @@ func patchTOMLKey(path, section, key, rawValue string) error {
 		final = final[:len(final)-1]
 	}
 
-	tmp := path + ".malcom.tmp"
-	if err := os.WriteFile(tmp, final, 0o644); err != nil {
-		return fmt.Errorf("write %s: %w", tmp, err)
-	}
-	if err := os.Rename(tmp, path); err != nil {
-		_ = os.Remove(tmp)
-		return fmt.Errorf("rename %s -> %s: %w", tmp, path, err)
+	if err := durable.WriteFile(path, final, 0o644); err != nil {
+		return fmt.Errorf("write %s: %w", path, err)
 	}
 	return nil
 }

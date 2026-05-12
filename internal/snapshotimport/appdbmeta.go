@@ -6,6 +6,8 @@ import (
 	"os"
 	"path/filepath"
 	"time"
+
+	"github.com/ambroslabs/malcom/internal/durable"
 )
 
 // AppDBMetaFilename is the filename of the metadata JSON written into
@@ -40,7 +42,7 @@ func WriteAppDBMeta(dir string, meta AppDBMeta) error {
 		return fmt.Errorf("marshal appdb meta: %w", err)
 	}
 	buf = append(buf, '\n')
-	if err := os.WriteFile(path, buf, 0o644); err != nil {
+	if err := durable.WriteFile(path, buf, 0o644); err != nil {
 		return fmt.Errorf("write %s: %w", path, err)
 	}
 	return nil

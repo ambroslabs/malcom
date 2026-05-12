@@ -11,6 +11,7 @@ import (
 	cfg "github.com/cometbft/cometbft/config"
 	"github.com/cometbft/cometbft/p2p/conn"
 
+	"github.com/ambroslabs/malcom/internal/durable"
 	"github.com/ambroslabs/malcom/internal/logctx"
 )
 
@@ -56,7 +57,7 @@ func RunFetch(ctx context.Context, c Config, outRoot string) error {
 	// just means download will fetch chunk-0 again.
 	if len(chunk0) > 0 {
 		path := filepath.Join(snapDir, "chunk_00000.bin")
-		if err := writeFileAtomic(path, chunk0, 0o644); err != nil {
+		if err := durable.WriteFile(path, chunk0, 0o644); err != nil {
 			s.log.Error("seed verified chunk-0 failed; download will refetch", "err", err)
 		}
 	}

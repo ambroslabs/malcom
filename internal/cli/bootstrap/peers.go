@@ -18,6 +18,7 @@ import (
 	"path/filepath"
 	"strings"
 
+	"github.com/ambroslabs/malcom/internal/durable"
 	"github.com/ambroslabs/malcom/internal/helpers/served"
 )
 
@@ -108,5 +109,5 @@ func copyAddrbook(src, homeRoot string, log *slog.Logger) error {
 		return fmt.Errorf("mkdir %s: %w", filepath.Dir(dst), err)
 	}
 	log.Info("addrbook copy", "src", src, "dst", dst)
-	return copyFile(src, dst)
+	return durable.CopyFile(src, dst)
 }

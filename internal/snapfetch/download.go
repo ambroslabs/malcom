@@ -18,6 +18,7 @@ import (
 	"github.com/cometbft/cometbft/p2p"
 
 	"github.com/ambroslabs/malcom/internal/connect"
+	"github.com/ambroslabs/malcom/internal/durable"
 	"github.com/ambroslabs/malcom/internal/helpers/served"
 	"github.com/ambroslabs/malcom/internal/logctx"
 	"github.com/ambroslabs/malcom/internal/statesync"
@@ -138,7 +139,7 @@ type chunkScheduler struct {
 	srv   *served.Set
 	log   *slog.Logger
 
-	// writeFile is the chunk-write hook. Production wires writeFileAtomic;
+	// writeFile is the chunk-write hook. Production wires durable.WriteFile;
 	// tests inject a failing stub to drive the disk-failure path without
 	// fiddling with filesystem permissions.
 	writeFile func(path string, data []byte, mode os.FileMode) error
@@ -206,7 +207,7 @@ func download(ctx context.Context, sw *p2p.Switch, ssR *statesync.Reactor,
 		watch:               watch,
 		srv:                 srv,
 		log:                 logctx.From(ctx),
-		writeFile:           writeFileAtomic,
+		writeFile:           durable.WriteFile,
 		onChunkReady:        onChunkReady,
 		chainID:             chainID,
 		target:              target,
@@ -281,18 +282,21 @@ func (s *chunkScheduler) resumeFromDisk() (resumed, removed int) {
 			continue
 		}
 		name := e.Name()
-		if !strings.HasPrefix(name, "chunk_") {
-			continue
-		}
+		// Stale tmp from a crash mid durable.WriteFile (live runs never
+		// see one — rename clears the tmp in the same syscall). Two
+		// shapes to handle: legacy in-place `.tmp` suffix and durable's
+		// CreateTemp pattern `.<base>.<rand>.tmp`.
 		path := filepath.Join(s.snapDir, name)
-		// Stale tmp from a crash mid writeFileAtomic (live runs never
-		// see it — rename clears the tmp in the same syscall).
-		if strings.HasSuffix(name, ".bin.tmp") {
+		if (strings.HasPrefix(name, ".chunk_") && strings.HasSuffix(name, ".tmp")) ||
+			(strings.HasPrefix(name, "chunk_") && strings.HasSuffix(name, ".bin.tmp")) {
 			if err := os.Remove(path); err != nil {
 				s.log.Error("resume: remove stale tmp", "name", name, "err", err)
 				continue
 			}
 			removed++
+			continue
+		}
+		if !strings.HasPrefix(name, "chunk_") {
 			continue
 		}
 		if !strings.HasSuffix(name, ".bin") {
