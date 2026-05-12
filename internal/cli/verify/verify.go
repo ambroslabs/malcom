@@ -321,5 +321,7 @@ func computeAppHash(infos []storeInfo) []byte {
 func writeUvarint(w io.Writer, v uint64) {
 	var buf [binary.MaxVarintLen64]byte
 	n := binary.PutUvarint(buf[:], v)
-	w.Write(buf[:n])
+	// Both call sites pass a *bytes.Buffer, whose Write never errors;
+	// the error return only matters for io.Writer impls that can fail.
+	_, _ = w.Write(buf[:n])
 }
