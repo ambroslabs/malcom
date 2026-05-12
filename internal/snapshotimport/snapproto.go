@@ -75,29 +75,51 @@ type snapItem struct {
 
 // snapReader pulls SnapshotItem proto messages off an io.Reader. Each
 // call to Next returns one decoded item or io.EOF.
+//
+// If the underlying reader implements ringPinner (chunkRingReader
+// does), Next advances the underlying's eviction pin to the start of
+// the most-recently-returned item — i.e., past every item the
+// consumer has *finished* with, but not past the item being returned
+// right now. The consumer (worker) is then free to break out of its
+// read loop without that final item's bytes being evicted out from
+// under the next consumer that needs them. See #124.
 type snapReader struct {
-	br *bufio.Reader
+	br            *bufio.Reader
+	pinner        ringPinner
+	lastItemBytes int64
 }
 
-// snapReaderBufSize is intentionally small. binary.ReadUvarint pulls
-// bytes through bufio.Reader one byte at a time — each call to its
-// underlying Read returns up to bufSize bytes regardless of the
-// snapReader's logical consumption. If the underlying reader is a
-// chunkRingReader (the pipelined-import path), that overshoot
-// advances the reader's eviction-pinning cursor past the bytes the
-// caller will actually need. Keeping the buffer small bounds the
-// overshoot to a handful of bytes, well below the ring's chunkSize,
-// so a reader peeking the next store's header at a store boundary
-// can't cause `evictLocked` to drop the chunk containing the next
-// store's envStart. See #124.
-//
-// Envelope bodies are read via io.ReadFull(s.br, buf) where
-// len(buf) >= bufSize triggers bufio's direct-read fast path
-// (skips the buffer entirely), so there's no per-item cost.
-const snapReaderBufSize = 64
+// ringPinner is satisfied by *chunkRingReader. The snapReader uses
+// it via type assertion to keep the chunkring eviction cursor in
+// sync with the consumer's logical position rather than bufio's
+// overshooting buffered-pull position.
+type ringPinner interface {
+	EnableManualPin()
+	AdvancePin(bytes int64)
+}
 
 func newSnapReader(r io.Reader) *snapReader {
-	return &snapReader{br: bufio.NewReaderSize(r, snapReaderBufSize)}
+	sr := &snapReader{br: bufio.NewReaderSize(r, 1<<20)}
+	if p, ok := r.(ringPinner); ok {
+		sr.pinner = p
+		// Switch eviction to track our explicit pin advances right
+		// away — before the very first Read, which would otherwise
+		// pull a full bufio buffer's worth of bytes and let
+		// auto-mode eviction act on that inflated pos.
+		p.EnableManualPin()
+	}
+	return sr
+}
+
+// uvarintLen returns the byte length of v's protobuf-style varint
+// encoding (1..10 bytes). Used to size pin advances per item.
+func uvarintLen(v uint64) int {
+	n := 1
+	for v >= 0x80 {
+		v >>= 7
+		n++
+	}
+	return n
 }
 
 // Next returns the next SnapshotItem or io.EOF when the stream ends.
@@ -107,6 +129,18 @@ func newSnapReader(r io.Reader) *snapReader {
 // (length-delimited wire type), followed by varint(innerLen) and the
 // inner message bytes.
 func (s *snapReader) Next() (*snapItem, error) {
+	// Each call commits the previously-returned item from the
+	// consumer's perspective — the consumer had its chance to look
+	// at it and is asking for the next one, so its bytes can be
+	// evicted from the underlying ring. The item being returned
+	// right now is *not* yet committed; if the consumer decides to
+	// stop after seeing it (typically a store-boundary item), its
+	// bytes stay pinned and a fresh reader created at this offset
+	// can still read them.
+	if s.pinner != nil && s.lastItemBytes > 0 {
+		s.pinner.AdvancePin(s.lastItemBytes)
+		s.lastItemBytes = 0
+	}
 	for {
 		envLen, err := binary.ReadUvarint(s.br)
 		if err == io.EOF {
@@ -116,7 +150,13 @@ func (s *snapReader) Next() (*snapItem, error) {
 			return nil, fmt.Errorf("read envelope length: %w", err)
 		}
 		if envLen == 0 {
-			// length-zero envelopes are technically valid; skip them
+			// length-zero envelopes are technically valid; skip them.
+			// A zero-length envelope is one byte on the wire, so its
+			// pin contribution is one byte. Roll it into the next
+			// item's commit by tracking it here.
+			if s.pinner != nil {
+				s.pinner.AdvancePin(1)
+			}
 			continue
 		}
 		if envLen > maxEnvelopeBytes {
@@ -150,6 +190,11 @@ func (s *snapReader) Next() (*snapItem, error) {
 		if err := decodeOneOf(item, body); err != nil {
 			return nil, err
 		}
+		// Remember this item's wire size so the *next* Next() call
+		// commits it for eviction. We deliberately don't advance the
+		// pin here — the consumer hasn't yet had a chance to decide
+		// whether to keep going.
+		s.lastItemBytes = int64(uvarintLen(envLen)) + int64(envLen)
 		return item, nil
 	}
 }

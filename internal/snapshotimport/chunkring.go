@@ -217,12 +217,88 @@ func (r *chunkRing) NewReader(start, endLimit int64) (*chunkRingReader, error) {
 var ErrStartEvicted = errors.New("chunkRing: start offset already evicted")
 
 // chunkRingReader tracks one reader's cursor into the ring. The
-// reader's pos pins eviction so the ring can't drop bytes the
-// reader still needs.
+// reader's effective pin pins eviction so the ring can't drop bytes
+// the reader (or, equivalently, a downstream buffered consumer)
+// still needs.
+//
+// pos is the byte offset of the next byte the reader will pull from
+// the ring (advanced by Read). pin is the byte offset the consumer
+// has *committed* — i.e., guarantees it won't need bytes below.
+// When manual is false (default), eviction uses pos: the reader's
+// bytes are pinned as long as the reader holds them in a downstream
+// buffer that we can't see into. When manual is true (set
+// implicitly on the first AdvancePin call), eviction uses pin, which
+// the consumer advances explicitly via AdvancePin — useful when the
+// reader sits behind a bufio whose internal buffer holds pulled-
+// but-not-yet-consumed bytes. See #124.
 type chunkRingReader struct {
 	ring     *chunkRing
 	pos      int64
+	pin      int64 // ≤ pos; only consulted in manual mode
+	manual   bool
 	endLimit int64 // -1 means "until ring closed past pos"
+}
+
+// effectivePin returns the offset eviction respects for this reader.
+// In manual mode that's the consumer-advanced pin; otherwise it's
+// the pull cursor pos.
+func (r *chunkRingReader) effectivePin() int64 {
+	if r.manual {
+		return r.pin
+	}
+	return r.pos
+}
+
+// EnableManualPin switches the reader from auto-pin (eviction
+// tracks pos, the buffered-pull cursor) to manual-pin (eviction
+// tracks pin, advanced explicitly via AdvancePin). Idempotent.
+// Must be called before the first Read if the consumer wants its
+// downstream buffer (bufio) not to cause premature eviction —
+// otherwise the very first Read advances pos by the bufio's full
+// fill size and auto-mode eviction acts on that inflated cursor.
+func (r *chunkRingReader) EnableManualPin() {
+	r.ring.mu.Lock()
+	defer r.ring.mu.Unlock()
+	if !r.manual {
+		r.pin = r.pos
+		r.manual = true
+	}
+}
+
+// AdvancePin moves the manual-mode pin forward by `bytes` bytes.
+// Capped at pos — the consumer can never commit past what's been
+// pulled from the ring. Implicitly enables manual mode (anchoring
+// pin = pos at the instant of the call) for callers that skip
+// EnableManualPin; the resulting pin advance is bounded by pos so
+// the late-switched reader doesn't suddenly evict bytes its bufio
+// has already pulled but not yet served.
+//
+// Snapshot import workers don't need to call this directly; the
+// snapReader wraps the chunkRingReader and advances the pin per
+// committed item.
+func (r *chunkRingReader) AdvancePin(bytes int64) {
+	if bytes <= 0 {
+		return
+	}
+	r.ring.mu.Lock()
+	defer r.ring.mu.Unlock()
+	if !r.manual {
+		r.pin = r.pos
+		r.manual = true
+	}
+	target := r.pin + bytes
+	if target > r.pos {
+		target = r.pos
+	}
+	if target <= r.pin {
+		return
+	}
+	r.pin = target
+	// Pin advance can free chunks; run eviction now so the producer
+	// blocked on maxBytes (or stage 3 waiting for memory) can make
+	// progress immediately.
+	r.ring.evictLocked()
+	r.ring.cond.Broadcast()
 }
 
 // Read implements io.Reader. Blocks until bytes are available at
@@ -317,22 +393,23 @@ func (r *chunkRingReader) findChunkLocked() int {
 }
 
 // evictLocked drops chunks whose end offset is <= the minimum
-// reader cursor. Caller holds mu.
+// reader pin (= the consumer's logical position; see
+// chunkRingReader.effectivePin). Caller holds mu.
 func (r *chunkRing) evictLocked() {
 	if len(r.readers) == 0 {
 		// No readers (stage 1 producing into the void): keep
 		// everything; stage 1 will block on maxBytes.
 		return
 	}
-	minPos := r.readers[0].pos
+	minPin := r.readers[0].effectivePin()
 	for _, rd := range r.readers[1:] {
-		if rd.pos < minPos {
-			minPos = rd.pos
+		if p := rd.effectivePin(); p < minPin {
+			minPin = p
 		}
 	}
 	for len(r.chunks) > 0 {
 		c := r.chunks[0]
-		if c.start+int64(len(c.data)) > minPos {
+		if c.start+int64(len(c.data)) > minPin {
 			break
 		}
 		r.head = c.start + int64(len(c.data))

@@ -2,6 +2,7 @@ package snapshotimport
 
 import (
 	"errors"
+	"io"
 	"testing"
 )
 
@@ -55,4 +56,83 @@ func TestNewReaderRejectsStartBelowHead(t *testing.T) {
 		t.Fatalf("NewReader(head): %v", err)
 	}
 	r2.Close()
+}
+
+// TestManualPinHoldsBackEviction is the regression test for #124's
+// race: in manual mode the ring's eviction tracks the consumer-
+// advanced pin, not the buffered-pull pos. Without this, a bufio
+// reader sitting in front of a chunkRingReader inflates pos by its
+// full buffer size on the first byte read, letting evictLocked drop
+// chunks the consumer hasn't actually consumed.
+func TestManualPinHoldsBackEviction(t *testing.T) {
+	ring := newChunkRing(4<<20, 16<<20)
+	if _, err := ring.Write(make([]byte, 8<<20)); err != nil {
+		t.Fatalf("ring.Write: %v", err)
+	}
+
+	r, err := ring.NewReader(0, -1)
+	if err != nil {
+		t.Fatalf("NewReader: %v", err)
+	}
+	defer r.Close()
+
+	// Switch BEFORE the first Read so pos can never auto-track.
+	r.EnableManualPin()
+
+	// Pull 6 MiB through Read; pos jumps to 6 MiB. In auto mode
+	// evictLocked would have advanced head along with pos. In manual
+	// mode pin stays at 0 — eviction must not move.
+	buf := make([]byte, 6<<20)
+	if _, err := io.ReadFull(r, buf); err != nil {
+		t.Fatalf("ReadFull: %v", err)
+	}
+	if r.pos < 6<<20 {
+		t.Fatalf("setup: pos = %d, want >= 6 MiB after ReadFull", r.pos)
+	}
+	if r.pin != 0 {
+		t.Fatalf("pin = %d, want 0 (consumer hasn't called AdvancePin yet)", r.pin)
+	}
+	if ring.head != 0 {
+		t.Fatalf("head = %d, want 0 (manual-mode eviction tracks pin which is 0)", ring.head)
+	}
+
+	// Commit past the first chunk's end. Eviction can now drop
+	// chunk 0 and advance head. Chunks are 4 MiB each; advancing pin
+	// to 4 MiB exactly evicts the first chunk and parks head there.
+	r.AdvancePin(4 << 20)
+	if r.pin != 4<<20 {
+		t.Fatalf("pin = %d, want 4 MiB after AdvancePin", r.pin)
+	}
+	if ring.head < 4<<20 {
+		t.Fatalf("head = %d, want >= 4 MiB after pin advance past first chunk's end", ring.head)
+	}
+}
+
+// TestAdvancePinCappedAtPos pins down the invariant that pin can't
+// exceed pos — the consumer can't commit past what's been pulled.
+func TestAdvancePinCappedAtPos(t *testing.T) {
+	ring := newChunkRing(4<<20, 16<<20)
+	if _, err := ring.Write(make([]byte, 8<<20)); err != nil {
+		t.Fatalf("ring.Write: %v", err)
+	}
+	r, err := ring.NewReader(0, -1)
+	if err != nil {
+		t.Fatalf("NewReader: %v", err)
+	}
+	defer r.Close()
+	r.EnableManualPin()
+
+	buf := make([]byte, 2<<20)
+	if _, err := io.ReadFull(r, buf); err != nil {
+		t.Fatalf("ReadFull: %v", err)
+	}
+	if r.pos != 2<<20 {
+		t.Fatalf("pos = %d, want 2 MiB", r.pos)
+	}
+
+	// Try to commit past pos; pin should cap.
+	r.AdvancePin(10 << 20)
+	if r.pin != r.pos {
+		t.Fatalf("pin = %d, pos = %d, want pin == pos (capped)", r.pin, r.pos)
+	}
 }
