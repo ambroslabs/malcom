@@ -113,7 +113,15 @@ max_disk_write_failures = 3
 [import]
 # Pebble bulk-load tuning. Defaults sized for an 8 GiB host with 2-4
 # vCPUs; bump memtable_mb / cache_mb on bigger boxes.
-memtable_mb           = 1024  # x2 in-flight = ~2 GiB resident
+#
+# memtable_mb: pebble keeps up to 4 memtables alive during bulk
+# import (active + 3 queued for flush). Each is a Go-heap arena
+# under CGO_ENABLED=0, so peak resident ≈ memtable_mb × 4. At the
+# old 1024 default an 8 GiB host hit 4+ GiB of arenas on top of the
+# chunk ring and app heap and OOM-killed mid-import (#103). 256 is
+# the new default; 16+ GiB hosts can raise it back toward 1024 for
+# slightly higher write throughput.
+memtable_mb           = 256
 cache_mb              = 64
 min_free_gb           = 20    # cosmoshub-4 import is ~14 GB after compact
 
