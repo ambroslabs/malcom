@@ -223,7 +223,7 @@ func copyBytesField(buf []byte, field int) []byte {
 // getVarintField returns the varint value at the given field number, or
 // 0 if the field isn't present.
 func getVarintField(buf []byte, field int) uint64 {
-	want := byte((field << 3) | 0)
+	want := byte(field << 3)
 	for i := 0; i < len(buf); {
 		tag := buf[i]
 		i++

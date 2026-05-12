@@ -440,9 +440,7 @@ func (r *Reactor) RequestChunk(peer p2p.Peer, height uint64, format, index uint3
 }
 
 func (r *Reactor) Receive(env p2p.Envelope) {
-	if pm, ok := env.Message.(proto.Message); ok {
-		r.bytesRecv.Add(int64(proto.Size(pm)))
-	}
+	r.bytesRecv.Add(int64(proto.Size(env.Message)))
 	peerID := string(env.Src.ID())
 	switch m := env.Message.(type) {
 	case *ssproto.SnapshotsResponse:

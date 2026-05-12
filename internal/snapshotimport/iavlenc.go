@@ -14,7 +14,6 @@ package snapshotimport
 import (
 	"crypto/sha256"
 	"encoding/binary"
-	"math/bits"
 )
 
 // ─── per-store key namespaces ────────────────────────────────────────────
@@ -48,17 +47,6 @@ func storePrefix(name string) []byte {
 // The "Into" suffix mirrors stdlib (e.g. *big.Int.FillBytes /
 // hash.Hash.Sum); callers pass `buf[:0]` to write from the start.
 
-// nodeKeyBytes returns the 12-byte (version, nonce) tuple in the order
-// IAVL stores it (big-endian for both, version first). This is the
-// "nodeKey" used as the storage key suffix and as the value of the
-// children's pointer fields in inner-node encoding.
-func nodeKeyBytes(version int64, nonce uint32) []byte {
-	out := make([]byte, 12)
-	binary.BigEndian.PutUint64(out, uint64(version))
-	binary.BigEndian.PutUint32(out[8:], nonce)
-	return out
-}
-
 // nodeDBKey assembles the full pebble key for a node entry under the
 // given store: storePrefix || 's' || version || nonce.
 func nodeDBKey(storePrefix []byte, version int64, nonce uint32) []byte {
@@ -75,12 +63,8 @@ func nodeDBKeyInto(buf, storePrefix []byte, version int64, nonce uint32) []byte 
 	return buf
 }
 
-// fastDBKey returns the pebble key for a fast-storage entry:
-// storePrefix || 'f' || userKey.
-func fastDBKey(storePrefix, userKey []byte) []byte {
-	return fastDBKeyInto(make([]byte, 0, len(storePrefix)+1+len(userKey)), storePrefix, userKey)
-}
-
+// fastDBKeyInto appends the pebble key for a fast-storage entry
+// (storePrefix || 'f' || userKey) to buf.
 func fastDBKeyInto(buf, storePrefix, userKey []byte) []byte {
 	buf = append(buf, storePrefix...)
 	buf = append(buf, 'f')
@@ -88,12 +72,8 @@ func fastDBKeyInto(buf, storePrefix, userKey []byte) []byte {
 	return buf
 }
 
-// metadataDBKey returns the pebble key for a per-store metadata entry:
-// storePrefix || 'm' || metaKey.
-func metadataDBKey(storePrefix []byte, metaKey string) []byte {
-	return metadataDBKeyInto(make([]byte, 0, len(storePrefix)+1+len(metaKey)), storePrefix, metaKey)
-}
-
+// metadataDBKeyInto appends the pebble key for a per-store metadata
+// entry (storePrefix || 'm' || metaKey) to buf.
 func metadataDBKeyInto(buf, storePrefix []byte, metaKey string) []byte {
 	buf = append(buf, storePrefix...)
 	buf = append(buf, 'm')
@@ -133,24 +113,6 @@ func putBytes(dst, b []byte) []byte {
 func putHash32(dst []byte, h []byte) []byte {
 	dst = append(dst, 0x20)
 	return append(dst, h...)
-}
-
-// uvarintSize returns the number of bytes binary.PutUvarint would write
-// for x. Matches iavl's `EncodeUvarintSize`.
-func uvarintSize(x uint64) int {
-	if x == 0 {
-		return 1
-	}
-	return (bits.Len64(x) + 6) / 7
-}
-
-// varintSize returns the number of bytes putVarint would write for x.
-func varintSize(x int64) int {
-	ux := uint64(x) << 1
-	if x < 0 {
-		ux = ^ux
-	}
-	return uvarintSize(ux)
 }
 
 // ─── hash pre-images ─────────────────────────────────────────────────────
@@ -244,18 +206,13 @@ func encodeInnerNodeInto(buf []byte,
 
 // ─── fast-node encoding ──────────────────────────────────────────────────
 
-// encodeFastNode produces the bytes IAVL writes for a fast-storage entry:
-//
-//	varint(versionLastUpdatedAt) || EncodeBytes(value)
+// encodeFastNodeInto appends the bytes IAVL writes for a fast-storage
+// entry (varint(versionLastUpdatedAt) || EncodeBytes(value)) to buf.
 //
 // Cosmos-sdk's `Get(userKey)` reads from the fast-storage path
 // `'f'+userKey` and falls back to a tree walk if missing. Pre-populating
 // these entries during import skips the expensive post-load fast-storage
 // upgrade pass.
-func encodeFastNode(version int64, value []byte) []byte {
-	return encodeFastNodeInto(make([]byte, 0, 16+len(value)), version, value)
-}
-
 func encodeFastNodeInto(buf []byte, version int64, value []byte) []byte {
 	buf = putVarint(buf, version)
 	buf = putBytes(buf, value)

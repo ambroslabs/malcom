@@ -690,7 +690,7 @@ func parseProtoBytes(buf []byte, field int) []byte {
 // parseProtoVarint returns the value of a wire-type-0 (varint) field, or 0
 // if not present.
 func parseProtoVarint(buf []byte, field int) uint64 {
-	want := byte((field << 3) | 0)
+	want := byte(field << 3)
 	for i := 0; i < len(buf); {
 		tag := buf[i]
 		i++

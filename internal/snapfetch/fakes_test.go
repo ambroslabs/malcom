@@ -131,7 +131,6 @@ var _ p2p.IPeerSet = (*fakePeerSet)(nil)
 // fakeSchedulerSwitch satisfies schedulerSwitch.
 type fakeSchedulerSwitch struct {
 	peerSet *fakePeerSet
-	out     int
 	in      int
 	dialing int
 }
@@ -191,12 +190,6 @@ func (r *fakeReactor) numRequests() int {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	return len(r.requests)
-}
-
-func (r *fakeReactor) reset() {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	r.requests = nil
 }
 
 // fakeManager satisfies schedulerManager. Records every call.
