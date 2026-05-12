@@ -427,8 +427,14 @@ func stage1WriteRingAndIndex(
 		// create the reader after pulling from storeCh, other readers
 		// could advance their cursors past start in the meantime,
 		// causing the start chunk to be evicted before this store's
-		// worker arrives.
-		s.reader = ring.NewReader(s.DecompressedStart, -1)
+		// worker arrives. NewReader's start-below-head precondition
+		// surfaces the race (#124) instead of letting a bad reader
+		// blow up at first Read deep inside the worker.
+		rdr, err := ring.NewReader(s.DecompressedStart, -1)
+		if err != nil {
+			return fmt.Errorf("pin reader for store %q: %w", s.Name, err)
+		}
+		s.reader = rdr
 		storeCh <- s
 		return nil
 	}
@@ -745,7 +751,11 @@ func processStoreSegment(
 	// reader on the fly using the populated DecompressedEnd.
 	rdr := store.reader
 	if rdr == nil {
-		rdr = ring.NewReader(store.DecompressedStart, store.DecompressedEnd)
+		var err error
+		rdr, err = ring.NewReader(store.DecompressedStart, store.DecompressedEnd)
+		if err != nil {
+			return StoreInfo{}, 0, 0, 0, fmt.Errorf("open reader for store %q: %w", store.Name, err)
+		}
 	}
 	defer rdr.Close()
 	if store.EndCh != nil {
@@ -1063,7 +1073,10 @@ func stage3ExtensionsFromRing(
 	ring *chunkRing, extStart, extEnd int64,
 	db *pebble.DB, extDir string, stats *Stats, log *slog.Logger,
 ) error {
-	rdr := ring.NewReader(extStart, extEnd)
+	rdr, err := ring.NewReader(extStart, extEnd)
+	if err != nil {
+		return fmt.Errorf("open extension reader: %w", err)
+	}
 	defer rdr.Close()
 	sr := newSnapReader(rdr)
 
