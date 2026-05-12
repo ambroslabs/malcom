@@ -161,7 +161,7 @@ func RunServe(ctx context.Context, c Config) error {
 		return fmt.Errorf("nodeInfo invalid: %w", err)
 	}
 
-	transport := p2p.NewMultiplexTransport(nodeInfo, *nodeKey, buildMConnConfig())
+	transport := p2p.NewMultiplexTransport(nodeInfo, *nodeKey, buildMConnConfig(c.MaxPacketMsgPayloadSize))
 	if err := transport.Listen(*listenAddr); err != nil {
 		return fmt.Errorf("transport.Listen: %w", err)
 	}
@@ -418,13 +418,17 @@ func buildP2PConfig(maxOutbound int, allowDuplicateIP bool) *cfg.P2PConfig {
 	return p
 }
 
-// buildMConnConfig matches snapfetch's MConn tuning. The serve side
-// also benefits from the larger packet payload (the chunks we ship
-// are 10 MiB) and the higher Send/RecvRate (cometbft's defaults
-// would throttle a 10 MiB chunk well below typical peer-side caps).
-func buildMConnConfig() conn.MConnConfig {
+// buildMConnConfig matches snapfetch's MConn tuning. A zero
+// maxPacketMsgPayloadSize leaves cometbft's DefaultMConnConfig value
+// (1024) in place — required for interop with stock cosmos-sdk /
+// cometbft peers; see #122. Send/RecvRate stay high regardless
+// because cometbft's defaults would throttle a 10 MiB chunk well
+// below typical peer-side caps.
+func buildMConnConfig(maxPacketMsgPayloadSize int) conn.MConnConfig {
 	mConfig := conn.DefaultMConnConfig()
-	mConfig.MaxPacketMsgPayloadSize = 256 * 1024
+	if maxPacketMsgPayloadSize > 0 {
+		mConfig.MaxPacketMsgPayloadSize = maxPacketMsgPayloadSize
+	}
 	mConfig.SendRate = 10 * 1024 * 1024
 	mConfig.RecvRate = 10 * 1024 * 1024
 	return mConfig

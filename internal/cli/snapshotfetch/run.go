@@ -235,6 +235,7 @@ func run(f *fetchFlags) error {
 		MaxRescans:               ch.Fetch.MaxRescans,
 		RescanDiscoverFor:        ch.Fetch.RescanDiscover.Duration(),
 		SkipVerifyHash:           f.noVerifyHash,
+		MaxPacketMsgPayloadSize:  ch.Fetch.MaxPacketMsgPayloadSize,
 	}
 
 	fetchLog.Info("config", "path", cfg.Path())

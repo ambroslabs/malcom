@@ -159,6 +159,13 @@ type Config struct {
 	//
 	// Runs on the chunk scheduler's main goroutine; must not block.
 	OnChunkReady func(idx uint32)
+
+	// MaxPacketMsgPayloadSize is the per-packet wire cap on the
+	// MConnection. Zero leaves cometbft's DefaultMConnConfig value
+	// (1024) in place — required for compat with stock cometbft
+	// peers (see #122). Raise only for malcom↔malcom-only
+	// deployments where both sides agree.
+	MaxPacketMsgPayloadSize int
 }
 
 // applyDefaults fills in zero-valued fields with defaults. Mutates cfg.

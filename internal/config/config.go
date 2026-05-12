@@ -228,6 +228,17 @@ type FetchTuning struct {
 
 	MaxRescans     int      `toml:"max_rescans"`
 	RescanDiscover duration `toml:"rescan_discover"`
+
+	// MaxPacketMsgPayloadSize is the per-packet wire cap on the
+	// MConnection. Default 0 inherits cometbft's 1024 — required for
+	// compatibility with stock cosmos-sdk / cometbft peers. Any
+	// vanilla gaiad node uses 1024 and disconnects on the first
+	// message that exceeds it ("message exceeds max size (10158 >
+	// 1034)"). Raise this only for malcom↔malcom-only deployments
+	// where both sides agree on the larger size; ~1% wire overhead
+	// is saved on large messages at higher packet sizes, which is
+	// rarely worth the loss of interop. See #122.
+	MaxPacketMsgPayloadSize int `toml:"max_packet_msg_payload_size"`
 }
 
 // ImportTuning maps onto snapshotimport.Options' tuning fields.

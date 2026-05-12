@@ -127,6 +127,13 @@ type Config struct {
 	// but aggregating to more than we want to serve. 0 disables.
 	ChunkRateGlobal  float64
 	ChunkBurstGlobal int
+
+	// MaxPacketMsgPayloadSize is the per-packet wire cap on the
+	// MConnection. Zero leaves cometbft's DefaultMConnConfig value
+	// (1024) in place — required for compat with stock cometbft
+	// peers (see #122). Raise only for malcom↔malcom-only
+	// deployments where both sides agree.
+	MaxPacketMsgPayloadSize int
 }
 
 func (c *Config) applyDefaults() {
