@@ -250,6 +250,8 @@ func run(cmd *cobra.Command, f *serveFlags) error {
 		ChunkBurstPerPeer: f.chunkBurstPerPeer,
 		ChunkRateGlobal:   f.chunkRateGlobal,
 		ChunkBurstGlobal:  f.chunkBurstGlobal,
+
+		MaxPacketMsgPayloadSize: ch.Fetch.MaxPacketMsgPayloadSize,
 	}
 
 	serveLog.Info("config", "path", cfg.Path())

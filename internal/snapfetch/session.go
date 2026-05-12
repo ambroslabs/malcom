@@ -107,7 +107,7 @@ func newFetchSession(ctx context.Context, c Config) (*fetchSession, func(), erro
 		return nil, nil, fmt.Errorf("nodeInfo invalid: %w", err)
 	}
 
-	transport := p2p.NewMultiplexTransport(nodeInfo, *nodeKey, buildMConnConfig())
+	transport := p2p.NewMultiplexTransport(nodeInfo, *nodeKey, buildMConnConfig(c.MaxPacketMsgPayloadSize))
 	if err := transport.Listen(*listenAddr); err != nil {
 		return nil, nil, fmt.Errorf("transport.Listen: %w", err)
 	}

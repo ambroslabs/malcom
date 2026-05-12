@@ -115,11 +115,15 @@ func buildP2PConfig(maxOutbound int, allowDuplicateIP bool) *cfg.P2PConfig {
 }
 
 // buildMConnConfig centralizes snapfetch-specific overrides to cometbft's
-// default MConnConfig.
-func buildMConnConfig() conn.MConnConfig {
+// default MConnConfig. A zero maxPacketMsgPayloadSize leaves cometbft's
+// DefaultMConnConfig value (1024) in place — required for interop with
+// stock cosmos-sdk / cometbft peers; see #122.
+func buildMConnConfig(maxPacketMsgPayloadSize int) conn.MConnConfig {
 	mConfig := conn.DefaultMConnConfig()
-	mConfig.MaxPacketMsgPayloadSize = 256 * 1024 // cometbft's 1024B default is below some peers' framing size
-	mConfig.SendRate = 10 * 1024 * 1024          // 500KB/s default caps us well below typical peer-side limits
-	mConfig.RecvRate = 10 * 1024 * 1024          // matched to SendRate
+	if maxPacketMsgPayloadSize > 0 {
+		mConfig.MaxPacketMsgPayloadSize = maxPacketMsgPayloadSize
+	}
+	mConfig.SendRate = 10 * 1024 * 1024 // 500KB/s default caps us well below typical peer-side limits
+	mConfig.RecvRate = 10 * 1024 * 1024 // matched to SendRate
 	return mConfig
 }

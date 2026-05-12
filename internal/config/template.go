@@ -110,6 +110,14 @@ max_dial_failures = 3
 # Default 3.
 max_disk_write_failures = 3
 
+# Per-packet wire cap on the MConnection. Default (and unset) inherits
+# cometbft's 1024 — required for compat with stock cosmos-sdk /
+# cometbft peers (any vanilla gaiad uses 1024 and disconnects on
+# any larger packet). Raise only for malcom↔malcom-only deployments
+# where both sides agree; ~1% wire overhead saved on large messages
+# at higher packet sizes, rarely worth the loss of interop.
+# max_packet_msg_payload_size = 1024
+
 [import]
 # Pebble bulk-load tuning. Defaults sized for an 8 GiB host with 2-4
 # vCPUs; bump memtable_mb / cache_mb on bigger boxes.
