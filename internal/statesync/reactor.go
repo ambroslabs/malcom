@@ -15,6 +15,7 @@ package statesync
 import (
 	"sync"
 	"sync/atomic"
+	"time"
 
 	"github.com/cometbft/cometbft/libs/log"
 	"github.com/cometbft/cometbft/p2p"
@@ -124,15 +125,20 @@ type Reactor struct {
 	// want to advertise during drain.
 	shuttingDown atomic.Bool
 
-	// Rate-limit state. peerLimiters is a per-peer.ID token bucket
-	// installed by SetChunkRateLimit; sync.Map's LoadOrStore handles
-	// the get-or-create race when two ChunkRequests for the same
-	// fresh peer race into the hot path. globalLim is a single
-	// reactor-wide bucket. Both are nil-equivalent (no globalLim,
-	// peerLimiters empty + chunkRatePerPeer/Burst zeroed) by default
-	// — the fetch-side reactor never calls SetChunkRateLimit, so
-	// neither bucket fires and Receive doesn't even cross the limiter
-	// branch.
+	// Rate-limit state. peerLimiters maps p2p.ID → *peerLimiterEntry,
+	// installed lazily on first ChunkRequest when SetChunkRateLimit
+	// has been called; sync.Map's LoadOrStore handles the get-or-
+	// create race when two ChunkRequests for the same fresh peer
+	// race into the hot path. globalLim is a single reactor-wide
+	// bucket. Both are nil-equivalent (no globalLim, peerLimiters
+	// empty + chunkRatePerPeer/Burst zeroed) by default — the
+	// fetch-side reactor never calls SetChunkRateLimit, so neither
+	// bucket fires and Receive doesn't even cross the limiter branch.
+	//
+	// Entries persist past RemovePeer until sweepStaleLimiters evicts
+	// them (see #108 C4): deleting on disconnect would let a peer
+	// with a stable Node ID disconnect/reconnect to refresh its
+	// burst budget.
 	globalLim         *rate.Limiter
 	peerLimiters      sync.Map
 	chunkRatePerPeer  rate.Limit
@@ -270,22 +276,64 @@ func (r *Reactor) SetChunkRateLimit(c ChunkRateLimit) {
 	}
 }
 
+// peerLimiterEntry wraps a *rate.Limiter with a tombstone timestamp
+// so RemovePeer can defer eviction without losing the bucket state.
+// removedAt is unix nanos: zero means the peer is still considered
+// connected; nonzero is the moment RemovePeer fired. The sweeper
+// evicts entries whose tombstone is older than 2 × (burst/rate) —
+// by which point the bucket has refilled past full and a same-ID
+// reconnect getting a fresh limiter is observationally identical
+// to the original peer hitting the steady-state rate.
+//
+// atomic.Int64 lets the sweeper (Range under sync.Map) read the
+// tombstone concurrently with RemovePeer's set and AddPeer's clear.
+type peerLimiterEntry struct {
+	lim       *rate.Limiter
+	removedAt atomic.Int64
+}
+
 // peerLimiter returns the per-peer.ID rate limiter, creating one on
 // first use. sync.Map.LoadOrStore makes the get-or-create atomic
 // under concurrent first-touch from the same peer (two goroutines
 // race to LoadOrStore; whichever stores first wins, the other's
-// freshly-allocated limiter is GC'd). Returns nil when per-peer
-// rate limiting is disabled.
+// freshly-allocated entry is GC'd). Returns nil when per-peer rate
+// limiting is disabled.
 func (r *Reactor) peerLimiter(id p2p.ID) *rate.Limiter {
 	if r.chunkRatePerPeer <= 0 || r.chunkBurstPerPeer <= 0 {
 		return nil
 	}
 	if v, ok := r.peerLimiters.Load(id); ok {
-		return v.(*rate.Limiter)
+		return v.(*peerLimiterEntry).lim
 	}
-	fresh := rate.NewLimiter(r.chunkRatePerPeer, r.chunkBurstPerPeer)
+	fresh := &peerLimiterEntry{lim: rate.NewLimiter(r.chunkRatePerPeer, r.chunkBurstPerPeer)}
 	actual, _ := r.peerLimiters.LoadOrStore(id, fresh)
-	return actual.(*rate.Limiter)
+	return actual.(*peerLimiterEntry).lim
+}
+
+// sweepStaleLimiters evicts entries whose peer has been disconnected
+// for at least 2 × (burst/rate) — the time it takes an empty bucket
+// to refill to full. After that the limiter holds no rate-limit
+// state worth preserving, so a same-NodeID reconnect getting a
+// fresh limiter is indistinguishable from the original peer hitting
+// the steady-state rate.
+//
+// Called from RemovePeer (the only place the tombstoned set grows),
+// so a long-running daemon's peerLimiters stays bounded by recent
+// disconnect activity.
+func (r *Reactor) sweepStaleLimiters() {
+	if r.chunkRatePerPeer <= 0 || r.chunkBurstPerPeer <= 0 {
+		return
+	}
+	refill := time.Duration(float64(r.chunkBurstPerPeer) / float64(r.chunkRatePerPeer) * float64(time.Second))
+	cutoff := time.Now().Add(-2 * refill).UnixNano()
+	r.peerLimiters.Range(func(k, v any) bool {
+		e := v.(*peerLimiterEntry)
+		t := e.removedAt.Load()
+		if t > 0 && t < cutoff {
+			r.peerLimiters.Delete(k)
+		}
+		return true
+	})
 }
 
 // BeginShutdown puts the reactor into drain mode: subsequent
@@ -339,6 +387,13 @@ func (r *Reactor) AddPeer(peer p2p.Peer) {
 		r.dropsCtrl.Add(1)
 		r.logger.Error("connect Out channel full; dropping", "peer", peerID)
 	}
+	// If a same-NodeID limiter is still in the map from a prior
+	// disconnect, clear its tombstone so the sweeper doesn't evict
+	// it while the peer is connected (and reset its bucket the
+	// next time RemovePeer fires). #108 C4.
+	if v, ok := r.peerLimiters.Load(peer.ID()); ok {
+		v.(*peerLimiterEntry).removedAt.Store(0)
+	}
 	if !r.probe {
 		return
 	}
@@ -353,9 +408,12 @@ func (r *Reactor) AddPeer(peer p2p.Peer) {
 
 // RemovePeer publishes a Removed event so consumers can clean up
 // per-peer state (drop in-flight assignments, drop firstSeen, etc.).
-// Also evicts any per-peer rate limiter installed for this ID so a
-// long-running server doesn't accumulate a limiter-per-historical-
-// peer in memory.
+//
+// The per-peer rate limiter is NOT deleted — only tombstoned.
+// Deleting immediately would let a peer with a stable Node ID
+// disconnect and reconnect to refresh its burst budget (#108 C4).
+// Eviction is deferred to sweepStaleLimiters, which runs here at
+// the moment the tombstoned-set grows by one.
 func (r *Reactor) RemovePeer(peer p2p.Peer, reason interface{}) {
 	peerID := string(peer.ID())
 	select {
@@ -364,7 +422,10 @@ func (r *Reactor) RemovePeer(peer p2p.Peer, reason interface{}) {
 		r.dropsCtrl.Add(1)
 		r.logger.Error("disconnect Out channel full; dropping", "peer", peerID)
 	}
-	r.peerLimiters.Delete(peer.ID())
+	if v, ok := r.peerLimiters.Load(peer.ID()); ok {
+		v.(*peerLimiterEntry).removedAt.Store(time.Now().UnixNano())
+	}
+	r.sweepStaleLimiters()
 }
 
 // RequestChunk dispatches a ChunkRequest for (height, format, index) to peer.

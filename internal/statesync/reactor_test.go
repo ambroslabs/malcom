@@ -4,6 +4,7 @@ import (
 	"net"
 	"sync"
 	"testing"
+	"time"
 
 	cmtlog "github.com/cometbft/cometbft/libs/log"
 	"github.com/cometbft/cometbft/p2p"
@@ -565,9 +566,13 @@ func TestServing_RateLimit_SecondSetCallIgnored(t *testing.T) {
 }
 
 func TestServing_RateLimit_RemovePeerEvictsLimiter(t *testing.T) {
-	// A long-running serve node sees thousands of peers come and
-	// go. Without eviction the sync.Map accumulates a limiter per
-	// historical peer.ID forever. Confirm RemovePeer clears it.
+	// A long-running serve node sees thousands of peers come and go.
+	// Limiters must eventually be evicted (so the sync.Map doesn't
+	// accumulate one per historical peer.ID forever), but NOT
+	// immediately on RemovePeer — that would let a same-NodeID
+	// reconnect refresh its burst budget (#108 C4). The fix defers
+	// eviction by 2× the bucket refill time, by which point the
+	// limiter holds no rate-limit state worth preserving.
 	prov := newFakeProvider(Snapshot{Height: 1000, Format: 3, Chunks: 5})
 	prov.chunks[chunkKey(1000, 3, 0)] = []byte{1}
 	r := newServingReactor(prov)
@@ -579,15 +584,28 @@ func TestServing_RateLimit_RemovePeerEvictsLimiter(t *testing.T) {
 		Src:       peer,
 		Message:   &ssproto.ChunkRequest{Height: 1000, Format: 3, Index: 0},
 	})
-
-	// Limiter should exist after the first request.
 	if _, ok := r.peerLimiters.Load(peer.ID()); !ok {
 		t.Fatal("expected peer limiter to be created on first request")
 	}
-	// RemovePeer should evict it.
+
+	// RemovePeer tombstones the entry instead of deleting it. The
+	// same-NodeID reconnect path relies on this — see
+	// TestServing_RateLimit_PerPeerBucketSurvivesReconnect.
 	r.RemovePeer(peer, "test")
+	if _, ok := r.peerLimiters.Load(peer.ID()); !ok {
+		t.Fatal("entry must persist past RemovePeer (else same-ID reconnect would refresh the bucket; #108 C4)")
+	}
+
+	// Fast-forward the tombstone past the TTL and exercise the
+	// auto-sweep that RemovePeer runs whenever the tombstoned set
+	// grows. Using a fresh unrelated peer here just to drive the
+	// sweep — the assertion is about the original entry's eviction.
+	v, _ := r.peerLimiters.Load(peer.ID())
+	v.(*peerLimiterEntry).removedAt.Store(time.Now().Add(-time.Hour).UnixNano())
+	other := newRecordingPeer("other")
+	r.RemovePeer(other, "test")
 	if _, ok := r.peerLimiters.Load(peer.ID()); ok {
-		t.Fatal("expected peer limiter to be evicted by RemovePeer")
+		t.Fatal("entry should be swept once tombstone is past TTL; auto-sweep from RemovePeer didn't fire")
 	}
 }
 
@@ -614,3 +632,59 @@ func TestServing_NoProvider_RequestsSilent(t *testing.T) {
 type errSimulated struct{}
 
 func (errSimulated) Error() string { return "simulated read error" }
+
+// TestServing_RateLimit_PerPeerBucketSurvivesReconnect is the
+// regression test for issue #108 finding C4: RemovePeer used to
+// delete the per-peer rate.Limiter immediately, so a peer holding a
+// fixed Node ID could disconnect and reconnect to refresh its full
+// burst budget. The whole point of PerPeerRate is to bound a single
+// peer's request rate; that bypass defeats it.
+//
+// The scenario: burst-exhaust the per-peer bucket at a rate so slow
+// it can't refill during the test, RemovePeer, then reconnect with a
+// fresh recordingPeer carrying the SAME Node ID. On vulnerable code
+// the limiter is gone and the reconnect gets a full burst. On the
+// fixed code the limiter survives RemovePeer (eviction is deferred
+// to a sweeper that waits ~2× the bucket refill time), so the
+// reconnect sees the same depleted bucket and is dropped.
+func TestServing_RateLimit_PerPeerBucketSurvivesReconnect(t *testing.T) {
+	prov := newFakeProvider(Snapshot{Height: 1000, Format: 3, Chunks: 100})
+	for i := uint32(0); i < 10; i++ {
+		prov.chunks[chunkKey(1000, 3, i)] = []byte{1}
+	}
+	r := newServingReactor(prov)
+	// Rate is effectively zero so the bucket can't refill during the test.
+	r.SetChunkRateLimit(ChunkRateLimit{PerPeerRate: 0.0001, PerPeerBurst: 3})
+
+	peer := newRecordingPeer("attacker")
+	r.AddPeer(peer)
+	for i := uint32(0); i < 5; i++ {
+		r.Receive(p2p.Envelope{
+			ChannelID: ChunkChannel,
+			Src:       peer,
+			Message:   &ssproto.ChunkRequest{Height: 1000, Format: 3, Index: i},
+		})
+	}
+	if got := len(peer.chunkResponses()); got != 3 {
+		t.Fatalf("setup: served %d, want 3 (burst); rate-limit config not applied?", got)
+	}
+
+	// Disconnect, then reconnect with the SAME Node ID. A fresh
+	// recordingPeer instance simulates a brand-new connection; the
+	// Node ID is what binds it to the same rate-limit bucket.
+	r.RemovePeer(peer, "test")
+	peer2 := newRecordingPeer("attacker")
+	r.AddPeer(peer2)
+
+	r.Receive(p2p.Envelope{
+		ChannelID: ChunkChannel,
+		Src:       peer2,
+		Message:   &ssproto.ChunkRequest{Height: 1000, Format: 3, Index: 5},
+	})
+	if got := len(peer2.chunkResponses()); got != 0 {
+		t.Fatalf("post-reconnect: served %d, want 0 (bucket should still be empty); reconnect bypassed rate limit", got)
+	}
+	if pd, _ := r.RateDropped(); pd < 3 {
+		t.Fatalf("dropped_rate_peer = %d, want >= 3 (2 over-burst + 1 reconnect); per-peer counter not ticking", pd)
+	}
+}
