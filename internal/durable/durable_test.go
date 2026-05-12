@@ -3,7 +3,6 @@ package durable
 import (
 	"bytes"
 	"errors"
-	"io"
 	"io/fs"
 	"os"
 	"path/filepath"
@@ -195,6 +194,51 @@ func TestCloneTreeMirrorsContentAndStructure(t *testing.T) {
 	}
 }
 
+func TestCloneTreePreservesFileModes(t *testing.T) {
+	src := t.TempDir()
+	dst := filepath.Join(t.TempDir(), "out")
+
+	mustMkdirAll(t, filepath.Join(src, "sub"))
+	for _, c := range []struct {
+		rel  string
+		mode os.FileMode
+	}{
+		{"private.bin", 0o600},
+		{"shared.bin", 0o644},
+		{"sub/exec.bin", 0o755},
+	} {
+		p := filepath.Join(src, c.rel)
+		if err := os.WriteFile(p, []byte("x"), c.mode); err != nil {
+			t.Fatalf("seed %s: %v", c.rel, err)
+		}
+		// os.WriteFile applies umask; force the mode explicitly.
+		if err := os.Chmod(p, c.mode); err != nil {
+			t.Fatalf("chmod %s: %v", c.rel, err)
+		}
+	}
+
+	if err := CloneTree(src, dst); err != nil {
+		t.Fatalf("CloneTree: %v", err)
+	}
+
+	for _, c := range []struct {
+		rel  string
+		mode os.FileMode
+	}{
+		{"private.bin", 0o600},
+		{"shared.bin", 0o644},
+		{"sub/exec.bin", 0o755},
+	} {
+		info, err := os.Stat(filepath.Join(dst, c.rel))
+		if err != nil {
+			t.Fatalf("Stat %s: %v", c.rel, err)
+		}
+		if got := info.Mode().Perm(); got != c.mode {
+			t.Errorf("%s: mode = %o, want %o", c.rel, got, c.mode)
+		}
+	}
+}
+
 func TestCloneTreeEmptyDirCopies(t *testing.T) {
 	src := t.TempDir()
 	dst := filepath.Join(t.TempDir(), "out")
@@ -255,5 +299,3 @@ func mustWrite(t *testing.T, p, content string) {
 	}
 }
 
-// _ = io.Reader to keep imports honest when we add streaming tests.
-var _ io.Reader = (*errReader)(nil)
