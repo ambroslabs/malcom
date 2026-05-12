@@ -2,6 +2,7 @@ package snapshotimport
 
 import (
 	"encoding/binary"
+	"fmt"
 	"log/slog"
 	"runtime"
 	"strings"
@@ -98,23 +99,13 @@ func TestProcessStoreSegmentDoesNotLeakOnMalformedStream(t *testing.T) {
 	// holding back the success path — success returns on the first
 	// poll, not at the deadline.
 	deadline := time.Now().Add(5 * time.Second)
-	var (
-		stacks string
-		got    map[string]int
-		leaked bool
-	)
+	var stacks string
+	var got map[string]int
 	for {
 		runtime.GC()
 		stacks = allStacks()
 		got = countLeakSignatures(stacks, leakSigs)
-		leaked = false
-		for _, sig := range leakSigs {
-			if got[sig] > baseline[sig] {
-				leaked = true
-				break
-			}
-		}
-		if !leaked {
+		if !exceedsBaseline(got, baseline, leakSigs) {
 			return
 		}
 		if time.Now().After(deadline) {
@@ -122,24 +113,15 @@ func TestProcessStoreSegmentDoesNotLeakOnMalformedStream(t *testing.T) {
 		}
 		time.Sleep(20 * time.Millisecond)
 	}
-	if leaked {
-		var details strings.Builder
-		details.WriteString("processStoreSegment leaked goroutines after error-return:\n")
-		for _, sig := range leakSigs {
-			details.WriteString("  ")
-			details.WriteString(sig)
-			details.WriteString(": baseline=")
-			details.WriteString(itoa(baseline[sig]))
-			details.WriteString(" after=")
-			details.WriteString(itoa(got[sig]))
-			details.WriteByte('\n')
-		}
-		details.WriteString("\nerror: ")
-		details.WriteString(err.Error())
-		details.WriteString("\n\nleaked stack frames:\n")
-		details.WriteString(extractMatchingFrames(stacks, leakSigs))
-		t.Fatal(details.String())
+
+	counts := make([]string, len(leakSigs))
+	for i, sig := range leakSigs {
+		counts[i] = fmt.Sprintf("  %s: baseline=%d after=%d", sig, baseline[sig], got[sig])
 	}
+	t.Fatalf("processStoreSegment leaked goroutines after error-return:\n"+
+		"%s\n\nerror: %v\n\nleaked stack frames:\n%s",
+		strings.Join(counts, "\n"), err,
+		extractMatchingFrames(stacks, leakSigs))
 }
 
 // ─── stream-builder + stack helpers ─────────────────────────────────────
@@ -203,38 +185,24 @@ func countLeakSignatures(stacks string, sigs []string) map[string]int {
 	return out
 }
 
+func exceedsBaseline(got, baseline map[string]int, sigs []string) bool {
+	for _, sig := range sigs {
+		if got[sig] > baseline[sig] {
+			return true
+		}
+	}
+	return false
+}
+
 func extractMatchingFrames(stacks string, sigs []string) string {
-	var out strings.Builder
+	var matches []string
 	for _, frame := range strings.Split(stacks, "\n\n") {
 		for _, sig := range sigs {
 			if strings.Contains(frame, sig) {
-				out.WriteString(frame)
-				out.WriteString("\n\n")
+				matches = append(matches, frame)
 				break
 			}
 		}
 	}
-	return out.String()
-}
-
-func itoa(n int) string {
-	if n == 0 {
-		return "0"
-	}
-	var buf [20]byte
-	i := len(buf)
-	neg := n < 0
-	if neg {
-		n = -n
-	}
-	for n > 0 {
-		i--
-		buf[i] = byte('0' + n%10)
-		n /= 10
-	}
-	if neg {
-		i--
-		buf[i] = '-'
-	}
-	return string(buf[i:])
+	return strings.Join(matches, "\n\n")
 }
