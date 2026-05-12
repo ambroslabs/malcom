@@ -241,7 +241,7 @@ func ImportParallel(opts ParallelOptions) (*Stats, error) {
 		_ = db.Close()
 		return nil, fmt.Errorf("mkdir ingest tmp: %w", err)
 	}
-	defer os.RemoveAll(ingestTmpDir)
+	defer func() { _ = os.RemoveAll(ingestTmpDir) }()
 
 	stats := &Stats{}
 
@@ -765,7 +765,11 @@ func processStoreSegment(
 	// overlap with iavl/parse work, not write parallelism.
 	const flushBytes = 64 << 20
 	bw := newAsyncBatchWriter(db)
-	defer bw.drain() // idempotent; ensures the writer goroutine is reaped on error returns
+	// drain is idempotent; the explicit call at line 1022 surfaces the
+	// real error path. This defer just reaps the writer goroutine on
+	// error returns — drain's own error has already been reported (or
+	// will be in the caller's explicit drain).
+	defer func() { _ = bw.drain() }()
 	batch := db.NewBatch()
 	batchBytes := 0
 	flush := func() error {

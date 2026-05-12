@@ -1,0 +1,17 @@
+version: "2"
+
+# Default v2 linter set, minus staticcheck (we run that standalone in
+# CI; v2's bundled staticcheck adds QF* "quick-fix" style suggestions
+# which produce a lot of stylistic noise that the standalone tool
+# doesn't gate on).
+linters:
+  disable:
+    - staticcheck
+  exclusions:
+    rules:
+      # errcheck on a deferred Close is the canonical false-positive
+      # pattern — most are on readers we're done with, where a Close
+      # error means nothing actionable. Writer-side Close errors that
+      # do matter get handled explicitly at the call site.
+      - linters: [errcheck]
+        source: '\.Close\(\)$'
