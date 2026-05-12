@@ -88,14 +88,18 @@ func newFetchSession(ctx context.Context, c Config) (*fetchSession, func(), erro
 	// Channels: PEX (0x00) lets us harvest addresses from peers via
 	// cometbft's peer-exchange; state-sync (0x60/0x61) is what we're
 	// here for. Advertising 0x00 is what makes well-behaved peers
-	// reply to our PexRequest.
+	// reply to our PexRequest. With PEXDisabled we drop 0x00 from our
+	// advertised channels so peers' PEX reactors won't initiate
+	// gossip — but we still register a noop handler for 0x00 below,
+	// because some peers ship a PEX hello before checking our
+	// Channels (see #118). Channel order is irrelevant on the wire.
 	nodeInfo := p2p.DefaultNodeInfo{
 		ProtocolVersion: p2p.NewProtocolVersion(version.P2PProtocol, version.BlockProtocol, 0),
 		DefaultNodeID:   nodeKey.ID(),
 		ListenAddr:      listenAddr.DialString(),
 		Network:         c.ChainID,
 		Version:         version.TMCoreSemVer,
-		Channels:        []byte{localpex.Channel, statesync.SnapshotChannel, statesync.ChunkChannel},
+		Channels:        advertisedChannels(c.PEXDisabled),
 		Moniker:         c.Moniker,
 		Other:           p2p.DefaultNodeInfoOther{TxIndex: "off"},
 	}
@@ -230,7 +234,11 @@ func newFetchSession(ctx context.Context, c Config) (*fetchSession, func(), erro
 		}, malcomlog.CmtShim(log.With("module", "pex")))
 		sw.AddReactor("PEX", pexR)
 	} else {
+		// Register a noop reactor for channel 0x00 so peers that
+		// ignore our NodeInfo.Channels and send PEX anyway don't tear
+		// down the MConnection with "unknown channel 0". See #118.
 		log.Info("pex disabled (curated-peers mode): warm-fill draws only from bootstrap_peers")
+		sw.AddReactor("PEX", localpex.NewNoopReactor(malcomlog.CmtShim(log.With("module", "pex"))))
 	}
 	sw.AddReactor("STATESYNC", ssR)
 
@@ -327,6 +335,17 @@ func buildPeerAddrs(ctx context.Context, c Config) ([]addrbook.PeerAddr, error) 
 		return nil, fmt.Errorf("%w: no peer addrs available — %s", ErrNoPeers, hintNoPeerAddrs(c.ChainID))
 	}
 	return peerAddrs, nil
+}
+
+// advertisedChannels returns the cometbft NodeInfo.Channels list for
+// this fetcher. PEXDisabled drops the PEX channel (0x00) so peers'
+// PEX reactors stop initiating gossip with us — see #118 for why we
+// also register a noop handler on the receive side.
+func advertisedChannels(pexDisabled bool) []byte {
+	if pexDisabled {
+		return []byte{statesync.SnapshotChannel, statesync.ChunkChannel}
+	}
+	return []byte{localpex.Channel, statesync.SnapshotChannel, statesync.ChunkChannel}
 }
 
 // walk runs the height-discovery walk against the peer set the manager
