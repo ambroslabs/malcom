@@ -2,7 +2,7 @@
 
 ## Reporting a vulnerability
 
-Email <security@ambroslabs.com> with the details. Please do not file
+Email <zachary@ambroslabs.io> with the details. Please do not file
 public GitHub issues for security reports.
 
 We aim to acknowledge new reports within two business days and to
