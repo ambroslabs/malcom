@@ -318,6 +318,14 @@ func run(f *fetchFlags) error {
 				"items", stats.Items,
 				"stores", len(stats.Stores))
 		}
+		// Mirror what `malcom snapshot import` writes: the appdb's
+		// meta.json. Downstream commands (verify, bootstrap) read
+		// this to default --chain/--height. The standalone import
+		// path always writes it; the pipelined path used to skip it.
+		if err := pipeline.writeAppDBMeta(time.Now().UTC()); err != nil {
+			fetchLog.Error("write appdb meta.json", "err", err, "appdb", pipeline.appdbOut)
+			return &cliexit.Error{Code: ExitDiskFailed}
+		}
 		return exitCodeErr(runPostImportVerify(fetchLog, pipeline.appdbOut, pipeline.appdbHeight, ch.RPCs, f.noVerify))
 	}
 
