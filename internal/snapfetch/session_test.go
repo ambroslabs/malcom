@@ -14,6 +14,9 @@ import (
 
 	"log/slog"
 	"github.com/cometbft/cometbft/p2p"
+
+	localpex "github.com/ambroslabs/malcom/internal/pex"
+	"github.com/ambroslabs/malcom/internal/statesync"
 )
 
 // TestWriteMetaWritesMetaAndCompleteAtomically exercises the finalize
@@ -359,4 +362,45 @@ func TestBuildPeerAddrsPEXDisabledSkipsAddrbook(t *testing.T) {
 			t.Fatalf("err=%v, want ErrNoPeers (curated mode + no bootstrap = nothing to dial)", err)
 		}
 	})
+}
+
+// TestAdvertisedChannelsPEXDisabled is the channels-list half of the
+// #118 fix: when pex_disabled=true the fetcher must drop channel 0x00
+// from its NodeInfo so well-behaved peers' PEX reactors won't initiate
+// gossip with us. (The receive-side noop reactor, registered by
+// newFetchSession when PEXDisabled, handles peers that send PEX
+// anyway — see TestNoopReactor* in the pex package.)
+func TestAdvertisedChannelsPEXDisabled(t *testing.T) {
+	wantPEX := localpex.Channel
+	wantSnap := statesync.SnapshotChannel
+	wantChunk := statesync.ChunkChannel
+
+	t.Run("pex enabled: includes 0x00", func(t *testing.T) {
+		ch := advertisedChannels(false)
+		if !contains(ch, wantPEX) {
+			t.Fatalf("pex enabled: want channel 0x%02x advertised, got %v", wantPEX, ch)
+		}
+		if !contains(ch, wantSnap) || !contains(ch, wantChunk) {
+			t.Fatalf("pex enabled: missing state-sync channels in %v", ch)
+		}
+	})
+
+	t.Run("pex disabled: drops 0x00", func(t *testing.T) {
+		ch := advertisedChannels(true)
+		if contains(ch, wantPEX) {
+			t.Fatalf("pex disabled: channel 0x%02x must NOT be advertised, got %v", wantPEX, ch)
+		}
+		if !contains(ch, wantSnap) || !contains(ch, wantChunk) {
+			t.Fatalf("pex disabled: state-sync channels still required, got %v", ch)
+		}
+	})
+}
+
+func contains(b []byte, v byte) bool {
+	for _, x := range b {
+		if x == v {
+			return true
+		}
+	}
+	return false
 }
