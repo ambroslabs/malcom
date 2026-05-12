@@ -17,10 +17,14 @@ package snapshotfetch
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"log/slog"
+	"os"
+	"path/filepath"
 	"sync"
+	"time"
 
 	"github.com/ambroslabs/malcom/internal/config"
 	"github.com/ambroslabs/malcom/internal/snapshotimport"
@@ -40,6 +44,11 @@ type pipelineState struct {
 	tailing    *snapshotimport.TailingChunkSource
 	importDone chan importResult
 	started    bool
+
+	// snapDir is the source snapshot directory, captured in
+	// onDownloadReady. Used after the import succeeds to read the
+	// snapshot's meta.json HashHex into the appdb's meta.json.
+	snapDir string
 
 	// appdbOut + appdbHeight are populated by onDownloadReady so the
 	// caller can chain into post-import verify without re-deriving the
@@ -86,6 +95,7 @@ func (p *pipelineState) onDownloadReady(snapDir string, height uint64, totalChun
 
 	importHeight := int64(height)
 	outDir := fmt.Sprintf("%s/appdb_%s_%d", p.importOutDir, p.chain.ChainID, importHeight)
+	p.snapDir = snapDir
 	p.appdbOut = outDir
 	p.appdbHeight = importHeight
 	importLog.Info("pipeline: starting import",
@@ -177,4 +187,38 @@ func (p *pipelineState) finalize(fetchErr error) (*snapshotimport.Stats, error) 
 	default:
 		return res.stats, nil
 	}
+}
+
+// snapshotMetaForAppDB is the subset of the snapshot's meta.json the
+// appdb's meta.json carries forward. Same shape standalone import
+// uses (cli/snapshotimport: metaJSON).
+type snapshotMetaForAppDB struct {
+	HashHex string `json:"hash_hex"`
+}
+
+// writeAppDBMeta lands the appdb's meta.json after a successful
+// pipelined import — the same file the standalone `malcom snapshot
+// import` writes. Downstream commands (verify, bootstrap) read this
+// to default --chain and --height; without it operators have to
+// pass both flags. See the reporter who first noticed this gap.
+func (p *pipelineState) writeAppDBMeta(now time.Time) error {
+	if p.snapDir == "" || p.appdbOut == "" {
+		return fmt.Errorf("writeAppDBMeta: pipeline state incomplete (snapDir=%q appdbOut=%q)", p.snapDir, p.appdbOut)
+	}
+	raw, err := os.ReadFile(filepath.Join(p.snapDir, "meta.json"))
+	if err != nil {
+		return fmt.Errorf("read snapshot meta.json: %w", err)
+	}
+	var sm snapshotMetaForAppDB
+	if err := json.Unmarshal(raw, &sm); err != nil {
+		return fmt.Errorf("parse snapshot meta.json: %w", err)
+	}
+	appdbMeta := snapshotimport.AppDBMeta{
+		ChainID:               p.chain.ChainID,
+		Height:                p.appdbHeight,
+		ImportedAt:            now,
+		SourceSnapshotHashHex: sm.HashHex,
+		DBBackend:             snapshotimport.DBBackendPebble,
+	}
+	return snapshotimport.WriteAppDBMeta(p.appdbOut, appdbMeta)
 }
