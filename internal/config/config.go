@@ -232,6 +232,14 @@ type FetchTuning struct {
 
 // ImportTuning maps onto snapshotimport.Options' tuning fields.
 type ImportTuning struct {
+	// MemtableMB sizes pebble's per-flush memtable arena. Default
+	// 256: bulk import keeps up to MemTableStopWritesThreshold (4)
+	// memtables alive, so peak resident arena bytes ≈ MemtableMB×4.
+	// Lowered from 1024 in #103 — the 1024 default OOM-killed 8 GiB
+	// hosts running on CGO_ENABLED=0 builds (where pebble's
+	// manual.New is a plain Go make and arenas stay in the GC heap).
+	// Operators on 16+ GiB boxes can raise this back toward 1024 for
+	// a small write-throughput win.
 	MemtableMB int `toml:"memtable_mb"`
 	CacheMB    int `toml:"cache_mb"`
 	MinFreeGB  int `toml:"min_free_gb"`

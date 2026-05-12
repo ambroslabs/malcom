@@ -117,7 +117,14 @@ func applyImportDefaults(t *ImportTuning) {
 	// ~70k, and the follow-on compact reads each file once instead of
 	// thrashing through tens of thousands of bloom/index blocks.
 	if t.MemtableMB == 0 {
-		t.MemtableMB = 1024
+		// 256 MiB chosen so peak resident arena bytes (MemtableMB × 4
+		// MemTableStopWritesThreshold) ≈ 1 GiB — leaves headroom on
+		// the 8 GiB hosts that hit OOM at the prior 1024 MiB default
+		// (~4 GiB arenas plus 512 MiB chunk ring plus app heap = 7+
+		// GiB anon RSS, see #103). Operators on bigger boxes can
+		// raise this back toward 1024 for a small write-throughput
+		// win — see ImportTuning.MemtableMB docs.
+		t.MemtableMB = 256
 	}
 	if t.CacheMB == 0 {
 		t.CacheMB = 64
