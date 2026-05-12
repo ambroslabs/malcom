@@ -854,6 +854,37 @@ func processStoreSegment(
 			}
 		}()
 
+		// Deferred teardown of the wave-parallel goroutine forest:
+		// writer, dispatcher, NumCPU hash workers, decoder. Without
+		// this, every error return from the wpLoop below leaked
+		// 2+NumCPU goroutines and pinned the chunk ring's memory —
+		// issue #108 C1.
+		//
+		// finishStreaming is idempotent (flips par.closed, broadcasts,
+		// joins dispatcher + workers — Waits are no-ops the second
+		// time). close(writeQ) is NOT idempotent, so the success path
+		// sets writerJoined=true after running its explicit teardown
+		// to stop the defer from double-closing. Draining itemQ wakes
+		// a decoder that may have blocked pushing into a full buffer;
+		// it then reaches its store's endLimit, gets io.EOF, and
+		// exits via the existing close(itemQ) defer.
+		//
+		// Ordering: this defer is declared after `defer bw.drain()`
+		// and `defer rdr.Close()` above, so it runs FIRST in the
+		// LIFO chain — the wave-parallel writer drains into bw, and
+		// the decoder reads from rdr, so both upstreams must still
+		// be alive while we join them.
+		writerJoined := false
+		defer func() {
+			_ = si.finishStreaming()
+			if !writerJoined {
+				close(writeQ)
+				<-writerDone
+			}
+			for range itemQ {
+			}
+		}()
+
 		first := true
 	wpLoop:
 		for item := range itemQ {
@@ -917,6 +948,7 @@ func processStoreSegment(
 			return StoreInfo{}, 0, 0, 0, fmt.Errorf("finish streaming: %w", err)
 		}
 		close(writeQ)
+		writerJoined = true
 		if werr := <-writerDone; werr != nil {
 			_ = batch.Close()
 			return StoreInfo{}, 0, 0, 0, fmt.Errorf("writer goroutine: %w", werr)
