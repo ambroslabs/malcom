@@ -22,7 +22,7 @@ import (
 )
 
 // defaultPersistentPeerCount is how many served-peer entries we forward
-// into config.toml's persistent_peers when -no-forward-peers isn't set.
+// into config.toml's persistent_peers when --forward-peers=false isn't set.
 // 20 is enough to give the daemon a healthy seed pool without bloating
 // the line.
 const defaultPersistentPeerCount = 20

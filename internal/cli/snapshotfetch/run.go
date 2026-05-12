@@ -1,24 +1,23 @@
 // Package snapshotfetch is the `malcom snapshot fetch` subcommand:
 // download a state-sync snapshot for the configured chain.
 //
-// Output: <-out>/snapshot_<chain>_<height>/ (chunks + meta.json +
-// metadata.bin + .complete marker). Default -out is the current
+// Output: <--out>/snapshot_<chain>_<height>/ (chunks + meta.json +
+// metadata.bin + .complete marker). Default --out is the current
 // working directory.
 //
 // Tuning knobs (timeouts, parallelism, peer-selection rules) live in
 // the [chains.<id>.fetch] section of config.toml; only operational
 // flags survive on the CLI.
 //
-// Run returns one of the documented Exit* codes so wrapping
-// orchestrators can distinguish failure modes (retry vs. pivot vs.
-// escalate). See exit.go for the contract.
+// Run returns a cliexit.Error wrapping one of the documented Exit*
+// codes so wrapping orchestrators can distinguish failure modes
+// (retry vs. pivot vs. escalate). See exit.go for the contract.
 package snapshotfetch
 
 import (
 	"context"
 	"encoding/json"
 	"errors"
-	"flag"
 	"fmt"
 	"io"
 	"log/slog"
@@ -32,6 +31,9 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/spf13/cobra"
+
+	"github.com/ambroslabs/malcom/internal/cli/cliexit"
 	"github.com/ambroslabs/malcom/internal/cli/verify"
 	"github.com/ambroslabs/malcom/internal/config"
 	malcomlog "github.com/ambroslabs/malcom/internal/log"
@@ -39,100 +41,128 @@ import (
 	"github.com/ambroslabs/malcom/internal/snapfetch"
 )
 
-// Run is the malcom subcommand entry point.
-func Run(args []string) int {
-	fs := flag.NewFlagSet("malcom snapshot fetch", flag.ContinueOnError)
-	chain := fs.String("chain", "", "chain id (required; must have been added with `malcom add <chain-id>`)")
-	out := fs.String("out", ".", "parent dir for the snapshot output (subdir snapshot_<chain>_<height>/ created inside)")
-	targetHeight := fs.Uint64("target-height", 0, "lock to this exact height; otherwise pick the best candidate")
-	maxHeightFlag := fs.Uint64("max-height", 0, "upper bound for snapshot selection; skips the RPC /status lookup (useful when RPCs are stale or unreachable). Defaults to the chain's current height.")
-	maxAge := fs.Uint64("max-age", 0, fmt.Sprintf("freshness floor in blocks (default %d; override in config.fetch.max_age_blocks)", config.DefaultMaxAgeBlocks))
-	noVerifyHash := fs.Bool("no-verify-hash", false, "skip the post-download SHA256(chunks) == offer.Hash check; per-chunk hashes are still verified against metadata. Run `malcom verify` afterwards if you skip.")
-	debug := fs.Bool("debug", false, "verbose snapfetch logging")
-	logMode := fs.String("log", "", "log output: auto (default), pretty, text, json")
-	pipelineImport := fs.Bool("import", false, "after the snapshot dir + chunk count are known, start `malcom snapshot import` in parallel (parallel/chunk-ring path) and stream chunks to it as they land. Snapshot is still persisted to <-out>; cancel with Ctrl-C aborts both stages.")
-	importOut := fs.String("import-out", "", "(with -import) parent dir for the appdb output. Default: same as -out.")
-	importNoExtensions := fs.Bool("import-no-extensions", false, "(with -import) skip writing extension payloads")
-	importWorkers := fs.Int("import-workers", 0, "(with -import) parallel-import store workers; 0 = NumCPU")
-	importChunkMB := fs.Int("import-chunk-mb", 0, "(with -import) chunk-ring budget in MiB; 0 = default (512)")
-	importWaveParallel := fs.Bool("import-wave-parallel", false, "(with -import) within-store wave-parallel hashing")
-	importFastIngest := fs.Bool("import-fast-ingest", true, "(with -import) bulk-ingest the f/ fast-storage entries via per-store sstable.Writer")
-	noVerify := fs.Bool("no-verify", false, "(with -import) skip the post-import AppHash check against the chain's configured rpcs. Default behaviour: when -import is set and the chain has rpcs, run the same check `malcom verify` performs and exit non-zero on mismatch.")
-	if err := fs.Parse(args); err != nil {
-		return ExitConfig
-	}
+type fetchFlags struct {
+	chain              string
+	out                string
+	targetHeight       uint64
+	maxHeightFlag      uint64
+	maxAge             uint64
+	noVerifyHash       bool
+	debug              bool
+	logMode            string
+	pipelineImport     bool
+	importOut          string
+	importNoExtensions bool
+	importWorkers      int
+	importChunkMB      int
+	importWaveParallel bool
+	importFastIngest   bool
+	noVerify           bool
+}
 
-	mode, ok := malcomlog.ParseMode(*logMode)
+// NewCmd returns the `malcom snapshot fetch` cobra command.
+func NewCmd() *cobra.Command {
+	f := &fetchFlags{}
+	cmd := &cobra.Command{
+		Use:   "fetch",
+		Short: "download a state-sync snapshot",
+		Long:  "Download a state-sync snapshot for the configured chain over P2P. Returns structured exit codes so orchestrators can branch on failure mode.",
+		Args:  cobra.NoArgs,
+		RunE: func(cmd *cobra.Command, _ []string) error {
+			return run(f)
+		},
+	}
+	cmd.Flags().StringVar(&f.chain, "chain", "", "chain id (required; must have been added with 'malcom add <chain-id>')")
+	cmd.Flags().StringVar(&f.out, "out", ".", "parent dir for the snapshot output (subdir snapshot_<chain>_<height>/ created inside)")
+	cmd.Flags().Uint64Var(&f.targetHeight, "target-height", 0, "lock to this exact height; otherwise pick the best candidate")
+	cmd.Flags().Uint64Var(&f.maxHeightFlag, "max-height", 0, "upper bound for snapshot selection; skips the RPC /status lookup (useful when RPCs are stale or unreachable). Defaults to the chain's current height.")
+	cmd.Flags().Uint64Var(&f.maxAge, "max-age", 0, fmt.Sprintf("freshness floor in blocks (default %d; override in config.fetch.max_age_blocks)", config.DefaultMaxAgeBlocks))
+	cmd.Flags().BoolVar(&f.noVerifyHash, "no-verify-hash", false, "skip the post-download SHA256(chunks) == offer.Hash check; per-chunk hashes are still verified against metadata. Run 'malcom verify' afterwards if you skip.")
+	cmd.Flags().BoolVar(&f.debug, "debug", false, "verbose snapfetch logging")
+	cmd.Flags().StringVar(&f.logMode, "log", "", "log output: auto (default), pretty, text, json")
+	cmd.Flags().BoolVar(&f.pipelineImport, "import", false, "after the snapshot dir + chunk count are known, start 'malcom snapshot import' in parallel (parallel/chunk-ring path) and stream chunks to it as they land. Snapshot is still persisted to <--out>; cancel with Ctrl-C aborts both stages.")
+	cmd.Flags().StringVar(&f.importOut, "import-out", "", "(with --import) parent dir for the appdb output. Default: same as --out.")
+	cmd.Flags().BoolVar(&f.importNoExtensions, "import-no-extensions", false, "(with --import) skip writing extension payloads")
+	cmd.Flags().IntVar(&f.importWorkers, "import-workers", 0, "(with --import) parallel-import store workers; 0 = NumCPU")
+	cmd.Flags().IntVar(&f.importChunkMB, "import-chunk-mb", 0, "(with --import) chunk-ring budget in MiB; 0 = default (512)")
+	cmd.Flags().BoolVar(&f.importWaveParallel, "import-wave-parallel", false, "(with --import) within-store wave-parallel hashing")
+	cmd.Flags().BoolVar(&f.importFastIngest, "import-fast-ingest", true, "(with --import) bulk-ingest the f/ fast-storage entries via per-store sstable.Writer")
+	cmd.Flags().BoolVar(&f.noVerify, "no-verify", false, "(with --import) skip the post-import AppHash check against the chain's configured rpcs. Default behaviour: when --import is set and the chain has rpcs, run the same check 'malcom verify' performs and exit non-zero on mismatch.")
+	return cmd
+}
+
+func run(f *fetchFlags) error {
+	mode, ok := malcomlog.ParseMode(f.logMode)
 	if !ok {
-		fmt.Fprintf(os.Stderr, "invalid -log %q (want auto/pretty/text/json)\n", *logMode)
-		return ExitConfig
+		fmt.Fprintf(os.Stderr, "invalid --log %q (want auto/pretty/text/json)\n", f.logMode)
+		return &cliexit.Error{Code: ExitConfig}
 	}
 
-	if *chain == "" {
-		fmt.Fprintln(os.Stderr, "required: -chain <id>")
-		return ExitConfig
+	if f.chain == "" {
+		fmt.Fprintln(os.Stderr, "required: --chain <id>")
+		return &cliexit.Error{Code: ExitConfig}
 	}
 	cfg, err := config.Load()
 	if err != nil {
 		fmt.Fprintln(os.Stderr, err)
-		return ExitConfig
+		return &cliexit.Error{Code: ExitConfig}
 	}
-	ch, err := cfg.Resolve(*chain)
+	ch, err := cfg.Resolve(f.chain)
 	if err != nil {
 		fmt.Fprintln(os.Stderr, err)
-		return ExitConfig
+		return &cliexit.Error{Code: ExitConfig}
 	}
 
 	// Build the logger from the resolved [log] / [log.modules] config.
-	// -debug lowers the global threshold to debug AND bumps every
+	// --debug lowers the global threshold to debug AND bumps every
 	// non-"silent" entry in [log.modules] to debug.
 	logOpts, err := malcomlog.BuildOptions(malcomlog.Tuning{
 		Level:   ch.Log.Level,
 		Modules: ch.Log.Modules,
-	}, mode, *debug, os.Stderr)
+	}, mode, f.debug, os.Stderr)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "log config: %v\n", err)
-		return ExitConfig
+		return &cliexit.Error{Code: ExitConfig}
 	}
 	logger := malcomlog.New(logOpts)
 	fetchLog := logger.With("module", "fetch-cli")
 
-	if err := os.MkdirAll(*out, 0o755); err != nil {
-		fetchLog.Error("mkdir out failed", "err", err, "dir", *out)
-		return ExitDiskFailed
+	if err := os.MkdirAll(f.out, 0o755); err != nil {
+		fetchLog.Error("mkdir out failed", "err", err, "dir", f.out)
+		return &cliexit.Error{Code: ExitDiskFailed}
 	}
 	// Ensure node key + cache dirs exist (config.Resolve gave us paths
 	// but didn't create them).
 	if err := os.MkdirAll(filepath.Dir(ch.NodeKey), 0o755); err != nil {
 		fetchLog.Error("mkdir node-key dir failed", "err", err, "dir", filepath.Dir(ch.NodeKey))
-		return ExitDiskFailed
+		return &cliexit.Error{Code: ExitDiskFailed}
 	}
 
 	// Resolve maxHeight. Three paths:
-	//   - -target-height set: skip lookup entirely (we lock to that one height).
-	//   - -max-height set: use it as-is, skip the RPC.
+	//   - --target-height set: skip lookup entirely (we lock to that one height).
+	//   - --max-height set: use it as-is, skip the RPC.
 	//   - else: query configured RPCs in order; first success wins.
 	// Failure to resolve when needed is fatal (the walking algorithm
 	// requires a maxHeight to pick its starting target).
 	var maxHeight uint64
 	var heightSource string
 	switch {
-	case *targetHeight != 0:
+	case f.targetHeight != 0:
 		// no lookup needed
-	case *maxHeightFlag != 0:
-		maxHeight = *maxHeightFlag
-		heightSource = "-max-height flag"
+	case f.maxHeightFlag != 0:
+		maxHeight = f.maxHeightFlag
+		heightSource = "--max-height flag"
 	default:
 		if len(ch.RPCs) == 0 {
-			fetchLog.Error("config has no rpcs; pass -target-height or -max-height, or fix chains config",
+			fetchLog.Error("config has no rpcs; pass --target-height or --max-height, or fix chains config",
 				"chain", ch.ChainID)
-			return ExitConfig
+			return &cliexit.Error{Code: ExitConfig}
 		}
 		h, src, err := fetchCurrentHeightVerbose(ch.RPCs, fetchLog)
 		if err != nil {
-			fetchLog.Error("all rpcs failed; cannot determine chain head (use -max-height to override)",
+			fetchLog.Error("all rpcs failed; cannot determine chain head (use --max-height to override)",
 				"chain", ch.ChainID, "rpc_count", len(ch.RPCs))
-			return ExitGeneric
+			return &cliexit.Error{Code: ExitGeneric}
 		}
 		// A successful response of latest_block_height=0 means the
 		// RPC believes the chain has no blocks (brand-new test net,
@@ -140,9 +170,9 @@ func Run(args []string) int {
 		// phase has nothing to enumerate; surface that here with a
 		// clearer message than the downstream ErrWalkFailed.
 		if h == 0 {
-			fetchLog.Error("rpc reports latest_block_height=0 (chain not started or stale node); pass -max-height to override",
+			fetchLog.Error("rpc reports latest_block_height=0 (chain not started or stale node); pass --max-height to override",
 				"chain", ch.ChainID, "source", src)
-			return ExitGeneric
+			return &cliexit.Error{Code: ExitGeneric}
 		}
 		maxHeight = h
 		heightSource = src
@@ -151,8 +181,8 @@ func Run(args []string) int {
 	// Freshness floor. 0 = "use config value" (which itself defaults
 	// to DefaultMaxAgeBlocks via applyFetchDefaults if unset).
 	effMaxAge := ch.Fetch.MaxAgeBlocks
-	if *maxAge != 0 {
-		effMaxAge = *maxAge
+	if f.maxAge != 0 {
+		effMaxAge = f.maxAge
 	}
 	var minHeight uint64
 	if effMaxAge > 0 && maxHeight > effMaxAge {
@@ -185,7 +215,7 @@ func Run(args []string) int {
 		PeerFailLimit:            ch.Fetch.PeerFails,
 		MaxRedials:               ch.Fetch.PeerRedials,
 		PeerRedialBackoff:        ch.Fetch.RedialBackoff.Duration(),
-		TargetHeight:             *targetHeight,
+		TargetHeight:             f.targetHeight,
 		MaxHeight:                maxHeight,
 		MinHeight:                minHeight,
 		SnapshotInterval:         ch.Fetch.SnapshotInterval,
@@ -204,12 +234,12 @@ func Run(args []string) int {
 		MaxDiskWriteFailures:     ch.Fetch.MaxDiskWriteFailures,
 		MaxRescans:               ch.Fetch.MaxRescans,
 		RescanDiscoverFor:        ch.Fetch.RescanDiscover.Duration(),
-		SkipVerifyHash:           *noVerifyHash,
+		SkipVerifyHash:           f.noVerifyHash,
 	}
 
 	fetchLog.Info("config", "path", cfg.Path())
 	fetchLog.Info("chain", "id", ch.ChainID)
-	fetchLog.Info("out", "dir", *out)
+	fetchLog.Info("out", "dir", f.out)
 	fetchLog.Info("node key", "path", ch.NodeKey)
 
 	rootCtx, cancel := context.WithCancel(context.Background())
@@ -237,39 +267,39 @@ func Run(args []string) int {
 	// that the parallel importer consumes as its decompressed-stream
 	// source. See pipeline.go for the rationale.
 	var pipeline *pipelineState
-	if *pipelineImport {
-		appdbOut := *importOut
+	if f.pipelineImport {
+		appdbOut := f.importOut
 		if appdbOut == "" {
-			appdbOut = *out
+			appdbOut = f.out
 		}
 		if err := os.MkdirAll(appdbOut, 0o755); err != nil {
 			fetchLog.Error("mkdir import-out failed", "err", err, "dir", appdbOut)
-			return ExitDiskFailed
+			return &cliexit.Error{Code: ExitDiskFailed}
 		}
 		pipeline = &pipelineState{
 			chain:          ch,
 			importOutDir:   appdbOut,
-			noExtensions:   *importNoExtensions,
+			noExtensions:   f.importNoExtensions,
 			cancelFetchCtx: cancel,
 			logger:         logger,
 			parallelOpts: pipelineImportTuning{
-				Workers:      *importWorkers,
-				ChunkMB:      *importChunkMB,
-				WaveParallel: *importWaveParallel,
-				FastIngest:   *importFastIngest,
+				Workers:      f.importWorkers,
+				ChunkMB:      f.importChunkMB,
+				WaveParallel: f.importWaveParallel,
+				FastIngest:   f.importFastIngest,
 			},
 		}
 		scfg.OnDownloadReady = pipeline.onDownloadReady
 		scfg.OnChunkReady = pipeline.onChunkReady
 		fetchLog.Info("pipelined import enabled",
 			"appdb_out", appdbOut,
-			"workers", *importWorkers,
-			"chunk_mb", *importChunkMB,
-			"wave_parallel", *importWaveParallel,
-			"fast_ingest", *importFastIngest)
+			"workers", f.importWorkers,
+			"chunk_mb", f.importChunkMB,
+			"wave_parallel", f.importWaveParallel,
+			"fast_ingest", f.importFastIngest)
 	}
 
-	fetchErr := snapfetch.RunFetch(rootCtx, scfg, *out)
+	fetchErr := snapfetch.RunFetch(rootCtx, scfg, f.out)
 
 	if pipeline != nil {
 		stats, err := pipeline.finalize(fetchErr)
@@ -279,7 +309,7 @@ func Run(args []string) int {
 			} else {
 				fetchLog.Error("import failed", "err", err)
 			}
-			return mapExitCode(err, interrupted.Load())
+			return exitCodeErr(mapExitCode(err, interrupted.Load()))
 		}
 		if stats != nil {
 			fetchLog.Info("pipeline complete",
@@ -287,15 +317,24 @@ func Run(args []string) int {
 				"items", stats.Items,
 				"stores", len(stats.Stores))
 		}
-		return runPostImportVerify(fetchLog, pipeline.appdbOut, pipeline.appdbHeight, ch.RPCs, *noVerify)
+		return exitCodeErr(runPostImportVerify(fetchLog, pipeline.appdbOut, pipeline.appdbHeight, ch.RPCs, f.noVerify))
 	}
 
 	if fetchErr != nil {
 		fetchLog.Error("snapfetch failed", "err", fetchErr)
-		return mapExitCode(fetchErr, interrupted.Load())
+		return exitCodeErr(mapExitCode(fetchErr, interrupted.Load()))
 	}
 	fetchLog.Info("WARNING: snapshot contents are not authenticated by p2p — run `malcom verify` against a trusted RPC before using this snapshot in production")
-	return ExitSuccess
+	return nil
+}
+
+// exitCodeErr returns nil when code is ExitSuccess so the cobra RunE
+// signals "no error"; otherwise it wraps the code in a cliexit.Error.
+func exitCodeErr(code int) error {
+	if code == ExitSuccess {
+		return nil
+	}
+	return &cliexit.Error{Code: code}
 }
 
 // runPostImportVerify runs the same AppHash check `malcom verify`
@@ -317,11 +356,11 @@ func runPostImportVerify(log *slog.Logger, appdb string, height int64, rpcs []st
 		return ExitSuccess
 	}
 	if noVerify {
-		log.Info("WARNING: -no-verify set; snapshot contents are not authenticated by p2p — run `malcom verify` against a trusted RPC before using this snapshot in production")
+		log.Info("WARNING: --no-verify set; snapshot contents are not authenticated by p2p — run `malcom verify` against a trusted RPC before using this snapshot in production")
 		return ExitSuccess
 	}
 	if len(rpcs) == 0 {
-		log.Info("WARNING: chain config has no rpcs; snapshot contents are not authenticated by p2p — populate chains/<id>.toml rpcs or run `malcom verify -rpc <url>` against a trusted RPC before using this snapshot in production")
+		log.Info("WARNING: chain config has no rpcs; snapshot contents are not authenticated by p2p — populate chains/<id>.toml rpcs or run `malcom verify --rpc <url>` against a trusted RPC before using this snapshot in production")
 		return ExitSuccess
 	}
 	verifyLog := log.With("module", "verify")
@@ -343,7 +382,7 @@ func runPostImportVerify(log *slog.Logger, appdb string, height int64, rpcs []st
 		// the operator can re-run `malcom verify` themselves.
 		verifyLog.Warn("post-import verify did not complete; snapshot is not authenticated",
 			"err", err,
-			"hint", "run `malcom verify -appdb "+appdb+"` once an rpc is reachable")
+			"hint", "run `malcom verify --appdb "+appdb+"` once an rpc is reachable")
 		return ExitSuccess
 	}
 	verifyLog.Info("MATCH — application.db is consensus-correct",

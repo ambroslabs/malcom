@@ -6,51 +6,66 @@
 package snapshotindex
 
 import (
-	"flag"
 	"fmt"
 	"os"
 	"text/tabwriter"
 	"time"
 
+	"github.com/spf13/cobra"
+
+	"github.com/ambroslabs/malcom/internal/cli/cliexit"
 	"github.com/ambroslabs/malcom/internal/config"
 	malcomlog "github.com/ambroslabs/malcom/internal/log"
 	"github.com/ambroslabs/malcom/internal/snapshotimport"
 )
 
-// Run is the malcom subcommand entry point.
-func Run(args []string) int {
-	fs := flag.NewFlagSet("malcom snapshot index", flag.ContinueOnError)
-	snapshotDir := fs.String("snapshot", "", "snapshot directory to index (with chunk_*.bin)")
-	logMode := fs.String("log", "", "log output: auto (default), pretty, text, json")
-	debug := fs.Bool("debug", false, "verbose logging")
-	if err := fs.Parse(args); err != nil {
-		return 2
+// NewCmd returns the `malcom snapshot index` cobra command.
+func NewCmd() *cobra.Command {
+	var (
+		snapshotDir string
+		logMode     string
+		debug       bool
+	)
+	cmd := &cobra.Command{
+		Use:   "index",
+		Short: "build a per-store offset index of a snapshot dir (diagnostic)",
+		Args:  cobra.NoArgs,
+		RunE: func(cmd *cobra.Command, _ []string) error {
+			return run(snapshotDir, logMode, debug)
+		},
 	}
-	if *snapshotDir == "" {
-		fs.Usage()
-		return 2
+	cmd.Flags().StringVar(&snapshotDir, "snapshot", "", "snapshot directory to index (with chunk_*.bin)")
+	cmd.Flags().StringVar(&logMode, "log", "", "log output: auto (default), pretty, text, json")
+	cmd.Flags().BoolVar(&debug, "debug", false, "verbose logging")
+	return cmd
+}
+
+func run(snapshotDir, logMode string, debug bool) error {
+	if snapshotDir == "" {
+		fmt.Fprintln(os.Stderr, "required: --snapshot <dir>")
+		return &cliexit.Error{Code: 2}
 	}
 
-	mode, ok := malcomlog.ParseMode(*logMode)
+	mode, ok := malcomlog.ParseMode(logMode)
 	if !ok {
-		fmt.Fprintf(os.Stderr, "invalid -log %q (want auto/pretty/text/json)\n", *logMode)
-		return 2
+		fmt.Fprintf(os.Stderr, "invalid --log %q (want auto/pretty/text/json)\n", logMode)
+		return &cliexit.Error{Code: 2}
 	}
 	var logTuning malcomlog.Tuning
 	if cfg, err := config.Load(); err == nil {
 		logTuning = malcomlog.Tuning{Level: cfg.Log.Level, Modules: cfg.Log.Modules}
 	}
-	logOpts, err := malcomlog.BuildOptions(logTuning, mode, *debug, os.Stderr)
+	logOpts, err := malcomlog.BuildOptions(logTuning, mode, debug, os.Stderr)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "log config: %v\n", err)
-		return 2
+		return &cliexit.Error{Code: 2}
 	}
 	log := malcomlog.New(logOpts).With("module", "index")
 
-	idx, err := snapshotimport.BuildIndex(*snapshotDir, log)
+	idx, err := snapshotimport.BuildIndex(snapshotDir, log)
 	if err != nil {
 		log.Error("build index failed", "err", err)
-		return 1
+		return &cliexit.Error{Code: 1}
 	}
 
 	// Print the per-store table to stdout — separate from the
@@ -69,7 +84,7 @@ func Run(args []string) int {
 		len(idx.Stores), idx.TotalItems, humanBytes(uint64(idx.TotalBytes)),
 		idx.BuildElapsed.Truncate(time.Millisecond), idx.BuildBytesRate)
 
-	return 0
+	return nil
 }
 
 // humanBytes formats binary units. Local copy rather than pulling the

@@ -11,7 +11,7 @@ import (
 
 // BootstrapHeightMarker is the filename written under the chain home
 // after `<binary> {tendermint,comet} bootstrap-state` succeeds. The
-// height is the source-of-truth for `malcom heal` recovery (see #95):
+// height is the source-of-truth for `malcom bootstrap heal` recovery (see #95):
 // cometbft consumes its OfflineStateSyncHeight signal on the first
 // `<binary> start`, so a failed first start permanently bricks the
 // home unless the height is re-applied via another `bootstrap-state`.
@@ -25,7 +25,7 @@ const BootstrapHeightMarker = ".malcom-bootstrap-height"
 
 // ErrNoMarker means the home dir has no .malcom-bootstrap-height
 // file. Distinguished from a corrupt marker so the heal subcommand
-// can decide between "use the -height flag" and "the file you wrote
+// can decide between "use the --height flag" and "the file you wrote
 // is unreadable, fix it".
 var ErrNoMarker = errors.New("no .malcom-bootstrap-height marker in home")
 

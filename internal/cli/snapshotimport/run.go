@@ -2,8 +2,8 @@
 // take a downloaded snapshot directory and produce gaiad-compatible
 // artefacts.
 //
-// Output: <-out>/appdb_<chain>_<height>/{application.db,extensions}/.
-// Default -out is the current working directory.
+// Output: <--out>/appdb_<chain>_<height>/{application.db,extensions}/.
+// Default --out is the current working directory.
 //
 // Pebble bulk-load tuning lives in the [chains.<id>.import] section
 // of config.toml.
@@ -12,7 +12,6 @@ package snapshotimport
 import (
 	"context"
 	"encoding/json"
-	"flag"
 	"fmt"
 	"log/slog"
 	"os"
@@ -21,6 +20,9 @@ import (
 	"runtime/pprof"
 	"time"
 
+	"github.com/spf13/cobra"
+
+	"github.com/ambroslabs/malcom/internal/cli/cliexit"
 	"github.com/ambroslabs/malcom/internal/config"
 	malcomlog "github.com/ambroslabs/malcom/internal/log"
 	"github.com/ambroslabs/malcom/internal/snapshotdiff"
@@ -33,41 +35,74 @@ type metaJSON struct {
 	HashHex string `json:"hash_hex"`
 }
 
-// Run is the malcom subcommand entry point.
-func Run(args []string) int {
-	fs := flag.NewFlagSet("malcom snapshot import", flag.ContinueOnError)
-	chain := fs.String("chain", "", "chain id (override; required if snapshot meta.json is missing or omits chain_id)")
-	snapshotDir := fs.String("snapshot", "", "snapshot directory to import (with chunk_*.bin + meta.json)")
-	out := fs.String("out", ".", "parent dir for the output (subdir appdb_<chain>_<height>/ created inside)")
-	height := fs.Int64("height", 0, "height override (required if snapshot meta.json is missing or omits height)")
-	noExt := fs.Bool("no-extensions", false, "skip writing extension payloads")
-	logMode := fs.String("log", "", "log output: auto (default), pretty, text, json")
-	debug := fs.Bool("debug", false, "verbose logging")
-	cpuProfile := fs.String("cpuprofile", "", "write a pprof CPU profile to this path; open with `go tool pprof -http=: <path>`")
-	memProfile := fs.String("memprofile", "", "write a pprof heap profile to this path at end of run")
-	memStats := fs.Bool("mem-stats", false, "log runtime.MemStats every 10s during the run (module=memstats)")
-	parallel := fs.Bool("parallel", false, "use the parallel pipeline: decompress to temp file once, then process stores concurrently across workers")
-	parallelWorkers := fs.Int("workers", 0, "max concurrent store workers in -parallel mode (default = NumCPU)")
-	tempDir := fs.String("tmp-dir", "", "(unused — preserved for backward CLI compatibility; the parallel pipeline streams through an in-memory chunk ring rather than a temp file)")
-	chunkMB := fs.Int("chunk-mb", 0, "in-memory chunk-ring budget in MiB (the streaming buffer between stage 1 decompression and stage 2 readers). 0 = default 512. Bigger values reduce stage-1 backpressure on multi-store-concurrent chains (cosmoshub bank+ibc, osmosis cl/ibc/wasm) at the cost of more peak RSS; single-polestar chains (bbn finality) don't benefit from larger rings.")
-	fastIngest := fs.Bool("fast-ingest", true, "route f/ (fast-storage) entries through pebble's bulk-ingest path (per-store sstable.Writer + db.Ingest at end-of-store). Disable to send them through the regular pebble.Batch instead. Output is bit-identical either way; this flag exists to A/B the bulk-ingest performance benefit.")
-	waveParallel := fs.Bool("wave-parallel", false, "within-store wave-parallel hashing: each per-store worker spawns a hash worker pool to overlap iavl hash + encode work across cores. Helps single-store-dominated chains (bbn finality: ~-2 min vs async-only). Slightly regresses chains where multiple polestar stores run concurrent (osmosis cl/ibc/wasm). Default off.")
-	flushSplitMB := fs.Int("flush-split-mb", -1, "cap on L0 SSTable size from memtable flushes; -1 = use [import].flush_split_mb (defaults to memtable_mb)")
-	compactDuringImport := fs.Bool("compact-during-import", false, "enable pebble auto-compactions during import (default off; trades wall time for tighter end-of-import LSM)")
-	compactWorkers := fs.Int("compact-workers", 0, "override [compact].max_concurrent_compactions for this run (only meaningful when -compact-during-import is set)")
-	noVerify := fs.Bool("no-verify", false, "skip the post-import AppHash check against the chain's configured rpcs. Default behaviour: after import completes, when the chain has rpcs, run the same check `malcom verify` performs and exit non-zero on mismatch.")
-	if err := fs.Parse(args); err != nil {
-		return 2
+type importFlags struct {
+	chain               string
+	snapshotDir         string
+	out                 string
+	height              int64
+	noExt               bool
+	logMode             string
+	debug               bool
+	cpuProfile          string
+	memProfile          string
+	memStats            bool
+	parallel            bool
+	parallelWorkers     int
+	tempDir             string
+	chunkMB             int
+	fastIngest          bool
+	waveParallel        bool
+	flushSplitMB        int
+	compactDuringImport bool
+	compactWorkers      int
+	noVerify            bool
+}
+
+// NewCmd returns the `malcom snapshot import` cobra command.
+func NewCmd() *cobra.Command {
+	f := &importFlags{}
+	cmd := &cobra.Command{
+		Use:   "import",
+		Short: "convert a snapshot dir into application.db + extensions/",
+		Long:  "Take a downloaded snapshot directory and produce gaiad-compatible artefacts (application.db + extensions).",
+		Args:  cobra.NoArgs,
+		RunE: func(cmd *cobra.Command, _ []string) error {
+			return run(f)
+		},
 	}
-	if *snapshotDir == "" {
-		fs.Usage()
-		return 2
+	cmd.Flags().StringVar(&f.chain, "chain", "", "chain id (override; required if snapshot meta.json is missing or omits chain_id)")
+	cmd.Flags().StringVar(&f.snapshotDir, "snapshot", "", "snapshot directory to import (with chunk_*.bin + meta.json)")
+	cmd.Flags().StringVar(&f.out, "out", ".", "parent dir for the output (subdir appdb_<chain>_<height>/ created inside)")
+	cmd.Flags().Int64Var(&f.height, "height", 0, "height override (required if snapshot meta.json is missing or omits height)")
+	cmd.Flags().BoolVar(&f.noExt, "no-extensions", false, "skip writing extension payloads")
+	cmd.Flags().StringVar(&f.logMode, "log", "", "log output: auto (default), pretty, text, json")
+	cmd.Flags().BoolVar(&f.debug, "debug", false, "verbose logging")
+	cmd.Flags().StringVar(&f.cpuProfile, "cpuprofile", "", "write a pprof CPU profile to this path; open with 'go tool pprof -http=: <path>'")
+	cmd.Flags().StringVar(&f.memProfile, "memprofile", "", "write a pprof heap profile to this path at end of run")
+	cmd.Flags().BoolVar(&f.memStats, "mem-stats", false, "log runtime.MemStats every 10s during the run (module=memstats)")
+	cmd.Flags().BoolVar(&f.parallel, "parallel", false, "use the parallel pipeline: decompress to temp file once, then process stores concurrently across workers")
+	cmd.Flags().IntVar(&f.parallelWorkers, "workers", 0, "max concurrent store workers in --parallel mode (default = NumCPU)")
+	cmd.Flags().StringVar(&f.tempDir, "tmp-dir", "", "(unused — preserved for backward CLI compatibility; the parallel pipeline streams through an in-memory chunk ring rather than a temp file)")
+	cmd.Flags().IntVar(&f.chunkMB, "chunk-mb", 0, "in-memory chunk-ring budget in MiB (the streaming buffer between stage 1 decompression and stage 2 readers). 0 = default 512. Bigger values reduce stage-1 backpressure on multi-store-concurrent chains (cosmoshub bank+ibc, osmosis cl/ibc/wasm) at the cost of more peak RSS; single-polestar chains (bbn finality) don't benefit from larger rings.")
+	cmd.Flags().BoolVar(&f.fastIngest, "fast-ingest", true, "route f/ (fast-storage) entries through pebble's bulk-ingest path (per-store sstable.Writer + db.Ingest at end-of-store). Disable to send them through the regular pebble.Batch instead. Output is bit-identical either way; this flag exists to A/B the bulk-ingest performance benefit.")
+	cmd.Flags().BoolVar(&f.waveParallel, "wave-parallel", false, "within-store wave-parallel hashing: each per-store worker spawns a hash worker pool to overlap iavl hash + encode work across cores. Helps single-store-dominated chains (bbn finality: ~-2 min vs async-only). Slightly regresses chains where multiple polestar stores run concurrent (osmosis cl/ibc/wasm). Default off.")
+	cmd.Flags().IntVar(&f.flushSplitMB, "flush-split-mb", -1, "cap on L0 SSTable size from memtable flushes; -1 = use [import].flush_split_mb (defaults to memtable_mb)")
+	cmd.Flags().BoolVar(&f.compactDuringImport, "compact-during-import", false, "enable pebble auto-compactions during import (default off; trades wall time for tighter end-of-import LSM)")
+	cmd.Flags().IntVar(&f.compactWorkers, "compact-workers", 0, "override [compact].max_concurrent_compactions for this run (only meaningful when --compact-during-import is set)")
+	cmd.Flags().BoolVar(&f.noVerify, "no-verify", false, "skip the post-import AppHash check against the chain's configured rpcs. Default behaviour: after import completes, when the chain has rpcs, run the same check 'malcom verify' performs and exit non-zero on mismatch.")
+	return cmd
+}
+
+func run(f *importFlags) error {
+	if f.snapshotDir == "" {
+		fmt.Fprintln(os.Stderr, "required: --snapshot <dir>")
+		return &cliexit.Error{Code: 2}
 	}
 
-	mode, ok := malcomlog.ParseMode(*logMode)
+	mode, ok := malcomlog.ParseMode(f.logMode)
 	if !ok {
-		fmt.Fprintf(os.Stderr, "invalid -log %q (want auto/pretty/text/json)\n", *logMode)
-		return 2
+		fmt.Fprintf(os.Stderr, "invalid --log %q (want auto/pretty/text/json)\n", f.logMode)
+		return &cliexit.Error{Code: 2}
 	}
 	// Load config so the logger picks up [log] / [log.modules]. Fall
 	// back to defaults if config is missing (the import path doesn't
@@ -76,10 +111,10 @@ func Run(args []string) int {
 	if cfg, err := config.Load(); err == nil {
 		logTuning = malcomlog.Tuning{Level: cfg.Log.Level, Modules: cfg.Log.Modules}
 	}
-	logOpts, err := malcomlog.BuildOptions(logTuning, mode, *debug, os.Stderr)
+	logOpts, err := malcomlog.BuildOptions(logTuning, mode, f.debug, os.Stderr)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "log config: %v\n", err)
-		return 2
+		return &cliexit.Error{Code: 2}
 	}
 	logger := malcomlog.New(logOpts)
 	log := logger.With("module", "import-cli")
@@ -87,25 +122,25 @@ func Run(args []string) int {
 	// CPU profile spans the whole Run including the final compact +
 	// cleanup pass — useful for profiling the entire pipeline, not
 	// just the stream phase.
-	if *cpuProfile != "" {
-		f, err := os.Create(*cpuProfile)
+	if f.cpuProfile != "" {
+		cf, err := os.Create(f.cpuProfile)
 		if err != nil {
-			log.Error("create cpu profile failed", "path", *cpuProfile, "err", err)
-			return 1
+			log.Error("create cpu profile failed", "path", f.cpuProfile, "err", err)
+			return &cliexit.Error{Code: 1}
 		}
-		if err := pprof.StartCPUProfile(f); err != nil {
+		if err := pprof.StartCPUProfile(cf); err != nil {
 			log.Error("start cpu profile failed", "err", err)
-			_ = f.Close()
-			return 1
+			_ = cf.Close()
+			return &cliexit.Error{Code: 1}
 		}
 		defer func() {
 			pprof.StopCPUProfile()
-			_ = f.Close()
-			log.Info("cpu profile written", "path", *cpuProfile)
+			_ = cf.Close()
+			log.Info("cpu profile written", "path", f.cpuProfile)
 		}()
 	}
 
-	if *memStats {
+	if f.memStats {
 		ctx, cancel := context.WithCancel(context.Background())
 		defer cancel()
 		go runMemStatsTicker(ctx, logger.With("module", "memstats"), 10*time.Second)
@@ -113,95 +148,95 @@ func Run(args []string) int {
 
 	// Read meta.json if present. The chain id and height are normally
 	// drawn from here so the user doesn't have to repeat themselves;
-	// the -chain / -height flags only kick in when meta.json is
+	// the --chain / --height flags only kick in when meta.json is
 	// missing or pre-dates the field, in which case they're required
 	// overrides. Any flag value that's set must match meta.json.
-	metaPath := filepath.Join(*snapshotDir, "meta.json")
+	metaPath := filepath.Join(f.snapshotDir, "meta.json")
 	meta, metaErr := readMeta(metaPath)
 	switch {
 	case metaErr != nil && !os.IsNotExist(metaErr):
 		log.Error("read meta.json", "path", metaPath, "err", metaErr)
-		return 1
+		return &cliexit.Error{Code: 1}
 	case metaErr != nil:
 		// missing meta.json — flags must fully specify chain + height.
-		if *chain == "" || *height == 0 {
-			log.Error("no meta.json; pass -chain and -height to override", "path", *snapshotDir)
-			return 1
+		if f.chain == "" || f.height == 0 {
+			log.Error("no meta.json; pass --chain and --height to override", "path", f.snapshotDir)
+			return &cliexit.Error{Code: 1}
 		}
 	default:
-		if meta.ChainID != "" && *chain != "" && meta.ChainID != *chain {
-			log.Error("meta.json chain_id does not match -chain", "meta", meta.ChainID, "flag", *chain)
-			return 1
+		if meta.ChainID != "" && f.chain != "" && meta.ChainID != f.chain {
+			log.Error("meta.json chain_id does not match --chain", "meta", meta.ChainID, "flag", f.chain)
+			return &cliexit.Error{Code: 1}
 		}
-		if meta.Height != 0 && *height != 0 && uint64(*height) != meta.Height {
-			log.Error("meta.json height does not match -height", "meta", meta.Height, "flag", *height)
-			return 1
+		if meta.Height != 0 && f.height != 0 && uint64(f.height) != meta.Height {
+			log.Error("meta.json height does not match --height", "meta", meta.Height, "flag", f.height)
+			return &cliexit.Error{Code: 1}
 		}
-		if *chain == "" {
+		if f.chain == "" {
 			if meta.ChainID == "" {
-				log.Error("meta.json has no chain_id; pass -chain to override")
-				return 1
+				log.Error("meta.json has no chain_id; pass --chain to override")
+				return &cliexit.Error{Code: 1}
 			}
-			*chain = meta.ChainID
+			f.chain = meta.ChainID
 		}
-		if *height == 0 {
+		if f.height == 0 {
 			if meta.Height == 0 {
-				log.Error("meta.json has no height; pass -height to override")
-				return 1
+				log.Error("meta.json has no height; pass --height to override")
+				return &cliexit.Error{Code: 1}
 			}
-			*height = int64(meta.Height)
+			f.height = int64(meta.Height)
 		}
 	}
 
 	cfg, err := config.Load()
 	if err != nil {
 		log.Error("config load", "err", err)
-		return 1
+		return &cliexit.Error{Code: 1}
 	}
-	ch, err := cfg.Resolve(*chain)
+	ch, err := cfg.Resolve(f.chain)
 	if err != nil {
-		log.Error("resolve chain", "err", err, "chain", *chain)
-		return 1
+		log.Error("resolve chain", "err", err, "chain", f.chain)
+		return &cliexit.Error{Code: 1}
 	}
 
-	outDir := filepath.Join(*out, fmt.Sprintf("appdb_%s_%d", ch.ChainID, *height))
+	outDir := filepath.Join(f.out, fmt.Sprintf("appdb_%s_%d", ch.ChainID, f.height))
 	if err := os.MkdirAll(outDir, 0o755); err != nil {
 		log.Error("mkdir out failed", "err", err, "dir", outDir)
-		return 1
+		return &cliexit.Error{Code: 1}
 	}
 
 	if ch.Import.MinFreeGB > 0 {
 		if err := snapshotdiff.CheckFreeSpace(outDir, uint64(ch.Import.MinFreeGB)<<30); err != nil {
 			log.Error("disk check failed", "err", err)
-			return 1
+			return &cliexit.Error{Code: 1}
 		}
 	}
 
 	log.Info("starting",
 		"config", cfg.Path(),
 		"chain", ch.ChainID,
-		"snapshot", *snapshotDir,
+		"snapshot", f.snapshotDir,
 		"out", outDir,
-		"height", *height,
+		"height", f.height,
 		"memtable_mb", ch.Import.MemtableMB,
 		"cache_mb", ch.Import.CacheMB,
 		"max_compact", ch.Import.MaxConcurrentCompactions,
-		"extensions", !*noExt)
+		"extensions", !f.noExt)
 
 	maxCompact := ch.Compact.MaxConcurrentCompactions
-	if *compactWorkers > 0 {
-		maxCompact = *compactWorkers
+	if f.compactWorkers > 0 {
+		maxCompact = f.compactWorkers
 	}
 	flushSplit := ch.Import.FlushSplitMB
-	if *flushSplitMB >= 0 {
-		flushSplit = *flushSplitMB
+	if f.flushSplitMB >= 0 {
+		flushSplit = f.flushSplitMB
 	}
-	compactDuring := ch.Import.CompactDuringImport || *compactDuringImport
+	compactDuring := ch.Import.CompactDuringImport || f.compactDuringImport
 	importOpts := snapshotimport.Options{
-		SnapshotDir:              *snapshotDir,
+		SnapshotDir:              f.snapshotDir,
 		OutDir:                   outDir,
-		Height:                   *height,
-		NoExtensions:             *noExt,
+		Height:                   f.height,
+		NoExtensions:             f.noExt,
 		MemtableMB:               ch.Import.MemtableMB,
 		CacheMB:                  ch.Import.CacheMB,
 		MaxConcurrentCompactions: maxCompact,
@@ -210,36 +245,36 @@ func Run(args []string) int {
 		Log:                      logger,
 	}
 	var stats *snapshotimport.Stats
-	if *parallel {
+	if f.parallel {
 		stats, err = snapshotimport.ImportParallel(snapshotimport.ParallelOptions{
 			Options:      importOpts,
-			Workers:      *parallelWorkers,
-			TempDir:      *tempDir,
-			ChunkMB:      *chunkMB,
-			WaveParallel: *waveParallel,
-			FastIngest:   *fastIngest,
+			Workers:      f.parallelWorkers,
+			TempDir:      f.tempDir,
+			ChunkMB:      f.chunkMB,
+			WaveParallel: f.waveParallel,
+			FastIngest:   f.fastIngest,
 		})
 	} else {
-		if *waveParallel {
-			log.Warn("-wave-parallel ignored without -parallel (wave-parallel only applies to per-store workers in the parallel pipeline)")
+		if f.waveParallel {
+			log.Warn("--wave-parallel ignored without --parallel (wave-parallel only applies to per-store workers in the parallel pipeline)")
 		}
 		stats, err = snapshotimport.Import(importOpts)
 	}
 	if err != nil {
 		log.Error("import failed", "err", err)
-		return 1
+		return &cliexit.Error{Code: 1}
 	}
 
 	appdbMeta := snapshotimport.AppDBMeta{
 		ChainID:               ch.ChainID,
-		Height:                *height,
+		Height:                f.height,
 		ImportedAt:            time.Now().UTC(),
 		SourceSnapshotHashHex: meta.HashHex,
 		DBBackend:             snapshotimport.DBBackendPebble,
 	}
 	if err := snapshotimport.WriteAppDBMeta(outDir, appdbMeta); err != nil {
 		log.Error("write appdb meta", "err", err)
-		return 1
+		return &cliexit.Error{Code: 1}
 	}
 
 	finalDB := filepath.Join(outDir, "application.db")
@@ -260,29 +295,29 @@ func Run(args []string) int {
 		"appdb", finalDB,
 		"appdb_bytes", dbBytes)
 
-	if rc := runPostImportVerify(log, outDir, *height, ch.RPCs, *noVerify); rc != 0 {
+	if rc := runPostImportVerify(log, outDir, f.height, ch.RPCs, f.noVerify); rc != 0 {
 		// Mismatch exits 7, RPC-unreachable returns 0 so the operator
 		// can still inspect the imported db while they sort out an
 		// RPC. See runPostImportVerify for the breakdown.
-		return rc
+		return &cliexit.Error{Code: rc}
 	}
 
-	if *memProfile != "" {
-		f, err := os.Create(*memProfile)
+	if f.memProfile != "" {
+		mf, err := os.Create(f.memProfile)
 		if err != nil {
-			log.Error("create mem profile failed", "path", *memProfile, "err", err)
-			return 1
+			log.Error("create mem profile failed", "path", f.memProfile, "err", err)
+			return &cliexit.Error{Code: 1}
 		}
 		runtime.GC() // GC once so the heap profile reflects steady-state, not leftover obsolete allocations
-		if err := pprof.Lookup("heap").WriteTo(f, 0); err != nil {
+		if err := pprof.Lookup("heap").WriteTo(mf, 0); err != nil {
 			log.Error("write mem profile failed", "err", err)
-			_ = f.Close()
-			return 1
+			_ = mf.Close()
+			return &cliexit.Error{Code: 1}
 		}
-		_ = f.Close()
-		log.Info("mem profile written", "path", *memProfile)
+		_ = mf.Close()
+		log.Info("mem profile written", "path", f.memProfile)
 	}
-	return 0
+	return nil
 }
 
 // runMemStatsTicker logs runtime.MemStats every interval. Deltas

@@ -69,7 +69,7 @@ func (r Result) Match() bool { return bytes.Equal(r.LocalHash, r.ConsensusHash) 
 // surface unwrapped.
 //
 // Producer-agnostic: the appdb can come from `malcom snapshot import`
-// or from a pipelined `malcom snapshot fetch -import` — both produce
+// or from a pipelined `malcom snapshot fetch --import` — both produce
 // the same on-disk shape.
 func CheckAppHash(appdbParent string, height int64, rpcs []string, log *slog.Logger) (Result, error) {
 	var zero Result

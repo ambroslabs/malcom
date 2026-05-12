@@ -50,7 +50,7 @@ func ParseAppStrategy(s string) (AppStrategy, error) {
 // Move is implemented as os.Rename; cross-device renames return an
 // error rather than transparently falling back to copy+delete (the
 // user explicitly opted for "move"; surprising them with a long copy
-// is worse than asking them to use -app-strategy=copy).
+// is worse than asking them to use --app-strategy=copy).
 func placeAppDB(srcAppDB, dstAppDB string, strategy AppStrategy, log *slog.Logger) error {
 	same, err := sameOnDisk(srcAppDB, dstAppDB)
 	if err != nil {
