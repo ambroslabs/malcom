@@ -16,6 +16,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/ambroslabs/malcom/internal/durable"
 )
 
 // tarEntry is one fake chain.json plus the relative path it should
@@ -354,5 +356,5 @@ func syncFromURL(ctx context.Context, cacheDir, url string) error {
 	if err != nil {
 		return err
 	}
-	return writeFileAtomic(filepath.Join(cacheDir, indexFilename), body, 0o644)
+	return durable.WriteFile(filepath.Join(cacheDir, indexFilename), body, 0o644)
 }

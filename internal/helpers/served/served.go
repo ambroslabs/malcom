@@ -22,6 +22,8 @@ import (
 	"sort"
 	"sync"
 	"time"
+
+	"github.com/ambroslabs/malcom/internal/durable"
 )
 
 const (
@@ -118,12 +120,8 @@ func (s *Set) Save() error {
 	if err != nil {
 		return fmt.Errorf("marshal served: %w", err)
 	}
-	tmp := s.path + ".tmp"
-	if err := os.WriteFile(tmp, b, 0o644); err != nil {
-		return fmt.Errorf("write served tmp: %w", err)
-	}
-	if err := os.Rename(tmp, s.path); err != nil {
-		return fmt.Errorf("rename served tmp: %w", err)
+	if err := durable.WriteFile(s.path, b, 0o644); err != nil {
+		return fmt.Errorf("write served: %w", err)
 	}
 	return nil
 }

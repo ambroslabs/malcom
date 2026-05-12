@@ -110,7 +110,7 @@ func TestPrepareSnapshotDirAtomicMetadata(t *testing.T) {
 // TestPrepareSnapshotDirReusesMatchingMetadata ensures we don't
 // gratuitously rewrite metadata.bin when a prior partial fetch already
 // left an identical file in place. We detect "did not rewrite" via
-// inode equality, which writeFileAtomic's tmp+rename would change.
+// inode equality, which durable.WriteFile's tmp+rename would change.
 func TestPrepareSnapshotDirReusesMatchingMetadata(t *testing.T) {
 	root := t.TempDir()
 	s := &fetchSession{log: slog.New(slog.DiscardHandler), cfg: Config{ChainID: "testchain"}}

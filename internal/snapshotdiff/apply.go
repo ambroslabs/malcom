@@ -14,6 +14,8 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+
+	"github.com/ambroslabs/malcom/internal/durable"
 )
 
 // ApplyStats summarises the result of an Apply run.
@@ -835,5 +837,5 @@ func writeMetaJSON(path string, m outMeta) error {
 	if err != nil {
 		return err
 	}
-	return os.WriteFile(path, b, 0o644)
+	return durable.WriteFile(path, b, 0o644)
 }

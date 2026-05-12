@@ -13,6 +13,7 @@ import (
 	"log/slog"
 	"github.com/cometbft/cometbft/p2p"
 
+	"github.com/ambroslabs/malcom/internal/durable"
 	"github.com/ambroslabs/malcom/internal/statesync"
 )
 
@@ -63,7 +64,7 @@ func (b *scenarioBuilder) build() *chunkScheduler {
 		mgr:         b.mgr,
 		watch:       nil, // banAndDrop falls through to mgr.Ban only
 		log:         slog.New(slog.DiscardHandler),
-		writeFile:   writeFileAtomic,
+		writeFile:   durable.WriteFile,
 		target:      b.target,
 		chunkHashes: hashes,
 		snapDir:     b.snapDir,

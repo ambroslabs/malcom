@@ -13,6 +13,7 @@ import (
 
 	"github.com/cockroachdb/pebble"
 
+	"github.com/ambroslabs/malcom/internal/durable"
 	malcomlog "github.com/ambroslabs/malcom/internal/log"
 )
 
@@ -212,7 +213,7 @@ func ApplyStateSync(baseDir, diffPath, outDir, tmpDir string, log *slog.Logger) 
 	if err != nil {
 		return stats, err
 	}
-	if err := os.WriteFile(metaPath, mb, 0o644); err != nil {
+	if err := durable.WriteFile(metaPath, mb, 0o644); err != nil {
 		return stats, err
 	}
 	stats.MetadataBytes = len(mb)
@@ -270,5 +271,5 @@ func patchMetaWithMetadataLen(path string, metadataLen int) error {
 	if err != nil {
 		return err
 	}
-	return os.WriteFile(path, out, 0o644)
+	return durable.WriteFile(path, out, 0o644)
 }

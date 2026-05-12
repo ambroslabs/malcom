@@ -18,6 +18,8 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+
+	"github.com/ambroslabs/malcom/internal/durable"
 )
 
 // HardcodedGenesisURLs maps chain_id → known-good genesis URL. The
@@ -59,25 +61,9 @@ func DownloadGenesis(url, destPath string) error {
 		src = gz
 	}
 
-	// Write via temp file + rename so a partial download doesn't
-	// leave a half-written genesis.json behind.
-	tmp, err := os.CreateTemp(filepath.Dir(destPath), ".genesis-*.tmp")
-	if err != nil {
-		return fmt.Errorf("create temp: %w", err)
-	}
-	tmpPath := tmp.Name()
-	if _, err := io.Copy(tmp, src); err != nil {
-		tmp.Close()
-		os.Remove(tmpPath)
-		return fmt.Errorf("write %s: %w", tmpPath, err)
-	}
-	if err := tmp.Close(); err != nil {
-		os.Remove(tmpPath)
-		return fmt.Errorf("close %s: %w", tmpPath, err)
-	}
-	if err := os.Rename(tmpPath, destPath); err != nil {
-		os.Remove(tmpPath)
-		return fmt.Errorf("rename to %s: %w", destPath, err)
-	}
-	return nil
+	// Stream the (possibly gunzip'd) body through durable.WriteFileFrom
+	// so a partial download doesn't leave a half-written genesis.json
+	// behind and a crash post-download doesn't lose the bytes still
+	// in page cache.
+	return durable.WriteFileFrom(destPath, src, 0o644)
 }

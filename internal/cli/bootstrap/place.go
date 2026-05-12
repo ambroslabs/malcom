@@ -22,6 +22,8 @@ import (
 	"os"
 	"path/filepath"
 	"syscall"
+
+	"github.com/ambroslabs/malcom/internal/durable"
 )
 
 // AppStrategy picks how application.db gets from the appdb dir to the
@@ -47,10 +49,11 @@ func ParseAppStrategy(s string) (AppStrategy, error) {
 // placeAppDB moves or copies srcAppDB → dstAppDB per strategy. It
 // short-circuits when src and dst are the same on-disk directory.
 //
-// Move is implemented as os.Rename; cross-device renames return an
-// error rather than transparently falling back to copy+delete (the
-// user explicitly opted for "move"; surprising them with a long copy
-// is worse than asking them to use --app-strategy=copy).
+// Move is implemented as a single rename + parent-dir fsync; cross-
+// device renames return an error rather than transparently falling
+// back to copy+delete (the user explicitly opted for "move";
+// surprising them with a long copy is worse than asking them to use
+// --app-strategy=copy).
 func placeAppDB(srcAppDB, dstAppDB string, strategy AppStrategy, log *slog.Logger) error {
 	same, err := sameOnDisk(srcAppDB, dstAppDB)
 	if err != nil {
@@ -75,14 +78,14 @@ func placeAppDB(srcAppDB, dstAppDB string, strategy AppStrategy, log *slog.Logge
 	switch strategy {
 	case StrategyMove:
 		log.Info("application.db move (rename)", "src", srcAppDB, "dst", dstAppDB)
-		if err := os.Rename(srcAppDB, dstAppDB); err != nil {
+		if err := durable.Rename(srcAppDB, dstAppDB); err != nil {
 			return fmt.Errorf("rename %s -> %s (cross-device renames are not supported; use -app-strategy=copy): %w",
 				srcAppDB, dstAppDB, err)
 		}
 		return nil
 	case StrategyCopy:
 		log.Info("application.db copy", "src", srcAppDB, "dst", dstAppDB)
-		return cloneTree(srcAppDB, dstAppDB)
+		return durable.CloneTree(srcAppDB, dstAppDB)
 	default:
 		return fmt.Errorf("unsupported -app-strategy %q", strategy)
 	}

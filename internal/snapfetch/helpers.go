@@ -7,8 +7,8 @@ import (
 	"encoding/binary"
 	"encoding/json"
 	"fmt"
-	"os"
 
+	"github.com/ambroslabs/malcom/internal/durable"
 	"github.com/ambroslabs/malcom/internal/helpers/addrbook"
 	"github.com/ambroslabs/malcom/internal/logctx"
 )
@@ -90,39 +90,8 @@ func loadAddrbookPeers(ctx context.Context, addrBookPath string) []addrbook.Peer
 	return out
 }
 
-// writeFileAtomic writes data to path durably: tmp file, fsync the
-// fd, close, rename to the final path. The caller is responsible for
-// fsyncing the parent directory afterwards if it cares about the
-// rename being durable across reboots.
-func writeFileAtomic(path string, data []byte, mode os.FileMode) error {
-	tmp := path + ".tmp"
-	f, err := os.OpenFile(tmp, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, mode)
-	if err != nil {
-		return err
-	}
-	if _, err := f.Write(data); err != nil {
-		f.Close()
-		os.Remove(tmp)
-		return err
-	}
-	if err := f.Sync(); err != nil {
-		f.Close()
-		os.Remove(tmp)
-		return err
-	}
-	if err := f.Close(); err != nil {
-		os.Remove(tmp)
-		return err
-	}
-	if err := os.Rename(tmp, path); err != nil {
-		os.Remove(tmp)
-		return err
-	}
-	return nil
-}
-
 // writeJSONAtomic JSON-encodes v with two-space indent and writes it
-// to path via writeFileAtomic. Mirrors the previous writeJSON output
+// to path via durable.WriteFile. Mirrors the previous writeJSON output
 // (indented, trailing newline from json.Encoder).
 func writeJSONAtomic(path string, v any) error {
 	var buf bytes.Buffer
@@ -131,22 +100,6 @@ func writeJSONAtomic(path string, v any) error {
 	if err := enc.Encode(v); err != nil {
 		return err
 	}
-	return writeFileAtomic(path, buf.Bytes(), 0o644)
-}
-
-// fsyncDir fsyncs a directory so that prior renames into it are
-// durable. On platforms where directory fsync is unsupported the
-// underlying open or sync may fail; callers treat that as best-effort
-// and surface the error so it can be logged.
-func fsyncDir(dir string) error {
-	d, err := os.Open(dir)
-	if err != nil {
-		return err
-	}
-	if err := d.Sync(); err != nil {
-		d.Close()
-		return err
-	}
-	return d.Close()
+	return durable.WriteFile(path, buf.Bytes(), 0o644)
 }
 

@@ -31,6 +31,7 @@ import (
 
 	"github.com/ambroslabs/malcom/internal/cli/cliexit"
 	"github.com/ambroslabs/malcom/internal/config"
+	"github.com/ambroslabs/malcom/internal/durable"
 	malcomlog "github.com/ambroslabs/malcom/internal/log"
 	"github.com/ambroslabs/malcom/internal/registry"
 	"github.com/ambroslabs/malcom/internal/snapshotimport"
@@ -450,7 +451,7 @@ func overlayGenesis(ch config.Chain, regInfo *registry.ChainInfo, configDir stri
 			return err
 		}
 		log.Info("genesis copy", "src", src, "dst", dst)
-		return copyFile(src, dst)
+		return durable.CopyFile(src, dst)
 	}
 	if regInfo != nil && regInfo.GenesisURL != "" {
 		dataDir, err := config.DataDir()
@@ -463,7 +464,7 @@ func overlayGenesis(ch config.Chain, regInfo *registry.ChainInfo, configDir stri
 			return err
 		}
 		log.Info("genesis copy", "src", cached, "dst", dst)
-		return copyFile(cached, dst)
+		return durable.CopyFile(cached, dst)
 	}
 	log.Warn("no genesis source configured; using daemon's init placeholder",
 		"chain", ch.ChainID,

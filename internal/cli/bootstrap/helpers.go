@@ -15,53 +15,9 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+
+	"github.com/ambroslabs/malcom/internal/durable"
 )
-
-// copyFile mirrors a single file src → dst, byte-for-byte. The
-// destination's parent directory must already exist.
-func copyFile(src, dst string) error {
-	in, err := os.Open(src)
-	if err != nil {
-		return err
-	}
-	defer in.Close()
-	out, err := os.Create(dst)
-	if err != nil {
-		return err
-	}
-	defer out.Close()
-	_, err = io.Copy(out, in)
-	return err
-}
-
-// cloneTree mirrors srcDir to dstDir as an independent on-disk copy.
-// Hardlinks are intentionally avoided — pebble's LOCK file aliases
-// across hardlinks, which entangles the source dir's lifetime with
-// the chain daemon's runtime, and a daemon at runtime would obsolete
-// files via unlink (only decrementing link count) — leaving the
-// source alive in practice but with files owned by the daemon's
-// runtime. cloneTree gives
-// the operator an independent dst they can move/delete without
-// disturbing src.
-func cloneTree(srcDir, dstDir string) error {
-	if err := os.MkdirAll(dstDir, 0o755); err != nil {
-		return err
-	}
-	return filepath.Walk(srcDir, func(path string, info os.FileInfo, err error) error {
-		if err != nil {
-			return err
-		}
-		rel, err := filepath.Rel(srcDir, path)
-		if err != nil {
-			return err
-		}
-		dst := filepath.Join(dstDir, rel)
-		if info.IsDir() {
-			return os.MkdirAll(dst, info.Mode())
-		}
-		return copyFile(path, dst)
-	})
-}
 
 // placeWasmPayloads ungzips each snapshot extension payload, sha256s
 // the raw wasm bytes, and writes the bytecode at the path the chain
@@ -159,7 +115,7 @@ func placeOneExt(srcDir, dstDir string, log *slog.Logger) error {
 		}
 		sum := sha256.Sum256(raw)
 		dstPath := filepath.Join(dstDir, hex.EncodeToString(sum[:]))
-		if err := os.WriteFile(dstPath, raw, 0o644); err != nil {
+		if err := durable.WriteFile(dstPath, raw, 0o644); err != nil {
 			return err
 		}
 		count++

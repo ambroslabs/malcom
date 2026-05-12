@@ -14,6 +14,8 @@ import (
 	"sort"
 	"strings"
 	"time"
+
+	"github.com/ambroslabs/malcom/internal/durable"
 )
 
 // tarballURL is GitHub's codeload endpoint for chain-registry's master
@@ -105,7 +107,7 @@ func Sync(ctx context.Context, cacheDir string) (*SyncResult, error) {
 	if err != nil {
 		return nil, fmt.Errorf("marshal index: %w", err)
 	}
-	if err := writeFileAtomic(indexPath, append(body, '\n'), 0o644); err != nil {
+	if err := durable.WriteFile(indexPath, append(body, '\n'), 0o644); err != nil {
 		return nil, fmt.Errorf("write index: %w", err)
 	}
 	return res.result, nil
@@ -190,7 +192,7 @@ func extractTarball(ctx context.Context, r io.Reader, cacheDir string) (*extract
 		if err := os.MkdirAll(filepath.Dir(dst), 0o755); err != nil {
 			return nil, fmt.Errorf("mkdir %s: %w", filepath.Dir(dst), err)
 		}
-		if err := writeFileAtomic(dst, body, 0o644); err != nil {
+		if err := durable.WriteFile(dst, body, 0o644); err != nil {
 			return nil, fmt.Errorf("write %s: %w", dst, err)
 		}
 		out.byChainID[raw.ChainID] = append(out.byChainID[raw.ChainID], dir)
@@ -273,32 +275,3 @@ func ensureWithin(root, target string) error {
 	return nil
 }
 
-// writeFileAtomic writes data to path via tmp file + rename. Mode is
-// applied to the renamed file so the caller doesn't have to chmod
-// after.
-func writeFileAtomic(path string, data []byte, mode os.FileMode) error {
-	dir := filepath.Dir(path)
-	tmp, err := os.CreateTemp(dir, ".registry-*.tmp")
-	if err != nil {
-		return err
-	}
-	tmpPath := tmp.Name()
-	if _, err := tmp.Write(data); err != nil {
-		tmp.Close()
-		os.Remove(tmpPath)
-		return err
-	}
-	if err := tmp.Close(); err != nil {
-		os.Remove(tmpPath)
-		return err
-	}
-	if err := os.Chmod(tmpPath, mode); err != nil {
-		os.Remove(tmpPath)
-		return err
-	}
-	if err := os.Rename(tmpPath, path); err != nil {
-		os.Remove(tmpPath)
-		return err
-	}
-	return nil
-}

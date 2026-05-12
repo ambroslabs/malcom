@@ -9,6 +9,7 @@ import (
 
 	"log/slog"
 
+	"github.com/ambroslabs/malcom/internal/durable"
 	"github.com/ambroslabs/malcom/internal/humanbytes"
 	"github.com/ambroslabs/malcom/internal/snapshotinspect"
 )
@@ -59,10 +60,10 @@ func InspectAndEnrich(dir string, logger *slog.Logger) error {
 	if err != nil {
 		return err
 	}
-	if err := writeFileAtomic(mp, append(enriched, '\n'), 0o644); err != nil {
+	if err := durable.WriteFile(mp, append(enriched, '\n'), 0o644); err != nil {
 		return fmt.Errorf("write meta.json: %w", err)
 	}
-	if err := fsyncDir(dir); err != nil {
+	if err := durable.FsyncDir(dir); err != nil {
 		return fmt.Errorf("fsync snapshot dir: %w", err)
 	}
 	if logger != nil {
