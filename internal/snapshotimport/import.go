@@ -10,8 +10,8 @@
 //	<OutDir>/application.db/   pebble dir the daemon reads (db_backend = "pebbledb")
 //	<OutDir>/extensions/<n>/   wasm bytecode (cosmwasm + 08-light-client)
 //
-// Use cosmos-p2p-toolkit's `malcom bootstrap` step downstream to
-// assemble these into a runnable chain home directory.
+// Use malcom's `bootstrap` step downstream to assemble these into a
+// runnable chain home directory.
 package snapshotimport
 
 import (

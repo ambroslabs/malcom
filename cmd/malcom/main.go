@@ -1,5 +1,5 @@
-// malcom is the cosmos-p2p-toolkit CLI for managing the cosmos-sdk
-// snapshot→bootstrap workflow:
+// malcom is a CLI for managing the cosmos-sdk snapshot→bootstrap
+// workflow:
 //
 //	malcom init                   seed XDG dirs + shared config.toml
 //	malcom add <chain-id>         register a chain (chain config + node key)
@@ -58,7 +58,7 @@ func newRoot() *cobra.Command {
 	root := &cobra.Command{
 		Use:           "malcom",
 		Short:         "cosmos-sdk chain bootstrap toolkit",
-		Long:          "malcom is the cosmos-p2p-toolkit CLI for managing the cosmos-sdk snapshot→bootstrap workflow.",
+		Long:          "malcom is a CLI for managing the cosmos-sdk snapshot→bootstrap workflow.",
 		SilenceUsage:  true,
 		SilenceErrors: true,
 	}
